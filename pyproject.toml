@@ -24,19 +24,17 @@ classifiers = [
     "Topic :: Internet :: WWW/HTTP",
 ]
 keywords = ["chatgpt", "openai", "mcp", "cdp", "proxy", "api"]
-
-[project.urls]
-Homepage = "https://github.com/Elephant-Rock-Lab/ChatGPT-Web2API"
-Repository = "https://github.com/Elephant-Rock-Lab/ChatGPT-Web2API"
-Issues = "https://github.com/Elephant-Rock-Lab/ChatGPT-Web2API/issues"
-Changelog = "https://github.com/Elephant-Rock-Lab/ChatGPT-Web2API/blob/master/CHANGELOG.md"
-
 dependencies = [
     "websockets>=12.0",
     "aiohttp>=3.9",
     "mcp>=1.0",
 ]
 
+[project.urls]
+Homepage = "https://github.com/Elephant-Rock-Lab/ChatGPT-Web2API"
+Repository = "https://github.com/Elephant-Rock-Lab/ChatGPT-Web2API"
+Issues = "https://github.com/Elephant-Rock-Lab/ChatGPT-Web2API/issues"
+Changelog = "https://github.com/Elephant-Rock-Lab/ChatGPT-Web2API/blob/master/CHANGELOG.md"
 
 [project.scripts]
 chatgpt-web2api = "chatgpt_web2api.__main__:main"
