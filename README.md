@@ -210,11 +210,18 @@ chat_with_gpt(gpt_id="g-hkJGhxxx", message="Analyze this data")
 
 ```json
 {
-  "chrome": {"cdp_port": 9222},
-  "server": {"port": 8080, "host": "127.0.0.1"},
-  "chatgpt": {"default_project_id": null}
+  "port": 8080,
+  "host": "127.0.0.1",
+  "cdp_port": 9222,
+  "headless": false,
+  "default_model": "auto",
+  "default_project_id": null,
+  "api_keys": [],
+  "request_timeout": 120
 }
 ```
+
+See [`config.example.json`](config.example.json) for all available keys.
 
 ### Environment Variables
 

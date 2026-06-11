@@ -456,6 +456,19 @@ LIST_PROJECT_FILES_OUTPUT = {
 
 _driver: CDPDriver | None = None
 _config: Config | None = None
+_lock: asyncio.Lock | None = None
+
+# Tools that mutate browser state — must hold the lock
+_MUTATING_TOOLS = frozenset({
+    ToolName.CHAT_COMPLETION.value,
+    ToolName.CHAT_WITH_GPT.value,
+    ToolName.DELETE_CONVERSATION.value,
+    ToolName.CREATE_PROJECT.value,
+    ToolName.UPDATE_PROJECT_INSTRUCTIONS.value,
+    ToolName.ARCHIVE_CONVERSATION.value,
+    ToolName.CREATE_MEMORY.value,
+    ToolName.DELETE_MEMORY.value,
+})
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -474,6 +487,15 @@ async def do_chat_completion(driver: CDPDriver, args: dict, config: Config) -> d
         full_text = f"[System Instructions]\n{validated.system_prompt}\n\n[User]\n{validated.message}"
     else:
         full_text = validated.message
+
+    # Select model if specified (non-fatal on failure)
+    if validated.model and validated.model != "auto":
+        selected = await driver.select_model(validated.model)
+        if not selected:
+            logger.warning(
+                "Could not select model '%s', proceeding with active model",
+                validated.model,
+            )
 
     # Navigate to correct conversation context
     if validated.conversation_id:
@@ -930,9 +952,10 @@ def _build_tools() -> list[mcp_types.Tool]:
             title="Create Memory",
             description=(
                 "Instruct ChatGPT to remember a new fact. "
-                "This sends a message to ChatGPT asking it to store the information permanently. "
-                "ChatGPT will remember this across all future conversations. "
-                "Use this to teach ChatGPT preferences, context, or domain knowledge.\n\n"
+                "This works by sending a chat message asking ChatGPT to remember — "
+                "the POST /backend-api/memories endpoint returns 405, so memory "
+                "creation must go through conversation. ChatGPT may paraphrase "
+                "or decline the request. Use list_memories to verify.\n\n"
                 "Examples: 'I prefer Python over JavaScript', 'My project uses PostgreSQL 16', "
                 "'Always respond in markdown with code examples'."
             ),
@@ -1073,7 +1096,12 @@ def create_server() -> Server:
         if not handler:
             raise ValueError(f"Unknown tool: {name}")
 
-        result = await handler()
+        # Serialize mutating tools through the shared lock
+        if name in _MUTATING_TOOLS and _lock:
+            async with _lock:
+                result = await handler()
+        else:
+            result = await handler()
 
         # chat_completion and chat_with_gpt return both text + structured output
         if name in (ToolName.CHAT_COMPLETION.value, ToolName.CHAT_WITH_GPT.value):
@@ -1337,9 +1365,10 @@ async def run_mcp(
     config: Config, transport: str = "stdio", port: int = 8090
 ) -> None:
     """Connect to Chrome and run the MCP server."""
-    global _driver, _config
+    global _driver, _config, _lock
 
     _config = config
+    _lock = asyncio.Lock()
 
     _driver = CDPDriver(cdp_port=config.chrome.cdp_port)
     try:

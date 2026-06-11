@@ -154,9 +154,13 @@ class APIServer:
         )
         conversation_id = body.get("conversation_id")
 
-        # Build the text to type: system messages prepended, then user message
+        # Build conversation text from all messages
+        # Includes prior assistant context for stateless clients (OpenAI SDK)
         system_parts = []
-        user_msg = ""
+        conversation_lines = []
+        user_msg_count = 0
+        MAX_HISTORY_TURNS = 10  # Cap to avoid textarea overflow
+
         for msg in messages:
             role = msg.get("role", "")
             content = msg.get("content", "")
@@ -171,19 +175,27 @@ class APIServer:
             if role == "system":
                 system_parts.append(content)
             elif role == "user":
-                user_msg = content
+                conversation_lines.append(f"[User]\n{content}")
+                user_msg_count += 1
+            elif role == "assistant":
+                conversation_lines.append(f"[Assistant]\n{content}")
 
-        if not user_msg:
+        # Trim to last N turns if too many messages
+        if len(conversation_lines) > MAX_HISTORY_TURNS * 2:
+            conversation_lines = conversation_lines[-(MAX_HISTORY_TURNS * 2):]
+
+        # Verify at least one user message exists
+        if user_msg_count == 0:
             return web.json_response(
                 {"error": {"message": "No user message", "type": "invalid_request_error"}},
                 status=400,
             )
 
-        # Compose final text: system instructions first, then user message
+        # Compose final text
+        prefix = ""
         if system_parts:
-            full_text = "[System Instructions]\n" + "\n".join(system_parts) + "\n\n[User]\n" + user_msg
-        else:
-            full_text = user_msg
+            prefix = "[System Instructions]\n" + "\n".join(system_parts) + "\n\n"
+        full_text = prefix + "\n".join(conversation_lines)
 
         model_slug = MODEL_MAP.get(model, model)
         timeout = self._config.server.request_timeout
@@ -196,6 +208,15 @@ class APIServer:
         # Serialize — one request at a time through the browser
         async with self._lock:
             try:
+                # Select model if specified (non-fatal on failure)
+                if model_slug and model_slug != "auto":
+                    selected = await self._driver.select_model(model_slug)
+                    if not selected:
+                        logger.warning(
+                            "Could not select model '%s', proceeding with active model",
+                            model_slug,
+                        )
+
                 # Decide: continue existing conversation or start fresh?
                 if conversation_id:
                     # Explicit conversation_id from client — navigate to it

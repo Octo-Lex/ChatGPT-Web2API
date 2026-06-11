@@ -202,7 +202,15 @@ class ChromeProcess:
                 if alive != self._healthy:
                     self._healthy = alive
                     if not alive:
-                        logger.error("Chrome CDP stopped responding")
+                        if self._cfg.restart_on_crash:
+                            logger.warning("Chrome died — restarting (attempt #%d)...", self._restart_count + 1)
+                            try:
+                                await self.restart()
+                                logger.info("Chrome restarted successfully")
+                            except Exception as e:
+                                logger.error("Chrome restart failed: %s", e)
+                        else:
+                            logger.error("Chrome CDP stopped responding")
                     else:
                         logger.info("Chrome CDP recovered")
             except asyncio.CancelledError:

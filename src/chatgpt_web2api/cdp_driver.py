@@ -45,6 +45,7 @@ class CDPDriver:
         self._access_token = ""
         self._user_name = ""
         self._current_conv_id: Optional[str] = None
+        self._current_model: Optional[str] = None
 
     # ── Connection ────────────────────────────────────────────
 
@@ -68,7 +69,7 @@ class CDPDriver:
             raise RuntimeError("No browser pages found — is Chrome running with chatgpt.com?")
 
         # Prefer chatgpt.com page
-        chatgpt = [t for t in pages if "chatgpt.com" in t.get("url", "")]
+        chatgpt = [t for t in pages if "chatgpt.com" in t.get("url", "") or "chatgpt.com" in t.get("title", "")]
         target = chatgpt[0] if chatgpt else pages[0]
         logger.info("Using page: %s", target.get("title", "")[:60])
         return target["webSocketDebuggerUrl"]
@@ -113,6 +114,95 @@ class CDPDriver:
             "timeout": int(timeout * 1000),
         }, timeout=timeout)
         return resp.get("result", {}).get("result", {}).get("value", "")
+
+    async def _js_with_data(self, expr_template: str, data: dict, timeout: float = 15) -> str:
+        """Evaluate JS with safely injected data variables.
+
+        Injects data as ``const __D = <json>;`` prefix, eliminating
+        all string-concatenation injection vectors.  The template can
+        reference ``__D.keyName`` for any key in *data*.
+        """
+        prefix = f"const __D = {json.dumps(data)};"
+        return await self._js(prefix + expr_template, timeout=timeout)
+
+    # ── Model Selection ───────────────────────────────────────
+
+    async def select_model(self, slug: str) -> bool:
+        """Select a model in the ChatGPT model picker.
+
+        Clicks the model picker button, waits for the dropdown,
+        finds the item matching *slug*, and clicks it.
+
+        Returns True if the model was selected, False if it failed
+        (e.g. model not found, picker not available).  Failures are
+        non-fatal — the request proceeds with whatever model is active.
+        """
+        if slug in ("auto", None, ""):
+            return True  # auto is the default, no action needed
+
+        # Track the current model
+        self._current_model = slug
+
+        # Click the model picker button
+        picker_clicked = await self._js(
+            "(function() {"
+            "  var btn = document.querySelector('#model-selector-btn') "
+            "    || document.querySelector('button[aria-label*=\"Model\"]') "
+            "    || document.querySelector('[data-testid*=\"model\"]') "
+            "    || document.querySelector('button[class*=\"model\"]');"
+            "  if (!btn) return 'no picker';"
+            "  btn.click();"
+            "  return 'clicked';"
+            "})()"
+        )
+        if picker_clicked != "clicked":
+            logger.warning("Model picker not found: %s — proceeding with active model", picker_clicked)
+            return False
+
+        # Wait for dropdown to appear
+        await asyncio.sleep(0.8)
+
+        # Find and click the target model item
+        # The dropdown renders model items as buttons or list items with the slug
+        result = await self._js_with_data(
+            "(function() {"
+            "  var items = document.querySelectorAll("
+            "    'button[data-testid*=\"model\"], "
+            "    '[class*=\"model-item\"], "
+            "    '[class*=\"modelOption\"], "
+            "    'li[class*=\"model\"], "
+            "    'div[class*=\"model\"] button'"
+            "  );"
+            "  for (var i = 0; i < items.length; i++) {"
+            "    var el = items[i];"
+            "    var text = (el.textContent || '').toLowerCase();"
+            "    var dataSlug = (el.getAttribute('data-slug') || '').toLowerCase();"
+            "    if (dataSlug === __D.slug || text.indexOf(__D.slug) !== -1) {"
+            "      el.click();"
+            "      return 'selected';"
+            "    }"
+            "  }"
+            "  // Fallback: try broader search in the dropdown"
+            "  var allBtns = document.querySelectorAll('button, [role=\"menuitem\"]');"
+            "  for (var j = 0; j < allBtns.length; j++) {"
+            "    var t = (allBtns[j].textContent || '').toLowerCase();"
+            "    if (t.indexOf(__D.slug) !== -1) {"
+            "      allBtns[j].click();"
+            "      return 'selected-fallback';"
+            "    }"
+            "  }"
+            "  return 'not-found';"
+            "})()",
+            {"slug": slug.lower()},
+        )
+
+        if result in ("selected", "selected-fallback"):
+            logger.info("Model selected: %s (%s)", slug, result)
+            await asyncio.sleep(0.5)  # Let UI settle
+            return True
+
+        logger.warning("Model '%s' not found in picker: %s — proceeding with active model", slug, result)
+        return False
 
     # ── Navigation ────────────────────────────────────────────
 
@@ -288,7 +378,7 @@ class CDPDriver:
                 "  var text = md ? (md.textContent || '') : '';"
                 "  var stopBtn = document.querySelector('button[aria-label=\"Stop\"]');"
                 "  return JSON.stringify({text: text, done: !stopBtn && !!md});"
-                "})()"
+                "})()",
             )
             try:
                 data = json.loads(result)
@@ -336,12 +426,11 @@ class CDPDriver:
 
     async def _fetch_text(self, conversation_id: str) -> str:
         """Fetch the latest assistant text from the conversation API."""
-        token = self._access_token
-        js = (
+        return await self._js_with_data(
             "(async function() {"
             "  try {"
-            "    var r = await fetch('/backend-api/conversation/' + '" + conversation_id + "' + '?offset=0&limit=5', {"
-            "      headers: {'Authorization': 'Bearer ' + '" + token + "'}"
+            "    var r = await fetch('/backend-api/conversation/' + __D.conv_id + '?offset=0&limit=5', {"
+            "      headers: {'Authorization': 'Bearer ' + __D.token}"
             "    });"
             "    if (!r.ok) return '';"
             "    var conv = await r.json();"
@@ -358,40 +447,37 @@ class CDPDriver:
             "    }"
             "    return '';"
             "  } catch(e) { return ''; }"
-            "})()"
-        )
-        return await self._js(js, timeout=15) or ""
+            "})()",
+            {"conv_id": conversation_id, "token": self._access_token},
+            timeout=15,
+        ) or ""
 
     # ── API helpers ───────────────────────────────────────────
 
     async def get_models(self) -> list[dict]:
-        token = self._access_token
-        raw = await self._js(
+        return await self._js_with_data(
             "(async () => {"
             "  var r = await fetch('/backend-api/models?iim=false&is_gizmo=false', {"
-            "    headers: {'Authorization': 'Bearer " + token + "'}"
+            "    headers: {'Authorization': 'Bearer ' + __D.token}"
             "  });"
             "  return await r.text();"
-            "})()"
+            "})()",
+            {"token": self._access_token},
         )
-        try:
-            return json.loads(raw).get("models", [])
-        except json.JSONDecodeError:
-            return []
 
     async def get_projects(self) -> list[dict]:
-        token = self._access_token
-        raw = await self._js(
+        raw = await self._js_with_data(
             "(async () => {"
             "  var r = await fetch('/backend-api/gizmos/snorlax/sidebar?owned_only=true&conversations_per_gizmo=5&limit=50', {"
-            "    headers: {'Authorization': 'Bearer " + token + "'}"
+            "    headers: {'Authorization': 'Bearer ' + __D.token}"
             "  });"
             "  var data = await r.json();"
             "  return JSON.stringify((data.items || []).map(function(i) {"
             "    var g = (i.gizmo || {}).gizmo || {};"
             "    return {id: g.id, name: (g.display || {}).name || '', memory_scope: g.memory_scope || '', short_url: g.short_url || ''};"
             "  }));"
-            "})()"
+            "})()",
+            {"token": self._access_token},
         )
         try:
             return json.loads(raw)
@@ -407,11 +493,10 @@ class CDPDriver:
         order: str = "updated",
     ) -> list[dict]:
         """List recent conversations."""
-        token = self._access_token
-        raw = await self._js(
+        raw = await self._js_with_data(
             "(async () => {"
-            "  var r = await fetch('/backend-api/conversations?offset=' + " + str(offset) + " + '&limit=' + " + str(limit) + " + '&order=' + '" + order + "', {"
-            "    headers: {'Authorization': 'Bearer ' + '" + token + "'}"
+            "  var r = await fetch('/backend-api/conversations?offset=' + __D.offset + '&limit=' + __D.limit + '&order=' + __D.order, {"
+            "    headers: {'Authorization': 'Bearer ' + __D.token}"
             "  });"
             "  var data = await r.json();"
             "  return JSON.stringify((data.items || []).map(function(c) {"
@@ -419,7 +504,8 @@ class CDPDriver:
             "      update_time: c.update_time, create_time: c.create_time,"
             "      is_archived: !!c.is_archived, gizmo_id: c.gizmo_id || null};"
             "  }));"
-            "})()"
+            "})()",
+            {"token": self._access_token, "offset": str(offset), "limit": str(limit), "order": order},
         )
         try:
             return json.loads(raw)
@@ -428,14 +514,14 @@ class CDPDriver:
 
     async def get_conversation(self, conversation_id: str) -> dict:
         """Get full conversation detail with message mapping."""
-        token = self._access_token
-        raw = await self._js(
+        raw = await self._js_with_data(
             "(async () => {"
-            "  var r = await fetch('/backend-api/conversation/" + conversation_id + "', {"
-            "    headers: {'Authorization': 'Bearer ' + '" + token + "'}"
+            "  var r = await fetch('/backend-api/conversation/' + __D.conv_id, {"
+            "    headers: {'Authorization': 'Bearer ' + __D.token}"
             "  });"
             "  return await r.text();"
             "})()",
+            {"conv_id": conversation_id, "token": self._access_token},
             timeout=30,
         )
         try:
@@ -445,22 +531,21 @@ class CDPDriver:
 
     async def delete_conversation(self, conversation_id: str) -> bool:
         """Delete a conversation. Returns True on success."""
-        token = self._access_token
-        result = await self._js(
+        result = await self._js_with_data(
             "(async () => {"
             "  try {"
-            "    var r = await fetch('/backend-api/conversation/" + conversation_id + "', {"
+            "    var r = await fetch('/backend-api/conversation/' + __D.conv_id, {"
             "      method: 'PATCH',"
-            "      headers: {'Authorization': 'Bearer ' + '" + token + "', 'Content-Type': 'application/json'},"
+            "      headers: {'Authorization': 'Bearer ' + __D.token, 'Content-Type': 'application/json'},"
             "      body: JSON.stringify({is_visible: false})"
             "    });"
             "    return r.ok ? 'true' : 'false';"
             "  } catch(e) { return 'error:' + e.message; }"
-            "})()"
+            "})()",
+            {"conv_id": conversation_id, "token": self._access_token},
         )
         if result == "true":
             logger.info("Deleted conversation: %s", conversation_id)
-            # Reset current conv if it was the one deleted
             if self._current_conv_id == conversation_id:
                 self._current_conv_id = None
             return True
@@ -471,19 +556,18 @@ class CDPDriver:
         self, conversation_id: str, title: str
     ) -> bool:
         """Rename a conversation. Returns True on success."""
-        token = self._access_token
-        escaped_title = title.replace("'", "\\'").replace('"', '\\"')
-        result = await self._js(
+        result = await self._js_with_data(
             "(async () => {"
             "  try {"
-            "    var r = await fetch('/backend-api/conversation/" + conversation_id + "', {"
+            "    var r = await fetch('/backend-api/conversation/' + __D.conv_id, {"
             "      method: 'PATCH',"
-            "      headers: {'Authorization': 'Bearer ' + '" + token + "', 'Content-Type': 'application/json'},"
-            "      body: JSON.stringify({title: '" + escaped_title + "'})"
+            "      headers: {'Authorization': 'Bearer ' + __D.token, 'Content-Type': 'application/json'},"
+            "      body: JSON.stringify({title: __D.title})"
             "    });"
             "    return r.ok ? 'true' : 'false';"
             "  } catch(e) { return 'error:' + e.message; }"
-            "})()"
+            "})()",
+            {"conv_id": conversation_id, "token": self._access_token, "title": title},
         )
         if result == "true":
             logger.info("Renamed conversation %s to: %s", conversation_id, title)
@@ -509,19 +593,15 @@ class CDPDriver:
         Returns:
             Created project dict with id, name, etc.
         """
-        token = self._access_token
-        escaped_name = name.replace("'", "\\'").replace('"', '\\"')
-        escaped_instructions = instructions.replace("'", "\\'").replace('"', '\\"')
-
-        raw = await self._js(
+        raw = await self._js_with_data(
             "(async () => {"
             "  try {"
             "    var body = {"
             "      gizmo: {"
-            "        display: {name: '" + escaped_name + "', description: ''},"
-            "        memory_scope: '" + memory_scope + "',"
+            "        display: {name: __D.name, description: ''},"
+            "        memory_scope: __D.memory_scope,"
             "        memory_enabled: true,"
-            "        instructions: '" + escaped_instructions + "',"
+            "        instructions: __D.instructions,"
             "        gizmo_type: 'snorlax',"
             "        tools: [],"
             "        files: []"
@@ -529,7 +609,7 @@ class CDPDriver:
             "    };"
             "    var r = await fetch('/backend-api/gizmos', {"
             "      method: 'POST',"
-            "      headers: {'Authorization': 'Bearer ' + '" + token + "', 'Content-Type': 'application/json'},"
+            "      headers: {'Authorization': 'Bearer ' + __D.token, 'Content-Type': 'application/json'},"
             "      body: JSON.stringify(body)"
             "    });"
             "    if (!r.ok) return JSON.stringify({error: 'HTTP ' + r.status, body: await r.text()});"
@@ -543,6 +623,12 @@ class CDPDriver:
             "    });"
             "  } catch(e) { return JSON.stringify({error: e.message}); }"
             "})()",
+            {
+                "token": self._access_token,
+                "name": name,
+                "instructions": instructions,
+                "memory_scope": memory_scope,
+            },
             timeout=20,
         )
         try:
@@ -561,26 +647,24 @@ class CDPDriver:
         instructions: str,
     ) -> bool:
         """Update a project's custom instructions. Returns True on success."""
-        token = self._access_token
-        escaped = instructions.replace("'", "\\'").replace('"', '\\"')
-
-        result = await self._js(
+        result = await self._js_with_data(
             "(async () => {"
             "  try {"
             "    var body = {"
             "      gizmo: {"
             "        display: {},"
-            "        instructions: '" + escaped + "'"
+            "        instructions: __D.instructions"
             "      }"
             "    };"
-            "    var r = await fetch('/backend-api/gizmos/" + project_id + "', {"
+            "    var r = await fetch('/backend-api/gizmos/' + __D.project_id, {"
             "      method: 'PATCH',"
-            "      headers: {'Authorization': 'Bearer ' + '" + token + "', 'Content-Type': 'application/json'},"
+            "      headers: {'Authorization': 'Bearer ' + __D.token, 'Content-Type': 'application/json'},"
             "      body: JSON.stringify(body)"
             "    });"
             "    return r.ok ? 'true' : 'false';"
             "  } catch(e) { return 'error:' + e.message; }"
             "})()",
+            {"token": self._access_token, "project_id": project_id, "instructions": instructions},
             timeout=15,
         )
         if result == "true":
@@ -591,14 +675,14 @@ class CDPDriver:
 
     async def get_project_detail(self, project_id: str) -> dict:
         """Get full project/gizmo detail."""
-        token = self._access_token
-        raw = await self._js(
+        raw = await self._js_with_data(
             "(async () => {"
-            "  var r = await fetch('/backend-api/gizmos/" + project_id + "', {"
-            "    headers: {'Authorization': 'Bearer ' + '" + token + "'}"
+            "  var r = await fetch('/backend-api/gizmos/' + __D.project_id, {"
+            "    headers: {'Authorization': 'Bearer ' + __D.token}"
             "  });"
             "  return await r.text();"
             "})()",
+            {"token": self._access_token, "project_id": project_id},
             timeout=15,
         )
         try:
@@ -612,18 +696,18 @@ class CDPDriver:
         self, conversation_id: str, archive: bool = True
     ) -> bool:
         """Archive or unarchive a conversation. Returns True on success."""
-        token = self._access_token
-        result = await self._js(
+        result = await self._js_with_data(
             "(async () => {"
             "  try {"
-            "    var r = await fetch('/backend-api/conversation/" + conversation_id + "', {"
+            "    var r = await fetch('/backend-api/conversation/' + __D.conv_id, {"
             "      method: 'PATCH',"
-            "      headers: {'Authorization': 'Bearer ' + '" + token + "', 'Content-Type': 'application/json'},"
-            "      body: JSON.stringify({is_archived: " + ("true" if archive else "false") + "})"
+            "      headers: {'Authorization': 'Bearer ' + __D.token, 'Content-Type': 'application/json'},"
+            "      body: JSON.stringify({is_archived: __D.archive})"
             "    });"
             "    return r.ok ? 'true' : 'false';"
             "  } catch(e) { return 'error:' + e.message; }"
-            "})()"
+            "})()",
+            {"conv_id": conversation_id, "token": self._access_token, "archive": archive},
         )
         if result == "true":
             logger.info("%s conversation: %s", 'Archived' if archive else 'Unarchived', conversation_id)
@@ -635,20 +719,20 @@ class CDPDriver:
 
     async def get_memories(self) -> list[dict]:
         """List all ChatGPT memories."""
-        token = self._access_token
-        js = (
+        raw = await self._js_with_data(
             "(async () => {"
             "  try {"
             "    var r = await fetch('/backend-api/memories', {"
-            "      headers: {'Authorization': 'Bearer ' + '" + token + "'}"
+            "      headers: {'Authorization': 'Bearer ' + __D.token}"
             "    });"
             "    if (!r.ok) return JSON.stringify({error: 'HTTP ' + r.status});"
             "    var data = await r.json();"
             "    return JSON.stringify(data);"
             "  } catch(e) { return JSON.stringify({error: e.message}); }"
-            "})()"
+            "})()",
+            {"token": self._access_token},
+            timeout=15,
         )
-        raw = await self._js(js, timeout=15)
         try:
             data = json.loads(raw)
             if isinstance(data, dict) and "error" in data:
@@ -664,48 +748,56 @@ class CDPDriver:
             return []
 
     async def create_memory(self, content: str) -> dict:
-        """Add a new memory to ChatGPT. Returns the created memory."""
-        token = self._access_token
-        escaped = content.replace("'", "\'").replace('"', '\\"')
-        js = (
-            "(async () => {"
-            "  try {"
-            "    var r = await fetch('/backend-api/memories', {"
-            "      method: 'POST',"
-            "      headers: {'Authorization': 'Bearer ' + '" + token + "', 'Content-Type': 'application/json'},"
-            "      body: JSON.stringify({content: '" + escaped + "'})"
-            "    });"
-            "    if (!r.ok) return JSON.stringify({error: 'HTTP ' + r.status, body: await r.text()});"
-            "    return await r.text();"
-            "  } catch(e) { return JSON.stringify({error: e.message}); }"
-            "})()"
+        """Create a memory by sending a chat message asking ChatGPT to remember.
+
+        The POST /backend-api/memories endpoint returns 405 — ChatGPT only
+        creates memories through conversation. This method sends a message
+        asking ChatGPT to remember the content, which triggers the memory
+        system automatically.
+        """
+        memory_prompt = (
+            f"Please remember this for all future conversations: {content}"
         )
-        raw = await self._js(js, timeout=15)
-        try:
-            result = json.loads(raw)
-            if isinstance(result, dict) and "error" in result:
-                logger.error("Create memory failed: %s", result["error"])
-            else:
-                logger.info("Created memory: %s", content[:50])
-            return result
-        except json.JSONDecodeError:
-            return {"error": "Invalid response"}
+
+        # Navigate to a fresh chat for memory creation
+        await self.navigate_new_chat()
+
+        # Send and collect the response
+        full_response = ""
+        async for chunk in self.send_and_stream(memory_prompt, timeout=60):
+            if chunk.delta:
+                full_response += chunk.delta
+
+        conv_id = self._current_conv_id or ""
+
+        logger.info("Memory creation request sent via chat (conv: %s)", conv_id)
+
+        return {
+            "content": content,
+            "method": "chat",
+            "conversation_id": conv_id,
+            "response": full_response[:200],
+            "note": (
+                "Memory creation happens via chat — ChatGPT may paraphrase "
+                "or decline. Use list_memories to verify."
+            ),
+        }
 
     async def delete_memory(self, memory_id: str) -> bool:
         """Delete a ChatGPT memory by ID. Returns True on success."""
-        token = self._access_token
-        js = (
+        result = await self._js_with_data(
             "(async () => {"
             "  try {"
-            "    var r = await fetch('/backend-api/memories/" + memory_id + "', {"
+            "    var r = await fetch('/backend-api/memories/' + __D.memory_id, {"
             "      method: 'DELETE',"
-            "      headers: {'Authorization': 'Bearer ' + '" + token + "'}"
+            "      headers: {'Authorization': 'Bearer ' + __D.token}"
             "    });"
             "    return r.ok ? 'true' : 'false';"
             "  } catch(e) { return 'error:' + e.message; }"
-            "})()"
+            "})()",
+            {"memory_id": memory_id, "token": self._access_token},
+            timeout=15,
         )
-        result = await self._js(js, timeout=15)
         if result == "true":
             logger.info("Deleted memory: %s", memory_id)
             return True
@@ -727,7 +819,7 @@ class CDPDriver:
                 "    ready: !!document.querySelector('#prompt-textarea'),"
                 "    url: location.href"
                 "  });"
-                "})()"
+                "})()",
             )
             try:
                 state = json.loads(result)
@@ -741,22 +833,27 @@ class CDPDriver:
         self._current_conv_id = None
 
     async def list_gpts(self) -> list[dict]:
-        """List Custom GPTs (non-project gizmos) from the sidebar."""
-        token = self._access_token
-        raw = await self._js(
+        """List Custom GPTs (non-project gizmos).
+
+        Projects (gizmo_type='snorlax') are excluded — use get_projects()
+        for those.  Only marketplace or user-created non-project GPTs
+        are returned.
+        """
+        raw = await self._js_with_data(
             "(async () => {"
             "  var r = await fetch('/backend-api/gizmos/snorlax/sidebar?owned_only=false&conversations_per_gizmo=0&limit=100', {"
-            "    headers: {'Authorization': 'Bearer ' + '" + token + "'}"
+            "    headers: {'Authorization': 'Bearer ' + __D.token}"
             "  });"
             "  var data = await r.json();"
             "  return JSON.stringify((data.items || []).map(function(i) {"
             "    var g = (i.gizmo || {}).gizmo || {};"
-            "    if (g.gizmo_type === 'snorlax') return null;"
+            "    if (g.gizmo_type === 'snorlax' && g.memory_scope) return null;"
             "    return {id: g.id, name: (g.display || {}).name || '', "
             "      description: (g.display || {}).description || '',"
             "      gizmo_type: g.gizmo_type || ''};"
             "  }).filter(Boolean));"
             "})()",
+            {"token": self._access_token},
             timeout=20,
         )
         try:
@@ -768,12 +865,11 @@ class CDPDriver:
 
     async def get_project_files(self, project_id: str) -> list[dict]:
         """List files attached to a ChatGPT project."""
-        token = self._access_token
-        raw = await self._js(
+        raw = await self._js_with_data(
             "(async () => {"
             "  try {"
-            "    var r = await fetch('/backend-api/gizmos/" + project_id + "', {"
-            "      headers: {'Authorization': 'Bearer ' + '" + token + "'}"
+            "    var r = await fetch('/backend-api/gizmos/' + __D.project_id, {"
+            "      headers: {'Authorization': 'Bearer ' + __D.token}"
             "    });"
             "    if (!r.ok) return '[]';"
             "    var data = await r.json();"
@@ -785,6 +881,7 @@ class CDPDriver:
             "    }));"
             "  } catch(e) { return '[]'; }"
             "})()",
+            {"token": self._access_token, "project_id": project_id},
             timeout=15,
         )
         try:

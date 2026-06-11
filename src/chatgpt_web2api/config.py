@@ -151,6 +151,8 @@ class Config:
             self.server.api_keys = [k.strip() for k in v.split(",") if k.strip()]
         if v := _env("W2A_DEFAULT_MODEL"):
             self.chatgpt.default_model = v
+        if v := _env("W2A_HEADLESS"):
+            self.chrome.headless = v.lower() in ("true", "1", "yes")
         if v := _env("W2A_LOG_LEVEL"):
             self.log.level = v
 

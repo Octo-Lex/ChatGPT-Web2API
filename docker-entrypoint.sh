@@ -23,6 +23,9 @@ if [ -f "$COOKIE_FILE" ]; then
     # Inject cookies
     chatgpt-web2api inject-cookies "$COOKIE_FILE" "$@"
     
+    # Let cookies propagate to session
+    sleep 3
+    
     # Wait for the proxy
     wait $PROXY_PID
 else
