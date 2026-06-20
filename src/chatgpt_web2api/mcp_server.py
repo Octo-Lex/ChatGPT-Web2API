@@ -42,7 +42,12 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 
 from .config import Config
-from .cdp_driver import CDPDriver, RateLimitError
+from .cdp_driver import (
+    AuthExpiredError,
+    CDPDriver,
+    GenerationStuckError,
+    RateLimitError,
+)
 from .resilience import retry_on_rate_limit
 
 logger = logging.getLogger(__name__)
@@ -1473,27 +1478,48 @@ def create_server() -> Server:
             else:
                 result = await _run()
         except RateLimitError as e:
-            # Persistent limit (transparent retries exhausted). MCP has no
-            # transport-level retry-after, so signal it semantically: an error
-            # result with a machine-readable structuredContent payload an agent
-            # can parse to decide "pause, then retry this tool."
-            #
-            # We return a CallToolResult directly (rather than the usual
-            # (content, structuredDict) tuple) so it bypasses the tool's
-            # outputSchema validation — the rate-limit payload deliberately
-            # doesn't match any tool's success schema.
-            structured = {
-                "rate_limited": True,
-                "retry_after": e.retry_after,
-                "retry_after_human": f"{e.retry_after}s",
-                "error": "rate_limit_exceeded",
-            }
+            # Persistent limit (transparent retries exhausted). Signal it as an
+            # error result with a recognizable marker the agent can parse to
+            # decide "pause, then retry this tool." isError=True with text only
+            # — no structuredContent, because the MCP SDK validates
+            # structuredContent against the tool's outputSchema and this error
+            # payload deliberately doesn't match any tool's success schema.
             return mcp_types.CallToolResult(
                 content=[mcp_types.TextContent(
                     type="text",
-                    text=f"ChatGPT rate limit reached. Retry in {e.retry_after}s.",
+                    text=(
+                        f"ChatGPT rate limit reached. Retry in {e.retry_after}s. "
+                        f"(rate_limit_exceeded, retry_after={e.retry_after})"
+                    ),
                 )],
-                structuredContent=structured,
+                isError=True,
+            )
+        except AuthExpiredError:
+            # The access token is stale/rejected. Surface a clear signal so the
+            # agent/user can prompt re-login instead of misdiagnosing the
+            # resulting empty reads as a different bug. isError=True with text
+            # content only — no structuredContent, because the MCP SDK validates
+            # structuredContent against the tool's outputSchema and this error
+            # payload deliberately doesn't match any tool's success schema.
+            return mcp_types.CallToolResult(
+                content=[mcp_types.TextContent(
+                    type="text",
+                    text="ChatGPT session expired — re-login required. (auth_expired)",
+                )],
+                isError=True,
+            )
+        except GenerationStuckError as e:
+            # Generation hung (no DOM progress within the stall window). Distinct
+            # from a slow generation (which keeps progressing and is allowed the
+            # full timeout). Phase + duration in the text for diagnosis.
+            return mcp_types.CallToolResult(
+                content=[mcp_types.TextContent(
+                    type="text",
+                    text=(
+                        f"Generation stuck in {e.phase} for {e.stalled_for_s:.0f}s "
+                        f"— no DOM progress. (generation_stuck)"
+                    ),
+                )],
                 isError=True,
             )
 

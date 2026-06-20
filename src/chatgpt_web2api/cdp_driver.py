@@ -43,6 +43,20 @@ class StreamChunk:
 # a real cooldown clear but short enough that a transient blip recovers fast.
 RATE_LIMIT_DEFAULT_RETRY_AFTER = 60
 
+# Re-check the access token if it's older than this. The observed ChatGPT
+# JWT has a ~10-day lifetime, so 1h is a conservative refresh interval: it
+# avoids unnecessary refetches on the happy path while guaranteeing a stale
+# token is refreshed well before its real expiry.
+TOKEN_TTL_SECONDS = 3600
+
+# A generation is considered "stuck" (vs. merely slow) if no DOM progress
+# signal occurs within this window. Slow-but-progressing generations
+# (image rendering, deep-research thinking) legitimately exceed this and
+# are allowed the full timeout; a true stall fails fast here instead of
+# hanging silently to the deadline. Applied to both Phase 1 (node appear)
+# and Phase 2 (text streaming).
+PHASE_STALL_SECONDS = 45
+
 
 class RateLimitError(RuntimeError):
     """Raised when ChatGPT shows its 'Too many requests' rate-limit pop-up.
@@ -76,6 +90,42 @@ class RateLimitError(RuntimeError):
         """Build a RateLimitError, parsing the wait from the pop-up *text*."""
         retry_after = parse_retry_after(text)
         return cls(retry_after=retry_after)
+
+
+class AuthExpiredError(RuntimeError):
+    """Raised when the ChatGPT access token is stale or rejected (HTTP 401).
+
+    Previously a 401 from /backend-api/* was silently swallowed (reads
+    returned []/{}/'', send_and_stream blocked 60s then raised a generic
+    "Timed out waiting for assistant response"). This error surfaces the
+    real cause so callers can prompt re-login instead of misdiagnosing it
+    as a timeout or empty data.
+    """
+
+    def __init__(self, message: str | None = None) -> None:
+        if message is None:
+            message = "ChatGPT session expired — re-login required"
+        super().__init__(message)
+
+
+class GenerationStuckError(RuntimeError):
+    """Raised when a generation stalls — no DOM progress within the stall window.
+
+    Distinct from a *slow* generation (which keeps making progress and is
+    allowed the full timeout). The ``phase`` and ``stalled_for_s`` attributes
+    are machine-readable so MCP/REST layers can surface them in structured
+    results; the message is for humans.
+
+    - ``phase == "phase_1_appear"``: assistant message node never appeared.
+    - ``phase == "phase_2_stream"``: streaming started but text stopped changing.
+    """
+
+    def __init__(self, phase: str, stalled_for_s: float) -> None:
+        self.phase = phase
+        self.stalled_for_s = float(stalled_for_s)
+        super().__init__(
+            f"Generation stalled in {phase} for {stalled_for_s:.0f}s — no DOM progress"
+        )
 
 
 # Phrases ChatGPT uses in its rate-limit pop-up. Matched case-insensitively
@@ -149,6 +199,7 @@ class CDPDriver:
         self._msg_id = 0
         self._access_token = ""
         self._user_name = ""
+        self._token_fetched_at: float = 0.0
         self._current_conv_id: Optional[str] = None
         self._current_model: Optional[str] = None
 
@@ -191,6 +242,7 @@ class CDPDriver:
         data = json.loads(raw)
         self._access_token = data.get("token", "")
         self._user_name = data.get("user", "")
+        self._token_fetched_at = time.time()
         if not self._access_token:
             raise RuntimeError("No access token — not logged into ChatGPT")
         logger.info("Auth: %d chars, user: %s", len(self._access_token), self._user_name)
@@ -475,14 +527,24 @@ class CDPDriver:
         await self.type_message(text)
         await self.click_send()
 
-        # Wait for a new assistant message (up to 60s)
-        deadline = time.monotonic() + min(timeout, 60)
+        # Wait for a new assistant message. The full `timeout` governs (was
+        # capped at 60s, which killed slow-to-appear responses like image
+        # generation). A stall detector (PHASE_STALL_SECONDS) catches a true
+        # hang fast: if the assistant node count doesn't change at all — even
+        # 0→1 with empty text counts as progress — for longer than the stall
+        # window, we raise GenerationStuckError instead of waiting out the
+        # whole deadline. Slow-but-progressing generations (image render,
+        # deep-research thinking) keep resetting the stall clock and are
+        # allowed the full timeout.
+        deadline = time.monotonic() + timeout
+        last_node_count = initial_count
+        last_progress = time.monotonic()
         while time.monotonic() < deadline:
             # First check for ChatGPT's rate-limit pop-up — if present, fail
             # fast with a clear error instead of waiting out the whole timeout.
             # The pop-up blocks the assistant from responding, so the assistant
             # count would never increase; without this check we'd hit a generic
-            # 60s timeout that hides the real cause.
+            # timeout that hides the real cause.
             dom_scan = await self._js(
                 "(function(){"
                 "  var t = (document.body && document.body.innerText) || '';"
@@ -500,16 +562,35 @@ class CDPDriver:
             raw = await self._js(
                 "document.querySelectorAll('[data-message-author-role=\"assistant\"]').length"
             )
-            if int(raw or 0) > initial_count:
+            current_count = int(raw or 0)
+            if current_count != last_node_count:
+                # Any node-count change is progress (incl. 0→1 with empty text,
+                # the slow-render case). Reset the stall clock.
+                last_node_count = current_count
+                last_progress = time.monotonic()
+            if current_count > initial_count:
                 break
+            if time.monotonic() - last_progress > PHASE_STALL_SECONDS:
+                raise GenerationStuckError(
+                    "phase_1_appear", time.monotonic() - last_progress
+                )
             await asyncio.sleep(0.5)
         else:
-            raise RuntimeError("Timed out waiting for assistant response")
+            raise GenerationStuckError(
+                "phase_1_appear", timeout
+            )
 
         logger.info("Assistant message appeared, waiting for completion...")
 
-        # Poll until generation is done (Stop button gone)
+        # Poll until generation is done (Stop button gone). A stall detector
+        # (PHASE_STALL_SECONDS) catches a stuck generation: if the DOM text
+        # doesn't change at all for longer than the stall window while the Stop
+        # button is still present, we raise GenerationStuckError instead of
+        # falling through to a silent empty/truncated completion. Any DOM-text
+        # change resets the stall clock — including edits/reformats where length
+        # stays constant but content changes (current != last_dom_text).
         last_dom_text = ""
+        last_change_time = time.monotonic()
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             result = await self._js(
@@ -532,13 +613,24 @@ class CDPDriver:
             current = data.get("text", "")
             done = data.get("done", False)
 
-            if len(current) > len(last_dom_text):
-                delta = current[len(last_dom_text):]
+            if current != last_dom_text:
+                last_change_time = time.monotonic()
+                if len(current) > len(last_dom_text):
+                    # Grew: yield just the newly appended chars.
+                    delta = current[len(last_dom_text):]
+                    yield StreamChunk(delta=delta)
+                # Else: text changed without growing (reformat/edit). Don't yield
+                # a delta here — the API reconcile path below corrects the final
+                # text. Just reset the stall clock (done above).
                 last_dom_text = current
-                yield StreamChunk(delta=delta)
 
             if done:
                 break
+
+            if time.monotonic() - last_change_time > PHASE_STALL_SECONDS:
+                raise GenerationStuckError(
+                    "phase_2_stream", time.monotonic() - last_change_time
+                )
 
             await asyncio.sleep(0.5)
 
@@ -568,14 +660,22 @@ class CDPDriver:
         yield StreamChunk(delta="", finish_reason="stop")
 
     async def _fetch_text(self, conversation_id: str) -> str:
-        """Fetch the latest assistant text from the conversation API."""
-        return await self._js_with_data(
+        """Fetch the latest assistant text from the conversation API.
+
+        Non-OK responses are encoded by the JS as ``{"__status": <code>}``
+        rather than ``''`` so Python can distinguish an auth failure (401 →
+        AuthExpiredError) from a missing conversation (404) or a network
+        error. This parse-and-raise happens here, before any return reaches
+        the caller, so callers never see a raw status blob as text.
+        """
+        await self.ensure_token()
+        raw = await self._js_with_data(
             "(async function() {"
             "  try {"
             "    var r = await fetch('/backend-api/conversation/' + __D.conv_id + '?offset=0&limit=5', {"
             "      headers: {'Authorization': 'Bearer ' + __D.token}"
             "    });"
-            "    if (!r.ok) return '';"
+            "    if (!r.ok) return JSON.stringify({__status: r.status});"
             "    var conv = await r.json();"
             "    var mapping = conv.mapping || {};"
             "    var current = conv.current_node || '';"
@@ -593,7 +693,22 @@ class CDPDriver:
             "})()",
             {"conv_id": conversation_id, "token": self._access_token},
             timeout=15,
-        ) or ""
+        )
+        if not raw:
+            return ""
+        # Detect the status-blob shape (non-OK response) and raise appropriately.
+        # Cheap pre-check before json.loads to avoid parsing every valid text body.
+        if raw.startswith('{"__status"') or raw.startswith("{ \"__status\""):
+            try:
+                payload = json.loads(raw)
+                status = payload.get("__status")
+            except (json.JSONDecodeError, TypeError):
+                status = None
+            if status == 401:
+                raise AuthExpiredError()
+            if status is not None:
+                raise RuntimeError(f"_fetch_text HTTP {status} for {conversation_id}")
+        return raw
 
     async def dismiss_rate_limit(self) -> bool:
         """Dismiss ChatGPT's 'Too many requests' pop-up by clicking 'Got it'.
@@ -663,6 +778,7 @@ class CDPDriver:
         ``do_list_models`` crash on ``m.get('slug')`` — only live testing
         caught it, since the mocked unit tests returned dicts.
         """
+        await self.ensure_token()
         raw = await self._js_with_data(
             "(async () => {"
             "  var r = await fetch('/backend-api/models?iim=false&is_gizmo=false', {"
@@ -684,6 +800,7 @@ class CDPDriver:
 
     @diagnose("get_projects")
     async def get_projects(self) -> list[dict]:
+        await self.ensure_token()
         raw = await self._js_with_data(
             "(async () => {"
             "  var r = await fetch('/backend-api/gizmos/snorlax/sidebar?owned_only=true&conversations_per_gizmo=5&limit=50', {"
@@ -712,6 +829,7 @@ class CDPDriver:
         order: str = "updated",
     ) -> list[dict]:
         """List recent conversations."""
+        await self.ensure_token()
         raw = await self._js_with_data(
             "(async () => {"
             "  var r = await fetch('/backend-api/conversations?offset=' + __D.offset + '&limit=' + __D.limit + '&order=' + __D.order, {"
@@ -734,6 +852,7 @@ class CDPDriver:
     @diagnose("get_conversation")
     async def get_conversation(self, conversation_id: str) -> dict:
         """Get full conversation detail with message mapping."""
+        await self.ensure_token()
         raw = await self._js_with_data(
             "(async () => {"
             "  var r = await fetch('/backend-api/conversation/' + __D.conv_id, {"
@@ -752,6 +871,7 @@ class CDPDriver:
     @diagnose("delete_conversation")
     async def delete_conversation(self, conversation_id: str) -> bool:
         """Delete a conversation. Returns True on success."""
+        await self.ensure_token()
         result = await self._js_with_data(
             "(async () => {"
             "  try {"
@@ -777,6 +897,7 @@ class CDPDriver:
         self, conversation_id: str, title: str
     ) -> bool:
         """Rename a conversation. Returns True on success."""
+        await self.ensure_token()
         result = await self._js_with_data(
             "(async () => {"
             "  try {"
@@ -832,6 +953,7 @@ class CDPDriver:
         # The UI sends "unset" for the Default (shared) memory option and
         # "project_v2" for Project-only. Map our public values accordingly.
         api_memory_scope = "project_v2" if memory_scope == "project_v2" else "unset"
+        await self.ensure_token()
         raw = await self._js_with_data(
             "(async () => {"
             "  try {"
@@ -895,6 +1017,7 @@ class CDPDriver:
         first and include it alongside the new instructions. Captured from
         ChatGPT's own UI via Super-Browser network capture.
         """
+        await self.ensure_token()
         result = await self._js_with_data(
             "(async () => {"
             "  try {"
@@ -954,6 +1077,7 @@ class CDPDriver:
         self, conversation_id: str, archive: bool = True
     ) -> bool:
         """Archive or unarchive a conversation. Returns True on success."""
+        await self.ensure_token()
         result = await self._js_with_data(
             "(async () => {"
             "  try {"
@@ -978,6 +1102,7 @@ class CDPDriver:
     @diagnose("get_memories")
     async def get_memories(self) -> list[dict]:
         """List all ChatGPT memories."""
+        await self.ensure_token()
         raw = await self._js_with_data(
             "(async () => {"
             "  try {"
@@ -1046,6 +1171,7 @@ class CDPDriver:
     @diagnose("delete_memory")
     async def delete_memory(self, memory_id: str) -> bool:
         """Delete a ChatGPT memory by ID. Returns True on success."""
+        await self.ensure_token()
         result = await self._js_with_data(
             "(async () => {"
             "  try {"
@@ -1074,6 +1200,7 @@ class CDPDriver:
         creation is split across /projects and /gizmos, but deletion is shared).
         Verified to return 200 against a live account.
         """
+        await self.ensure_token()
         result = await self._js_with_data(
             "(async () => {"
             "  try {"
@@ -1130,6 +1257,7 @@ class CDPDriver:
         for those.  Only marketplace or user-created non-project GPTs
         are returned.
         """
+        await self.ensure_token()
         raw = await self._js_with_data(
             "(async () => {"
             "  var r = await fetch('/backend-api/gizmos/snorlax/sidebar?owned_only=false&conversations_per_gizmo=0&limit=100', {"
@@ -1157,6 +1285,7 @@ class CDPDriver:
     @diagnose("get_project_files")
     async def get_project_files(self, project_id: str) -> list[dict]:
         """List files attached to a ChatGPT project."""
+        await self.ensure_token()
         raw = await self._js_with_data(
             "(async () => {"
             "  try {"
@@ -1184,8 +1313,18 @@ class CDPDriver:
     # ── Token Management ──────────────────────────────────────
 
     async def ensure_token(self) -> str:
-        """Ensure a valid access token, refreshing if needed. Returns the token."""
-        if not self._access_token:
+        """Ensure a non-stale access token, refreshing if empty OR older than TTL.
+
+        Returns the token. The TTL guard (TOKEN_TTL_SECONDS) catches expiry
+        well before the real JWT lifetime; callers should invoke this before
+        any /backend-api/* fetch so a stale session surfaces as
+        AuthExpiredError (via _fetch_text) rather than silent empty data.
+        """
+        stale = (
+            not self._access_token
+            or time.time() - self._token_fetched_at > TOKEN_TTL_SECONDS
+        )
+        if stale:
             await self._refresh_token()
         return self._access_token
 

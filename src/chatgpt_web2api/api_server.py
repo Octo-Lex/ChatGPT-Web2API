@@ -18,7 +18,13 @@ from typing import Optional
 
 from aiohttp import web
 
-from .cdp_driver import CDPDriver, RateLimitError, is_rate_limited_text
+from .cdp_driver import (
+    AuthExpiredError,
+    CDPDriver,
+    GenerationStuckError,
+    RateLimitError,
+    is_rate_limited_text,
+)
 from .config import Config
 from .resilience import retry_on_rate_limit
 
@@ -248,11 +254,18 @@ class APIServer:
     def _error_response(self, exc: Exception) -> web.Response:
         """Map a driver exception to an OpenAI-shaped error response.
 
-        RateLimitError → HTTP 429 with the canonical OpenAI
-        ``rate_limit_exceeded`` type/code and a ``Retry-After`` header, so any
-        OpenAI-aware agent framework (SDK, LangChain, LlamaIndex) automatically
-        backs off and retries with zero client integration. Every other
-        exception stays a 500 ``server_error`` (a real failure, not retriable).
+        - RateLimitError → HTTP 429 with the canonical OpenAI
+          ``rate_limit_exceeded`` type/code and a ``Retry-After`` header, so any
+          OpenAI-aware agent framework (SDK, LangChain, LlamaIndex) automatically
+          backs off and retries with zero client integration.
+        - AuthExpiredError → HTTP 401 ``invalid_api_key`` — the ChatGPT session
+          expired; previously this surfaced as silent empty data or a generic
+          timeout.
+        - GenerationStuckError → HTTP 504 ``generation_stuck`` — the generation
+          stalled (no DOM progress within the stall window); the phase is in the
+          message for diagnosis.
+        - Everything else stays a 500 ``server_error`` (a real failure, not
+          retriable).
         """
         if isinstance(exc, RateLimitError):
             retry_after = str(int(exc.retry_after))
@@ -267,6 +280,30 @@ class APIServer:
                 },
                 status=429,
                 headers={"Retry-After": retry_after},
+            )
+        if isinstance(exc, AuthExpiredError):
+            return web.json_response(
+                {
+                    "error": {
+                        "message": str(exc),
+                        "type": "invalid_api_key",
+                        "param": None,
+                        "code": "invalid_api_key",
+                    }
+                },
+                status=401,
+            )
+        if isinstance(exc, GenerationStuckError):
+            return web.json_response(
+                {
+                    "error": {
+                        "message": str(exc),
+                        "type": "server_error",
+                        "param": None,
+                        "code": "generation_stuck",
+                    }
+                },
+                status=504,
             )
         return web.json_response(
             {"error": {"message": str(exc), "type": "server_error"}},
@@ -388,6 +425,22 @@ class APIServer:
             await self._send_sse(resp, {
                 "id": cid, "object": "chat.completion.chunk", "created": created, "model": model,
                 "choices": [{"index": 0, "delta": {"content": f"\n\n[Error: rate_limit_exceeded — retry in {e.retry_after}s]"}, "finish_reason": "error"}],
+            })
+        except AuthExpiredError:
+            # Session expired mid-stream (status locked at 200). Surface with a
+            # recognizable marker so clients can prompt re-login.
+            logger.warning("Mid-stream auth expiry")
+            await self._send_sse(resp, {
+                "id": cid, "object": "chat.completion.chunk", "created": created, "model": model,
+                "choices": [{"index": 0, "delta": {"content": "\n\n[Error: auth_expired — re-login required]"}, "finish_reason": "error"}],
+            })
+        except GenerationStuckError as e:
+            # Generation stalled mid-stream (status locked at 200). Surface the
+            # phase + duration so the client can decide whether to retry.
+            logger.warning("Mid-stream generation stuck: %s", e)
+            await self._send_sse(resp, {
+                "id": cid, "object": "chat.completion.chunk", "created": created, "model": model,
+                "choices": [{"index": 0, "delta": {"content": f"\n\n[Error: generation_stuck — stalled in {e.phase} for {e.stalled_for_s:.0f}s]"}, "finish_reason": "error"}],
             })
         except Exception as e:
             logger.error("Stream error: %s", e)

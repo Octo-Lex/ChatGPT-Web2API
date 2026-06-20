@@ -1,11 +1,15 @@
-"""Tests for the MCP server's rate-limit structured result.
+"""Tests for the MCP server's rate-limit error handling.
 
-MCP has no transport-level retry-after, so a rate limit is signaled
-semantically: a CallToolResult with isError=True AND a structuredContent
-payload an agent can parse to decide "pause, then retry this tool."
+MCP has no transport-level retry-after, so a persistent rate limit is
+signaled as a CallToolResult with isError=True and a machine-readable
+marker (rate_limit_exceeded, retry_after=N) in the text content. The
+error info is in text rather than structuredContent because the MCP SDK
+validates structuredContent against the tool's outputSchema, and the
+error payload deliberately doesn't match the success schema.
 
-The chat tools are also wrapped in retry_on_rate_limit so a transient limit
-is retried transparently first; only a persistent limit reaches the client.
+The chat tools are also wrapped in retry_on_rate_limit so a transient
+limit is retried transparently first; only a persistent limit reaches
+the client.
 """
 
 import asyncio
@@ -51,10 +55,13 @@ def _make_server_with_raising_driver(raises: Exception | None):
 
 @pytest.mark.asyncio
 async def test_mcp_chat_persistent_rate_limit_returns_structured_error(monkeypatch):
-    """When every retry is throttled, call_tool returns isError + structuredContent.
+    """When every retry is throttled, call_tool returns isError with a
+    machine-readable marker in the text content.
 
-    An agent can read structuredContent.rate_limited / retry_after to decide
-    to pause and retry the tool — instead of parsing an English error string.
+    The error info (rate_limited, retry_after) is embedded in the text rather
+    than structuredContent because the MCP SDK validates structuredContent
+    against the tool's outputSchema, and the error payload deliberately
+    doesn't match any tool's success schema.
     """
     # Patch sleep so the (exhausted) retries don't make the test take minutes.
     import chatgpt_web2api.resilience as res
@@ -62,7 +69,7 @@ async def test_mcp_chat_persistent_rate_limit_returns_structured_error(monkeypat
     monkeypatch.setattr(res.asyncio, "sleep", _noop)
 
     # Raise on EVERY attempt → retries exhaust → RateLimitError propagates
-    # to call_tool, which converts it to a structured error result.
+    # to call_tool, which converts it to an error result.
     server, _ = _make_server_with_raising_driver(RateLimitError(retry_after=90))
     from mcp.shared.memory import create_connected_server_and_client_session
 
@@ -73,12 +80,11 @@ async def test_mcp_chat_persistent_rate_limit_returns_structured_error(monkeypat
         )
 
     assert result.isError is True
-    # Machine-readable structured payload for the agent:
-    sc = result.structuredContent or {}
-    assert sc.get("rate_limited") is True
-    assert sc.get("retry_after") == 90
-    # Text content still carries a human-readable message
-    assert "rate" in result.content[0].text.lower()
+    # Machine-readable markers in the text content:
+    text = result.content[0].text.lower()
+    assert "rate" in text
+    assert "90" in text  # retry_after value
+    assert "rate_limit_exceeded" in text
 
 
 # ── Transient rate limit -> transparent retry succeeds ────────
