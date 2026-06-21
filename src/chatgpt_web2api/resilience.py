@@ -93,7 +93,7 @@ async def retry_on_rate_limit(
             try:
                 dismissed = await driver.dismiss_rate_limit()
             except Exception:  # best-effort
-                dismissed = False
+                dismissed = None  # unknown — see dismiss_rate_limit's tri-state contract
             wait = min(e.retry_after or backoff, cap)
             wait = wait + random.uniform(0, min(wait, 1.0))  # jitter
             logger.info(

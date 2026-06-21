@@ -564,6 +564,13 @@ class CDPDriver:
             await asyncio.sleep(0.5)  # Let UI settle
             return True
 
+        # #8: Close the dropdown if model wasn't found, so it doesn't
+        # overlay the textarea and corrupt subsequent type/send operations.
+        if result == "not-found":
+            try:
+                await self._js_strict("document.body.click()")  # dismiss dropdown
+            except Exception:
+                pass  # best-effort
         logger.warning("Model '%s' not found in picker: %s — proceeding with active model", slug, result)
         return False
 
@@ -589,7 +596,14 @@ class CDPDriver:
             try:
                 state = json.loads(result)
                 if state.get("ready"):
-                    logger.info("Page ready: %s", state.get("url"))
+                    actual_url = state.get("url", "")
+                    # #14: verify we actually landed on chatgpt.com, not an
+                    # error/recovery page that happens to have a textarea.
+                    if "chatgpt.com" not in actual_url:
+                        raise RuntimeError(
+                            f"Navigation landed on unexpected URL: {actual_url}"
+                        )
+                    logger.info("Page ready: %s", actual_url)
                     break
             except (json.JSONDecodeError, TypeError):
                 pass
@@ -619,7 +633,13 @@ class CDPDriver:
             try:
                 state = json.loads(result)
                 if state.get("ready"):
-                    logger.info("Conversation ready: %s", state.get("url"))
+                    actual_url = state.get("url", "")
+                    # #14: verify we landed on the right conversation
+                    if conversation_id not in actual_url:
+                        raise RuntimeError(
+                            f"Navigation to {conversation_id} landed on {actual_url}"
+                        )
+                    logger.info("Conversation ready: %s", actual_url)
                     break
             except (json.JSONDecodeError, TypeError):
                 pass
@@ -693,6 +713,22 @@ class CDPDriver:
         )
         if result != "sent":
             raise RuntimeError(f"Send failed: {result}")
+        # #13: Verify the send actually landed — ChatGPT clears the textarea
+        # on successful send. If it's still populated, the click didn't
+        # register (modal overlay, React handler unmounted, etc.). Give it
+        # a brief moment to clear.
+        await asyncio.sleep(0.3)
+        try:
+            remaining = await self._js_strict(
+                "document.querySelector('#prompt-textarea')?.textContent || ''"
+            )
+        except Exception:
+            remaining = ""  # can't verify — proceed optimistically
+        if remaining.strip():
+            raise RuntimeError(
+                f"Send appeared to succeed but textarea still has content "
+                f"(len={len(remaining)}) — click may not have registered"
+            )
         logger.info("Message sent")
 
     # ── Response Retrieval ────────────────────────────────────
@@ -879,23 +915,31 @@ class CDPDriver:
                 "      headers: {'Authorization': 'Bearer ' + __D.token}"
                 "    });"
                 "    if (!r.ok) return JSON.stringify({__status: r.status});"
-            "    var conv = await r.json();"
-            "    var mapping = conv.mapping || {};"
-            "    var current = conv.current_node || '';"
-            "    if (current && mapping[current]) {"
-            "      var node = mapping[current];"
-            "      if (node.message && node.message.author && node.message.author.role === 'assistant') {"
-            "        if (node.message.content.content_type === 'text') {"
-            "          var parts = node.message.content.parts || [];"
-            "          if (parts.length > 0 && parts[0]) return parts[0];"
-            "        }"
-            "      }"
-            "    }"
-            "    return '';"
-            "  } catch(e) { return ''; }"
-            "})()",
-            {"conv_id": conversation_id, "token": self._access_token},
-            timeout=15,
+                "    var conv = await r.json();"
+                "    var mapping = conv.mapping || {};"
+                "    var current = conv.current_node || '';"
+                "    // #12: Traverse backward from current_node to find the most"
+                "    // recent ASSISTANT node with text. current_node may point at a"
+                "    // user message or a wrong-branch leaf after regen/edit."
+                "    var n = current;"
+                "    var guard = 0;"
+                "    while (n && guard < 50) {"
+                "      guard++;"
+                "      var nd = mapping[n] || {};"
+                "      var msg = nd.message;"
+                "      if (msg && msg.author && msg.author.role === 'assistant') {"
+                "        if (msg.content && msg.content.content_type === 'text') {"
+                "          var parts = msg.content.parts || [];"
+                "          if (parts.length > 0 && parts[0]) return parts[0];"
+                "        }"
+                "      }"
+                "      n = nd.parent;"
+                "    }"
+                "    return '';"
+                "  } catch(e) { return ''; }"
+                "})()",
+                {"conv_id": conversation_id, "token": self._access_token},
+                timeout=15,
         )
         except CDPJSError as e:
             logger.debug("_fetch_text JS failed (will retry): %s", e)
@@ -925,9 +969,10 @@ class CDPDriver:
         page to confirm the pop-up cleared.
 
         Best-effort: never raises. Returns True if the pop-up is gone after the
-        attempt, False if it couldn't be dismissed (button missing, JS error,
-        or the limit persists). Callers should back off and retry regardless
-        when this returns False.
+        attempt, False if it couldn't be dismissed (button missing, or the
+        limit persists), None if the status is unknown (scan error — the
+        click may have succeeded but we can't confirm). Callers should retry
+        on False but NOT on None, to avoid hammering an already-dismissed pop-up.
         """
         click_js = (
             "(function(){"
@@ -954,7 +999,7 @@ class CDPDriver:
             clicked = json.loads(click_raw).get("clicked", False) if click_raw else False
         except Exception:  # best-effort: never raise
             logger.warning("dismiss_rate_limit: click failed", exc_info=True)
-            return False
+            return None  # unknown — don't trigger retry storm
         if not clicked:
             return False
 
@@ -967,9 +1012,28 @@ class CDPDriver:
             )
             text = json.loads(scan).get("text", "") if scan else ""
         except Exception:
-            # If the re-scan errors, assume not cleared.
-            return False
+            # #19: If the re-scan errors, the status is unknown (not False).
+            # Returning False would trigger a retry storm against an already-
+            # dismissed pop-up; returning None lets callers skip the retry.
+            return None
         return not is_rate_limited_text(text)
+
+    def _check_auth_in_raw(self, raw: str) -> None:
+        """#20: Detect auth failure in raw response text and raise.
+
+        Most read methods' JS doesn't check r.ok or r.status — a 401 returns
+        the HTML login page body. This helper catches that case in Python so
+        a stale token surfaces as AuthExpiredError instead of empty data.
+        Called after _js_with_data_strict returns, before json.loads.
+        """
+        if not raw:
+            return
+        # Login pages contain these markers
+        lower = raw[:500].lower()
+        if "sign in" in lower and "chatgpt" in lower and "<html" in lower:
+            raise AuthExpiredError(
+                "Session expired — read returned login page instead of data"
+            )
 
     # ── API helpers ───────────────────────────────────────────
 
@@ -995,6 +1059,7 @@ class CDPDriver:
                 "})()",
                 {"token": self._access_token},
             )
+            self._check_auth_in_raw(raw)
             data = json.loads(raw)
         except (CDPJSError, json.JSONDecodeError, TypeError) as e:
             logger.warning("get_models failed: %s", e)
@@ -1022,6 +1087,7 @@ class CDPDriver:
                 "})()",
                 {"token": self._access_token},
             )
+            self._check_auth_in_raw(raw)
             return json.loads(raw)
         except (CDPJSError, json.JSONDecodeError) as e:
             logger.warning("get_projects failed: %s", e)
@@ -1053,6 +1119,7 @@ class CDPDriver:
                 "})()",
                 {"token": self._access_token, "offset": str(offset), "limit": str(limit), "order": order},
             )
+            self._check_auth_in_raw(raw)
             return json.loads(raw)
         except (CDPJSError, json.JSONDecodeError) as e:
             logger.warning("get_conversations failed: %s", e)
@@ -1073,6 +1140,7 @@ class CDPDriver:
                 {"conv_id": conversation_id, "token": self._access_token},
                 timeout=30,
             )
+            self._check_auth_in_raw(raw)
             return json.loads(raw)
         except (CDPJSError, json.JSONDecodeError) as e:
             logger.warning("get_conversation failed: %s", e)
@@ -1206,6 +1274,7 @@ class CDPDriver:
             timeout=20,
         )
         try:
+            self._check_auth_in_raw(raw)
             result = json.loads(raw)
             if "error" in result:
                 logger.error("Create project failed: %s", result["error"])
@@ -1282,6 +1351,7 @@ class CDPDriver:
             timeout=15,
         )
         try:
+            self._check_auth_in_raw(raw)
             return json.loads(raw)
         except json.JSONDecodeError:
             return {}
@@ -1344,6 +1414,7 @@ class CDPDriver:
                 {"token": self._access_token},
                 timeout=15,
             )
+            self._check_auth_in_raw(raw)
             data = json.loads(raw)
             if isinstance(data, dict) and "error" in data:
                 logger.error("Get memories failed: %s", data["error"])
@@ -1384,14 +1455,28 @@ class CDPDriver:
 
         logger.info("Memory creation request sent via chat (conv: %s)", conv_id)
 
+        # #17: Check if the memory was actually created by looking for it
+        # in the memories list. ChatGPT may refuse or paraphrase — without
+        # this check the caller can't tell success from failure.
+        memory_created = False
+        try:
+            memories = await self.get_memories()
+            memory_created = any(
+                content[:30].lower() in (m.get("content", "")[:50].lower())
+                for m in memories
+            )
+        except Exception:
+            pass  # best-effort verification
+
         return {
             "content": content,
             "method": "chat",
             "conversation_id": conv_id,
             "response": full_response[:200],
+            "success": memory_created,
             "note": (
                 "Memory creation happens via chat — ChatGPT may paraphrase "
-                "or decline. Use list_memories to verify."
+                "or decline. Verified via list_memories."
             ),
         }
 
@@ -1511,6 +1596,7 @@ class CDPDriver:
                 {"token": self._access_token},
                 timeout=20,
             )
+            self._check_auth_in_raw(raw)
             return json.loads(raw)
         except (CDPJSError, json.JSONDecodeError) as e:
             logger.warning("list_gpts failed: %s", e)
@@ -1542,6 +1628,7 @@ class CDPDriver:
                 {"token": self._access_token, "project_id": project_id},
                 timeout=15,
             )
+            self._check_auth_in_raw(raw)
             return json.loads(raw)
         except (CDPJSError, json.JSONDecodeError) as e:
             logger.warning("get_project_files failed: %s", e)

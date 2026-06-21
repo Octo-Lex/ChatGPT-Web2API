@@ -81,14 +81,16 @@ async def test_dismiss_returns_false_when_no_got_it_button():
 
 @pytest.mark.asyncio
 async def test_dismiss_never_raises_on_js_error():
-    """A JS error during dismiss must not propagate — best-effort contract."""
+    """A JS error during dismiss must not propagate — best-effort contract.
+    Returns None (unknown status) per #19 tri-state: not False, to avoid
+    triggering a retry storm against an already-dismissed pop-up."""
     driver = MagicMock()
 
     async def failing_js(expr, timeout=15):
         raise RuntimeError("websocket closed")
 
-    driver._js = failing_js
+    driver._js_strict = failing_js
 
-    # Should swallow and return False, not raise.
+    # Should swallow and return None (not raise, not False).
     result = await CDPDriver.dismiss_rate_limit(driver)
-    assert result is False
+    assert result is None
