@@ -1,34 +1,16 @@
-"""curl_cffi TLS-impersonation send test.
-
-The pure-Python (urllib) send 403'd with 'Unusual activity'. This test
-isolates whether TLS fingerprinting is the cause by replaying the SAME
-send request through curl_cffi with Chrome impersonation. If it goes
-200, TLS was the gate. If still 403, something else.
-
-prepare/finalize still use urllib (they already worked) — only the SEND
-swaps to Chrome-impersonated TLS.
-"""
-
 import asyncio
 import base64
 import json
 import time
+import urllib.error
 import urllib.request
-
-from curl_cffi import requests as cffi_requests
+import uuid
 import websockets
 
-CONV = "6a36adf9-0fa8-83ed-9b9a-aae468239ae7"
+from curl_cffi import requests as cffi_requests
 
+CONV = ""
 STATIC_HEADERS = {
-    "OAI-Language": "en-US",
-    "Content-Type": "application/json",
-    "sec-ch-ua-platform": '"Windows"',
-    "sec-ch-ua": '"Google Chrome";v="149", "Chromium";v="149", "Not)A;Brand";v="24"',
-    "sec-ch-ua-mobile": "?0",
-    "OAI-Client-Build-Number": "7646290",
-    "OAI-Client-Version": "prod-497f333866796e100096ad083b51ca949d22e751",
-    "OAI-Device-Id": "a2791825-a74f-4557-84cb-b611834e7f6c",
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
     "Referer": f"https://chatgpt.com/c/{CONV}",
     "Origin": "https://chatgpt.com",
@@ -153,7 +135,6 @@ async def main():
     print("\n" + "=" * 70)
     print("[SEND] via curl_cffi (impersonate=chrome) — posts real message")
     print("=" * 70)
-    import uuid
     send_body = {
         "action": "next",
         "messages": [{
