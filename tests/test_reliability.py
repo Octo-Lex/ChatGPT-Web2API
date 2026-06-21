@@ -36,7 +36,7 @@ def _mock_js_with_payload(d, payload_map):
     → response string. For _fetch_text the payload carries conv_id+token."""
     async def _fake(js_template, data, timeout=15):
         return payload_map.get(data.get("conv_id"), "")
-    d._js_with_data = _fake
+    d._js_with_data_strict = _fake
     return d
 
 
@@ -80,7 +80,7 @@ async def test_read_methods_call_ensure_token_first():
     # _js_with_data returns a models JSON string
     async def _fake(js_template, data, timeout=15):
         return json.dumps({"title": "Models", "models": [{"slug": "auto", "title": "Auto"}]})
-    d._js_with_data = _fake
+    d._js_with_data_strict = _fake
     # Patch ensure_token to record the call distinctly
     call_order = []
     async def _record_token():
@@ -102,7 +102,7 @@ async def test_fetch_text_401_raises_auth_expired():
     d = _make_driver()
     async def _fake(js_template, data, timeout=15):
         return '{"__status": 401}'
-    d._js_with_data = _fake
+    d._js_with_data_strict = _fake
     d.ensure_token = AsyncMock(return_value="tok")
     with pytest.raises(AuthExpiredError):
         await d._fetch_text("conv-1")
@@ -114,7 +114,7 @@ async def test_fetch_text_404_raises_runtime_error():
     d = _make_driver()
     async def _fake(js_template, data, timeout=15):
         return '{"__status": 404}'
-    d._js_with_data = _fake
+    d._js_with_data_strict = _fake
     d.ensure_token = AsyncMock(return_value="tok")
     with pytest.raises(RuntimeError) as ei:
         await d._fetch_text("conv-1")
@@ -126,7 +126,7 @@ async def test_fetch_text_valid_body_returns_text():
     d = _make_driver()
     async def _fake(js_template, data, timeout=15):
         return "the assistant reply text"
-    d._js_with_data = _fake
+    d._js_with_data_strict = _fake
     d.ensure_token = AsyncMock(return_value="tok")
     result = await d._fetch_text("conv-1")
     assert result == "the assistant reply text"
@@ -157,7 +157,7 @@ async def test_phase1_stall_raises_generation_stuck(monkeypatch):
         if "JSON.stringify" not in expr and ".length" in expr:
             return "1"  # constant count, never > initial_count
         return '{"text":"normal page text"}'
-    d._js = _fake_js
+    d._js_strict = _fake_js
     d.type_message = AsyncMock()
     d.click_send = AsyncMock()
 
@@ -195,7 +195,7 @@ async def test_phase2_stall_raises_generation_stuck(monkeypatch):
         # Count poll (bare .length expression)
         state["count_polls"] += 1
         return "1" if state["count_polls"] > 1 else "0"
-    d._js = _fake_js
+    d._js_strict = _fake_js
     d.type_message = AsyncMock()
     d.click_send = AsyncMock()
     d._fetch_text = AsyncMock(return_value="")
@@ -235,7 +235,7 @@ async def test_slow_appear_succeeds_without_cap(monkeypatch):
         if n > 150:
             return "2"  # appear + break at ~75s
         return "1" if (n // 10) % 2 == 0 else "0"  # wobble 0/1 — progress signal
-    d._js = _fake_js
+    d._js_strict = _fake_js
     d.type_message = AsyncMock()
     d.click_send = AsyncMock()
     d._fetch_text = AsyncMock(return_value="done")
@@ -272,7 +272,7 @@ async def test_progressing_generation_does_not_raise(monkeypatch):
             return json.dumps({"text": "normal"})
         state["phase1_polls"] += 1
         return "1" if state["phase1_polls"] > 1 else "0"
-    d._js = _fake_js
+    d._js_strict = _fake_js
     d.type_message = AsyncMock()
     d.click_send = AsyncMock()
     d._fetch_text = AsyncMock(return_value=state["text"])

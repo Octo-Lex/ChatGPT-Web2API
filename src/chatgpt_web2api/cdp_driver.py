@@ -709,10 +709,14 @@ class CDPDriver:
         6. Fetch final text from conversation API
         """
         # Count existing assistants BEFORE sending
-        initial_raw = await self._js(
-            "document.querySelectorAll('[data-message-author-role=\"assistant\"]').length"
-        )
-        initial_count = int(initial_raw) if initial_raw else 0
+        try:
+            initial_raw = await self._js_strict(
+                "document.querySelectorAll('[data-message-author-role=\"assistant\"]').length"
+            )
+            initial_count = int(initial_raw) if initial_raw else 0
+        except CDPJSError as e:
+            logger.warning("send_and_stream: initial count failed: %s", e)
+            initial_count = 0
 
         # Type and send
         await self.type_message(text)
@@ -736,24 +740,27 @@ class CDPDriver:
             # The pop-up blocks the assistant from responding, so the assistant
             # count would never increase; without this check we'd hit a generic
             # timeout that hides the real cause.
-            dom_scan = await self._js(
-                "(function(){"
-                "  var t = (document.body && document.body.innerText) || '';"
-                "  return JSON.stringify({text: t.slice(0, 4000)});"
-                "})()"
-            )
             try:
+                dom_scan = await self._js_strict(
+                    "(function(){"
+                    "  var t = (document.body && document.body.innerText) || '';"
+                    "  return JSON.stringify({text: t.slice(0, 4000)});"
+                    "})()"
+                )
                 scanned_text = json.loads(dom_scan).get("text", "")
-            except (json.JSONDecodeError, TypeError):
+            except (CDPJSError, json.JSONDecodeError, TypeError):
                 scanned_text = ""
             if is_rate_limited_text(scanned_text):
                 # from_text parses any explicit wait from the pop-up copy.
                 raise RateLimitError.from_text(scanned_text)
 
-            raw = await self._js(
-                "document.querySelectorAll('[data-message-author-role=\"assistant\"]').length"
-            )
-            current_count = int(raw or 0)
+            try:
+                raw = await self._js_strict(
+                    "document.querySelectorAll('[data-message-author-role=\"assistant\"]').length"
+                )
+                current_count = int(raw or 0)
+            except CDPJSError:
+                current_count = last_node_count  # no progress signal
             if current_count != last_node_count:
                 # Any node-count change is progress (incl. 0→1 with empty text,
                 # the slow-render case). Reset the stall clock.
@@ -784,20 +791,20 @@ class CDPDriver:
         last_change_time = time.monotonic()
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            result = await self._js(
-                "(function() {"
-                "  var msgs = document.querySelectorAll('[data-message-author-role=\"assistant\"]');"
-                "  if (!msgs.length) return JSON.stringify({text:'', done:false});"
-                "  var last = msgs[msgs.length - 1];"
-                "  var md = last.querySelector('.markdown');"
-                "  var text = md ? (md.textContent || '') : '';"
-                "  var stopBtn = document.querySelector('button[aria-label=\"Stop\"]');"
-                "  return JSON.stringify({text: text, done: !stopBtn && !!md});"
-                "})()",
-            )
             try:
+                result = await self._js_strict(
+                    "(function() {"
+                    "  var msgs = document.querySelectorAll('[data-message-author-role=\"assistant\"]');"
+                    "  if (!msgs.length) return JSON.stringify({text:'', done:false});"
+                    "  var last = msgs[msgs.length - 1];"
+                    "  var md = last.querySelector('.markdown');"
+                    "  var text = md ? (md.textContent || '') : '';"
+                    "  var stopBtn = document.querySelector('button[aria-label=\"Stop\"]');"
+                    "  return JSON.stringify({text: text, done: !stopBtn && !!md});"
+                    "})()",
+                )
                 data = json.loads(result)
-            except (json.JSONDecodeError, TypeError):
+            except (CDPJSError, json.JSONDecodeError, TypeError):
                 await asyncio.sleep(0.5)
                 continue
 
@@ -828,7 +835,11 @@ class CDPDriver:
         # Wait for URL to become /c/{id}
         conv_id = ""
         for _ in range(30):
-            url = await self._js("window.location.href")
+            try:
+                url = await self._js_strict("window.location.href")
+            except CDPJSError:
+                await asyncio.sleep(0.5)
+                continue
             if "/c/" in url:
                 conv_id = url.split("/c/")[1].split("/")[0].split("?")[0]
                 break
@@ -860,13 +871,14 @@ class CDPDriver:
         the caller, so callers never see a raw status blob as text.
         """
         await self.ensure_token()
-        raw = await self._js_with_data(
-            "(async function() {"
-            "  try {"
-            "    var r = await fetch('/backend-api/conversation/' + __D.conv_id + '?offset=0&limit=5', {"
-            "      headers: {'Authorization': 'Bearer ' + __D.token}"
-            "    });"
-            "    if (!r.ok) return JSON.stringify({__status: r.status});"
+        try:
+            raw = await self._js_with_data_strict(
+                "(async function() {"
+                "  try {"
+                "    var r = await fetch('/backend-api/conversation/' + __D.conv_id + '?offset=0&limit=5', {"
+                "      headers: {'Authorization': 'Bearer ' + __D.token}"
+                "    });"
+                "    if (!r.ok) return JSON.stringify({__status: r.status});"
             "    var conv = await r.json();"
             "    var mapping = conv.mapping || {};"
             "    var current = conv.current_node || '';"
@@ -885,6 +897,9 @@ class CDPDriver:
             {"conv_id": conversation_id, "token": self._access_token},
             timeout=15,
         )
+        except CDPJSError as e:
+            logger.debug("_fetch_text JS failed (will retry): %s", e)
+            return ""
         if not raw:
             return ""
         # Detect the status-blob shape (non-OK response) and raise appropriately.
