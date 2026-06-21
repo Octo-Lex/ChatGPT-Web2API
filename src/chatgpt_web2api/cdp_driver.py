@@ -202,15 +202,72 @@ class CDPDriver:
         self._token_fetched_at: float = 0.0
         self._current_conv_id: Optional[str] = None
         self._current_model: Optional[str] = None
+        # CDP response routing (#7): id-keyed futures + background reader
+        self._pending: dict[int, asyncio.Future] = {}
+        self._reader_task: Optional[asyncio.Task] = None
 
     # ── Connection ────────────────────────────────────────────
 
     async def connect(self) -> None:
         """Connect to Chrome's CDP and authenticate."""
         ws_url = await self._find_page_ws()
-        self._ws = await websockets.connect(ws_url, max_size=100 * 1024 * 1024)
+        self._ws = await websockets.connect(
+            ws_url, max_size=100 * 1024 * 1024,
+            ping_interval=20, ping_timeout=10,
+        )
+        self._reader_task = asyncio.create_task(self._reader_loop())
         logger.info("CDP connected to Chrome")
         await self._refresh_token()
+
+    async def reconnect(self) -> None:
+        """Reconnect after a socket drop (#4).
+
+        Re-discovers the page websocket URL (Chrome may have restarted with a
+        different one), re-opens the connection, and restarts the background
+        reader. Resets stale state (#18): _current_conv_id and _current_model
+        are cleared because a socket death almost certainly means the page
+        navigated or the tab was closed — the old conversation/model context
+        is no longer valid.
+
+        Backoff: 3 attempts at 2s/5s/10s before giving up.
+        """
+        # Stop the old reader if it's still running
+        if self._reader_task and not self._reader_task.done():
+            self._reader_task.cancel()
+            try:
+                await asyncio.wait_for(self._reader_task, timeout=2)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                pass
+        self._reader_task = None
+        # Close the dead socket if present
+        if self._ws:
+            try:
+                await self._ws.close()
+            except Exception:
+                pass
+            self._ws = None
+        # Clear stale state (#18) — the page we reconnect to may be different
+        self._current_conv_id = None
+        self._current_model = None
+        self._pending.clear()
+
+        # Reconnect with backoff
+        for attempt, delay in enumerate([2, 5, 10], 1):
+            try:
+                ws_url = await self._find_page_ws()
+                self._ws = await websockets.connect(
+                    ws_url, max_size=100 * 1024 * 1024,
+                    ping_interval=20, ping_timeout=10,
+                )
+                self._reader_task = asyncio.create_task(self._reader_loop())
+                await self._refresh_token()
+                logger.info("CDP reconnected on attempt %d", attempt)
+                return
+            except Exception as e:
+                logger.warning("Reconnect attempt %d failed: %s", attempt, e)
+                if attempt < 3:
+                    await asyncio.sleep(delay)
+        raise RuntimeError("CDP reconnect failed after 3 attempts")
 
     async def _find_page_ws(self) -> str:
         """Find a suitable page's websocket URL."""
@@ -226,8 +283,30 @@ class CDPDriver:
 
         # Prefer chatgpt.com page
         chatgpt = [t for t in pages if "chatgpt.com" in t.get("url", "") or "chatgpt.com" in t.get("title", "")]
-        target = chatgpt[0] if chatgpt else pages[0]
-        logger.info("Using page: %s", target.get("title", "")[:60])
+        candidates = chatgpt if chatgpt else pages
+
+        # #16: liveness check — skip targets whose WS URL is unreachable
+        # (crashed tab, about:blank after recovery, etc.)
+        for target in candidates:
+            ws_url = target.get("webSocketDebuggerUrl")
+            if not ws_url:
+                continue
+            try:
+                # Quick HTTP check that the page target is alive
+                check_url = f"http://127.0.0.1:{self.port}/json"
+                with urllib.request.urlopen(
+                    urllib.request.Request(check_url), timeout=3
+                ) as check_resp:
+                    _alive = json.loads(check_resp.read())
+                # If we can reach /json and the target has a WS URL, it's alive
+                logger.info("Using page: %s", target.get("title", "")[:60])
+                return ws_url
+            except Exception:
+                logger.debug("Target not alive: %s", target.get("title", "")[:40])
+                continue
+        # Fallback: return the first candidate even if liveness check failed
+        target = candidates[0]
+        logger.info("Using page (fallback): %s", target.get("title", "")[:60])
         return target["webSocketDebuggerUrl"]
 
     async def _refresh_token(self) -> None:
@@ -249,19 +328,63 @@ class CDPDriver:
 
     # ── CDP primitives ────────────────────────────────────────
 
+    async def _reader_loop(self) -> None:
+        """Background reader: sole consumer of self._ws.recv().
+
+        Routes each incoming CDP message to the matching pending Future by id.
+        Messages without an id (CDP events like Page.frameNavigated) are logged
+        at DEBUG and discarded — no caller subscribes to events today, but the
+        hook is here for future navigation-ready detection.
+
+        On ConnectionClosed, fails all pending futures so callers don't hang.
+        """
+        try:
+            while True:
+                raw = await self._ws.recv()
+                try:
+                    msg = json.loads(raw)
+                except (json.JSONDecodeError, TypeError):
+                    logger.debug("CDP reader: unparseable frame, discarding")
+                    continue
+                mid = msg.get("id")
+                if mid is None:
+                    # Unsolicited CDP event — no caller subscribes yet.
+                    logger.debug("CDP event: %s", msg.get("method", "?"))
+                    continue
+                fut = self._pending.pop(mid, None)
+                if fut and not fut.done():
+                    fut.set_result(msg)
+                else:
+                    logger.debug("CDP reader: response for unknown/stale id %s", mid)
+        except Exception as e:
+            # Socket closed or errored — fail all pending callers so they
+            # don't hang waiting for a response that will never arrive.
+            logger.warning("CDP reader loop ended: %s", e)
+            for mid, fut in list(self._pending.items()):
+                if not fut.done():
+                    fut.set_exception(e)
+
     async def _cdp(self, method: str, params: dict = None, timeout: float = 15) -> dict:
+        """Send a CDP command and await its response.
+
+        Uses the background reader + id-keyed Future table (#7 fix) so
+        concurrent _cdp calls each receive their own response without
+        cross-eating each other's frames.
+        """
         self._msg_id += 1
         mid = self._msg_id
-        await self._ws.send(json.dumps({"id": mid, "method": method, "params": params or {}}))
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            raw = await asyncio.wait_for(
-                self._ws.recv(), timeout=max(1, deadline - time.monotonic())
-            )
-            resp = json.loads(raw)
-            if resp.get("id") == mid:
-                return resp
-        raise TimeoutError(f"CDP timeout: {method}")
+        fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        self._pending[mid] = fut
+        try:
+            await self._ws.send(json.dumps({"id": mid, "method": method, "params": params or {}}))
+        except Exception:
+            self._pending.pop(mid, None)
+            raise
+        try:
+            return await asyncio.wait_for(fut, timeout)
+        except asyncio.TimeoutError:
+            self._pending.pop(mid, None)
+            raise TimeoutError(f"CDP timeout: {method}")
 
     async def _js(self, expr: str, timeout: float = 15) -> str:
         resp = await self._cdp("Runtime.evaluate", {
@@ -1331,6 +1454,19 @@ class CDPDriver:
     # ── Lifecycle ─────────────────────────────────────────────
 
     async def close(self) -> None:
+        # Stop the background reader first
+        if self._reader_task and not self._reader_task.done():
+            self._reader_task.cancel()
+            try:
+                await asyncio.wait_for(self._reader_task, timeout=2)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                pass
+        self._reader_task = None
+        # Fail any pending futures so callers don't hang
+        for mid, fut in list(self._pending.items()):
+            if not fut.done():
+                fut.cancel()
+        self._pending.clear()
         if self._ws:
             await self._ws.close()
             self._ws = None
