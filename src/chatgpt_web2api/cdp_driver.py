@@ -128,6 +128,18 @@ class GenerationStuckError(RuntimeError):
         )
 
 
+class CDPJSError(RuntimeError):
+    """Raised by _js_strict when a JS evaluation fails (exceptionDetails or
+    CDP-level error). The soft _js collapses these to "" silently; _js_strict
+    surfaces them so callers can distinguish "the JS threw" from "the result
+    is genuinely empty." Carries the raw exceptionDetails for diagnosis.
+    """
+
+    def __init__(self, message: str, details: dict | None = None) -> None:
+        self.details = details or {}
+        super().__init__(message)
+
+
 # Phrases ChatGPT uses in its rate-limit pop-up. Matched case-insensitively
 # against scanned DOM text. Kept narrow to avoid false positives on normal
 # chat content (e.g. a user asking about "rate limits" in a message).
@@ -424,6 +436,58 @@ class CDPDriver:
         )
         return await self._js(wrapped, timeout=timeout)
 
+    async def _js_strict(self, expr: str, timeout: float = 15) -> str:
+        """Strict JS evaluation — raises CDPJSError on failure instead of "".
+
+        Inspects the CDP response for:
+        - ``error`` (CDP-level error, e.g. execution context destroyed)
+        - ``exceptionDetails`` (JS threw an exception)
+        - missing ``result.result`` (undefined return, type mismatch)
+
+        On any of these, raises CDPJSError with the detail. On success,
+        returns the value string (same as _js).
+
+        Callers that already handle exceptions benefit immediately. Callers
+        that depend on the ""-on-error contract must wrap in try/except.
+        """
+        resp = await self._cdp("Runtime.evaluate", {
+            "expression": expr,
+            "awaitPromise": True,
+            "returnByValue": True,
+            "timeout": int(timeout * 1000),
+        }, timeout=timeout)
+        # CDP-level error (e.g. "Execution context was destroyed")
+        if "error" in resp:
+            err = resp["error"]
+            raise CDPJSError(
+                f"CDP error evaluating JS: {err.get('message', err)}",
+                details=err,
+            )
+        result = resp.get("result", {})
+        # JS exception
+        if result.get("exceptionDetails"):
+            exd = result["exceptionDetails"]
+            exc_text = exd.get("exception", {}).get("description", "") or exd.get("text", "")
+            raise CDPJSError(
+                f"JS exception: {exc_text[:500]}",
+                details=exd,
+            )
+        inner = result.get("result", {})
+        # Undefined or unserializable return
+        if inner.get("type") in ("undefined",) or "value" not in inner:
+            raise CDPJSError(
+                f"JS returned {inner.get('type', 'unknown')} (no value)",
+                details={"type": inner.get("type")},
+            )
+        return inner.get("value", "")
+
+    async def _js_with_data_strict(self, expr_template: str, data: dict, timeout: float = 15) -> str:
+        """Strict variant of _js_with_data — raises CDPJSError on failure."""
+        wrapped = (
+            f"( (__D) => ({expr_template}) )({json.dumps(data)})"
+        )
+        return await self._js_strict(wrapped, timeout=timeout)
+
     # ── Model Selection ───────────────────────────────────────
 
     async def select_model(self, slug: str) -> bool:
@@ -589,10 +653,14 @@ class CDPDriver:
         await self._cdp("Input.insertText", {"text": text})
         await asyncio.sleep(0.5)
 
-        # Verify
-        content = await self._js(
-            "document.querySelector('#prompt-textarea')?.textContent || ''"
-        )
+        # Verify — use _js_strict so a CDP/JS error surfaces as the real
+        # cause rather than a generic "Failed to insert text".
+        try:
+            content = await self._js_strict(
+                "document.querySelector('#prompt-textarea')?.textContent || ''"
+            )
+        except CDPJSError as e:
+            raise RuntimeError(f"Failed to verify text insertion: {e}") from e
         if not content:
             raise RuntimeError("Failed to insert text into textarea")
         logger.info("Typed: %s", text[:80])
@@ -867,7 +935,7 @@ class CDPDriver:
             "})()"
         )
         try:
-            click_raw = await self._js(click_js, timeout=10)
+            click_raw = await self._js_strict(click_js, timeout=10)
             clicked = json.loads(click_raw).get("clicked", False) if click_raw else False
         except Exception:  # best-effort: never raise
             logger.warning("dismiss_rate_limit: click failed", exc_info=True)
@@ -877,7 +945,7 @@ class CDPDriver:
 
         # Re-scan to confirm the pop-up cleared.
         try:
-            scan = await self._js(
+            scan = await self._js_strict(
                 "(function(){var t=(document.body&&document.body.innerText)||'';"
                 "return JSON.stringify({text:t.slice(0,4000)});})()",
                 timeout=10,

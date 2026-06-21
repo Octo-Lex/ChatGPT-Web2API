@@ -17,10 +17,10 @@ from chatgpt_web2api.cdp_driver import CDPDriver
 
 
 def _driver_with_js_sequence(js_returns: list[str]):
-    """Build a mock driver whose _js returns the given sequence, then True.
+    """Build a mock driver whose _js_strict returns the given sequence.
 
-    Each call to _js pops the next canned return; once exhausted it returns
-    the sentinel 'OK'. This lets us script the click + the post-click re-scan.
+    Each call to _js_strict pops the next canned return; once exhausted it
+    returns 'OK'. This lets us script the click + the post-click re-scan.
     """
     driver = MagicMock()
     seq = list(js_returns)
@@ -30,7 +30,7 @@ def _driver_with_js_sequence(js_returns: list[str]):
             return seq.pop(0)
         return "OK"
 
-    driver._js = fake_js
+    driver._js_strict = fake_js
     return driver
 
 

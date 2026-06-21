@@ -380,11 +380,15 @@ class APIServer:
 
         async def _preflight() -> None:
             """Raise RateLimitError if the pop-up is present right now."""
-            scan = await self._driver._js(
-                "(function(){var t=(document.body&&document.body.innerText)||'';"
-                "return JSON.stringify({text:t.slice(0,4000)});})()",
-                timeout=10,
-            )
+            try:
+                scan = await self._driver._js_strict(
+                    "(function(){var t=(document.body&&document.body.innerText)||'';"
+                    "return JSON.stringify({text:t.slice(0,4000)});})()",
+                    timeout=10,
+                )
+            except Exception:
+                # CDP/JS error during scan — assume no rate limit (proceed).
+                return
             try:
                 body = json.loads(scan).get("text", "") if scan else ""
             except (json.JSONDecodeError, TypeError):
