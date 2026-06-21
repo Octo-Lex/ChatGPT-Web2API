@@ -803,13 +803,24 @@ class CDPDriver:
         logger.info("Assistant message appeared, waiting for completion...")
 
         # Poll until generation is done (Stop button gone). A stall detector
-        # (PHASE_STALL_SECONDS) catches a stuck generation: if the DOM text
-        # doesn't change at all for longer than the stall window while the Stop
-        # button is still present, we raise GenerationStuckError instead of
-        # falling through to a silent empty/truncated completion. Any DOM-text
-        # change resets the stall clock — including edits/reformats where length
-        # stays constant but content changes (current != last_dom_text).
+        # (PHASE_STALL_SECONDS) catches a stuck generation: if NO DOM progress
+        # occurs for longer than the stall window, we raise GenerationStuckError.
+        #
+        # Progress is tracked on THREE signals, not just text, so non-text
+        # responses (images, tool-use, code interpreter) don't falsely stall:
+        #   - text:       .markdown textContent (streamed as deltas for text)
+        #   - html_len:   assistant message innerHTML length (grows when img/
+        #                 canvas/tool-use elements are added)
+        #   - child_count: direct children count (grows when new blocks render)
+        # Any of these changing resets the stall clock.
+        #
+        # Done detection: Stop button gone AND there's meaningful content
+        # (either .markdown text OR non-trivial HTML footprint). The threshold
+        # (> 50 chars) prevents false 'done' from an empty/partial node.
         last_dom_text = ""
+        last_html_len = 0
+        last_child_count = 0
+        had_non_text_content = False
         last_change_time = time.monotonic()
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
@@ -817,12 +828,15 @@ class CDPDriver:
                 result = await self._js_strict(
                     "(function() {"
                     "  var msgs = document.querySelectorAll('[data-message-author-role=\"assistant\"]');"
-                    "  if (!msgs.length) return JSON.stringify({text:'', done:false});"
+                    "  if (!msgs.length) return JSON.stringify({text:'', html_len:0, child_count:0, done:false});"
                     "  var last = msgs[msgs.length - 1];"
                     "  var md = last.querySelector('.markdown');"
                     "  var text = md ? (md.textContent || '') : '';"
+                    "  var html_len = last.innerHTML.length;"
+                    "  var child_count = last.children.length;"
                     "  var stopBtn = document.querySelector('button[aria-label=\"Stop\"]');"
-                    "  return JSON.stringify({text: text, done: !stopBtn && !!md});"
+                    "  var hasContent = !!md || html_len > 50;"
+                    "  return JSON.stringify({text: text, html_len: html_len, child_count: child_count, done: !stopBtn && hasContent});"
                     "})()",
                 )
                 data = json.loads(result)
@@ -831,18 +845,25 @@ class CDPDriver:
                 continue
 
             current = data.get("text", "")
+            html_len = data.get("html_len", 0)
+            child_count = data.get("child_count", 0)
             done = data.get("done", False)
 
+            # Text delta streaming (unchanged for text responses)
             if current != last_dom_text:
                 last_change_time = time.monotonic()
                 if len(current) > len(last_dom_text):
-                    # Grew: yield just the newly appended chars.
                     delta = current[len(last_dom_text):]
                     yield StreamChunk(delta=delta)
-                # Else: text changed without growing (reformat/edit). Don't yield
-                # a delta here — the API reconcile path below corrects the final
-                # text. Just reset the stall clock (done above).
                 last_dom_text = current
+
+            # Non-text progress signals (images, tool-use, etc.)
+            if html_len != last_html_len or child_count != last_child_count:
+                last_change_time = time.monotonic()
+                if html_len > 50:
+                    had_non_text_content = True
+            last_html_len = html_len
+            last_child_count = child_count
 
             if done:
                 break
@@ -880,6 +901,15 @@ class CDPDriver:
                 if api_text:
                     break
                 await asyncio.sleep(0.5)
+            # If no text was captured but Phase-2 detected non-text content
+            # (image, tool-use, etc.), surface a placeholder so the agent
+            # knows something was generated and where to find it.
+            if not last_dom_text and had_non_text_content:
+                placeholder = (
+                    "[Non-text response generated (image/tool-use/etc.) — "
+                    "use get_conversation to retrieve full content.]"
+                )
+                yield StreamChunk(delta=placeholder)
 
         yield StreamChunk(delta="", finish_reason="stop")
 
