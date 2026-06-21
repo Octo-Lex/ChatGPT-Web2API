@@ -1,35 +1,4 @@
-"""curl_cffi TLS-impersonation send test.
-
-The pure-Python (urllib) send 403'd with 'Unusual activity'. This test
-isolates whether TLS fingerprinting is the cause by replaying the SAME
-send request through curl_cffi with Chrome impersonation. If it goes
-200, TLS was the gate. If still 403, something else.
-
-prepare/finalize still use urllib (they already worked) — only the SEND
-swaps to Chrome-impersonated TLS.
-"""
-
-import asyncio
-import base64
-import json
-import time
-import urllib.request
-
-from curl_cffi import requests as cffi_requests
-import websockets
-
-CONV = "6a36adf9-0fa8-83ed-9b9a-aae468239ae7"
-
-STATIC_HEADERS = {
-    "OAI-Language": "en-US",
-    "Content-Type": "application/json",
-    "sec-ch-ua-platform": '"Windows"',
-    "sec-ch-ua": '"Google Chrome";v="149", "Chromium";v="149", "Not)A;Brand";v="24"',
-    "sec-ch-ua-mobile": "?0",
-    "OAI-Client-Build-Number": "7646290",
-    "OAI-Client-Version": "prod-497f333866796e100096ad083b51ca949d22e751",
-    "OAI-Device-Id": "a2791825-a74f-4557-84cb-b611834e7f6c",
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+la/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
     "Referer": f"https://chatgpt.com/c/{CONV}",
     "Origin": "https://chatgpt.com",
     "Accept": "*/*",
@@ -189,6 +158,7 @@ async def main():
         send_hdr["openai-sentinel-proof-token"] = finalize_token
 
     try:
+        from curl_cffi import requests as cffi_requests
         resp = cffi_requests.post(
             f"{base}/f/conversation",
             headers=send_hdr,
@@ -202,6 +172,8 @@ async def main():
         # If streaming, show a bit more
         if resp.status_code == 200 and len(body) > 1500:
             print(f"[SEND] ... (total {len(body)} bytes)")
+    except ImportError:
+        print("[SEND] SKIPPED: curl_cffi not installed.")
     except Exception as e:
         print(f"[SEND] EXCEPTION: {type(e).__name__}: {e}")
 
