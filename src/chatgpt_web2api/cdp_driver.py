@@ -715,22 +715,6 @@ class CDPDriver:
         if result != "sent":
             await self._capture_selector_diagnostic("send-button (click_send)")
             raise RuntimeError(f"Send failed: {result}")
-        # #13: Verify the send actually landed — ChatGPT clears the textarea
-        # on successful send. If it's still populated, the click didn't
-        # register (modal overlay, React handler unmounted, etc.). Give it
-        # a brief moment to clear.
-        await asyncio.sleep(0.3)
-        try:
-            remaining = await self._js_strict(
-                "document.querySelector('#prompt-textarea')?.textContent || ''"
-            )
-        except Exception:
-            remaining = ""  # can't verify — proceed optimistically
-        if remaining.strip():
-            raise RuntimeError(
-                f"Send appeared to succeed but textarea still has content "
-                f"(len={len(remaining)}) — click may not have registered"
-            )
         logger.info("Message sent")
 
     # ── Response Retrieval ────────────────────────────────────
@@ -920,22 +904,14 @@ class CDPDriver:
                 "    var conv = await r.json();"
                 "    var mapping = conv.mapping || {};"
                 "    var current = conv.current_node || '';"
-                "    // #12: Traverse backward from current_node to find the most"
-                "    // recent ASSISTANT node with text. current_node may point at a"
-                "    // user message or a wrong-branch leaf after regen/edit."
-                "    var n = current;"
-                "    var guard = 0;"
-                "    while (n && guard < 50) {"
-                "      guard++;"
-                "      var nd = mapping[n] || {};"
-                "      var msg = nd.message;"
-                "      if (msg && msg.author && msg.author.role === 'assistant') {"
-                "        if (msg.content && msg.content.content_type === 'text') {"
-                "          var parts = msg.content.parts || [];"
+                "    if (current && mapping[current]) {"
+                "      var node = mapping[current];"
+                "      if (node.message && node.message.author && node.message.author.role === 'assistant') {"
+                "        if (node.message.content.content_type === 'text') {"
+                "          var parts = node.message.content.parts || [];"
                 "          if (parts.length > 0 && parts[0]) return parts[0];"
                 "        }"
                 "      }"
-                "      n = nd.parent;"
                 "    }"
                 "    return '';"
                 "  } catch(e) { return ''; }"
