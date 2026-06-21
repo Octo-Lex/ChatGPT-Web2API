@@ -662,6 +662,7 @@ class CDPDriver:
             "})()"
         )
         if focus_result != 'focused':
+            await self._capture_selector_diagnostic("#prompt-textarea (type_message)")
             raise RuntimeError("No textarea found")
 
         # Clear existing text by selecting all first
@@ -712,6 +713,7 @@ class CDPDriver:
             "})()"
         )
         if result != "sent":
+            await self._capture_selector_diagnostic("send-button (click_send)")
             raise RuntimeError(f"Send failed: {result}")
         # #13: Verify the send actually landed — ChatGPT clears the textarea
         # on successful send. If it's still populated, the click didn't
@@ -1034,6 +1036,33 @@ class CDPDriver:
             raise AuthExpiredError(
                 "Session expired — read returned login page instead of data"
             )
+
+    async def _capture_selector_diagnostic(self, selector_name: str) -> None:
+        """#5: Capture DOM state when a selector fails to match.
+
+        Logs a diagnostic snapshot (URL, title, body text preview, button count)
+        so selector drift is diagnosable without W2A_DIAGNOSE=1. Called at
+        the point of selector failure (e.g. 'no send button', 'No textarea').
+        Best-effort — never raises.
+        """
+        try:
+            snapshot = await self._js_strict(
+                "(function(){"
+                "  return JSON.stringify({"
+                "    url: location.href,"
+                "    title: document.title,"
+                "    body_preview: (document.body && document.body.innerText || '').slice(0, 300),"
+                "    button_count: document.querySelectorAll('button').length,"
+                "    textarea_count: document.querySelectorAll('textarea').length"
+                "  });"
+                "})()",
+                timeout=5,
+            )
+            logger.warning(
+                "Selector drift diagnostic (%s): %s", selector_name, snapshot
+            )
+        except Exception:
+            logger.warning("Selector drift diagnostic (%s): capture failed", selector_name)
 
     # ── API helpers ───────────────────────────────────────────
 
