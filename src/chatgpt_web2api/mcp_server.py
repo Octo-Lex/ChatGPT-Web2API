@@ -49,6 +49,7 @@ from .cdp_driver import (
     RateLimitError,
 )
 from .resilience import retry_on_rate_limit
+from .cross_process_lock import CrossProcessLock, LockAcquisitionError
 
 logger = logging.getLogger(__name__)
 
@@ -635,7 +636,10 @@ def _visible_tool_names() -> set[str]:
 
 _driver: CDPDriver | None = None
 _config: Config | None = None
-_lock: asyncio.Lock | None = None
+# Cross-process lock factory — creates a fresh CrossProcessLock per critical
+# section, keyed on the CDP port so all processes sharing a Chrome instance
+# serialize. None until run_mcp() sets it. Read-only tools run lock-free.
+_lock_cdp_port: int | None = None
 
 # Tools that mutate browser state — must hold the lock
 _MUTATING_TOOLS = frozenset({
@@ -1470,10 +1474,10 @@ def create_server() -> Server:
                 return await retry_on_rate_limit(_driver, handler, on_progress=on_progress)
             return await handler()
 
-        # Serialize mutating tools through the shared lock
+        # Serialize mutating tools through the cross-process lock
         try:
-            if name in _MUTATING_TOOLS and _lock:
-                async with _lock:
+            if name in _MUTATING_TOOLS and _lock_cdp_port is not None:
+                async with CrossProcessLock(cdp_port=_lock_cdp_port):
                     result = await _run()
             else:
                 result = await _run()
@@ -1519,6 +1523,16 @@ def create_server() -> Server:
                         f"Generation stuck in {e.phase} for {e.stalled_for_s:.0f}s "
                         f"— no DOM progress. (generation_stuck)"
                     ),
+                )],
+                isError=True,
+            )
+        except LockAcquisitionError as e:
+            # Another process holds the cross-process lock for this Chrome tab
+            # and didn't release it within the timeout. The caller should retry.
+            return mcp_types.CallToolResult(
+                content=[mcp_types.TextContent(
+                    type="text",
+                    text=f"Browser busy — another operation in progress. Retry later. (lock_timeout)",
                 )],
                 isError=True,
             )
@@ -1786,10 +1800,10 @@ async def run_mcp(
     config: Config, transport: str = "stdio", port: int = 8090
 ) -> None:
     """Connect to Chrome and run the MCP server."""
-    global _driver, _config, _lock
+    global _driver, _config, _lock_cdp_port
 
     _config = config
-    _lock = asyncio.Lock()
+    _lock_cdp_port = config.chrome.cdp_port
 
     _driver = CDPDriver(cdp_port=config.chrome.cdp_port)
     try:

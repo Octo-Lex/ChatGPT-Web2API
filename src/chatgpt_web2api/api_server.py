@@ -26,6 +26,7 @@ from .cdp_driver import (
     is_rate_limited_text,
 )
 from .config import Config
+from .cross_process_lock import CrossProcessLock, LockAcquisitionError
 from .resilience import retry_on_rate_limit
 
 logger = logging.getLogger(__name__)
@@ -54,7 +55,7 @@ class APIServer:
     def __init__(self, config: Config, driver: CDPDriver) -> None:
         self._config = config
         self._driver = driver
-        self._lock = asyncio.Lock()
+        self._cdp_port = config.chrome.cdp_port
         self._request_count = 0
         # Track last conversation for multi-turn continuity
         self._last_conv_id: Optional[str] = None
@@ -212,8 +213,8 @@ class APIServer:
             self._request_count, model, model_slug, conversation_id, project_id, stream, full_text,
         )
 
-        # Serialize — one request at a time through the browser
-        async with self._lock:
+        # Serialize — cross-process lock so MCP + REST don't corrupt each other
+        async with CrossProcessLock(cdp_port=self._cdp_port):
             try:
                 # Select model if specified (non-fatal on failure)
                 if model_slug and model_slug != "auto":
@@ -304,6 +305,18 @@ class APIServer:
                     }
                 },
                 status=504,
+            )
+        if isinstance(exc, LockAcquisitionError):
+            return web.json_response(
+                {
+                    "error": {
+                        "message": str(exc),
+                        "type": "server_error",
+                        "param": None,
+                        "code": "lock_timeout",
+                    }
+                },
+                status=503,
             )
         return web.json_response(
             {"error": {"message": str(exc), "type": "server_error"}},

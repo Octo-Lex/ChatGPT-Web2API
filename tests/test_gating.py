@@ -138,7 +138,7 @@ async def test_hidden_tool_refuses_to_run(monkeypatch):
     import chatgpt_web2api.mcp_server as mod
     monkeypatch.setattr(mod, "_driver", object())  # truthy: passes the driver check
     monkeypatch.setattr(mod, "_config", None)
-    monkeypatch.setattr(mod, "_lock", None)
+    monkeypatch.setattr(mod, "_lock_cdp_port", None)
 
     server = mod.create_server()
     from mcp import types as t
@@ -165,7 +165,7 @@ async def test_visible_tool_is_not_blocked(monkeypatch):
     driver.get_models = AsyncMock(return_value=[{"slug": "auto", "title": "Auto"}])
     monkeypatch.setattr(mod, "_driver", driver)
     monkeypatch.setattr(mod, "_config", None)
-    monkeypatch.setattr(mod, "_lock", None)
+    monkeypatch.setattr(mod, "_lock_cdp_port", None)
 
     server = mod.create_server()
     from mcp import types as t

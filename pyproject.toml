@@ -31,6 +31,9 @@ dependencies = [
     # base Session has a no-op stub in older 1.x), and Server.request_context
     # (contextvar-backed) exists. Cap at <2.0 pending a compat audit.
     "mcp>=1.26,<2.0",
+    # Cross-platform file lock for serializing mutating ops across MCP/REST
+    # processes that share one Chrome tab.
+    "portalocker>=2.7",
 ]
 
 [project.urls]
