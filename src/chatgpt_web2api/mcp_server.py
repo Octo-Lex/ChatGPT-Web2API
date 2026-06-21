@@ -1816,6 +1816,8 @@ async def run_mcp(
             config.chrome.cdp_port,
             e,
         )
+        # Clean up any tab that connect() may have created before failing
+        await _driver.close()
         return
 
     server = create_server()

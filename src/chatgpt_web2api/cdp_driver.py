@@ -217,12 +217,48 @@ class CDPDriver:
         # CDP response routing (#7): id-keyed futures + background reader
         self._pending: dict[int, asyncio.Future] = {}
         self._reader_task: Optional[asyncio.Task] = None
+        # Tab isolation: the targetId of the tab this driver owns (None = shared tab)
+        self._target_id: Optional[str] = None
 
     # ── Connection ────────────────────────────────────────────
 
     async def connect(self) -> None:
-        """Connect to Chrome's CDP and authenticate."""
-        ws_url = await self._find_page_ws()
+        """Connect to Chrome's CDP and authenticate.
+
+        Tab isolation: creates a dedicated chatgpt.com tab via Target.createTarget
+        so this process owns its own DOM (no cross-process tab sharing). Falls back
+        to the shared-tab discover-and-grab pattern if createTarget fails.
+
+        If already connected (e.g. Service reconnects after login), reuses the
+        existing owned tab instead of creating a new one.
+        """
+        # If we already own a tab from a prior connect attempt, reuse it
+        if self._ws is not None:
+            await self._ws.close()
+            self._ws = None
+        if self._reader_task and not self._reader_task.done():
+            self._reader_task.cancel()
+            try:
+                await asyncio.wait_for(self._reader_task, timeout=2)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                pass
+            self._reader_task = None
+
+        ws_url = None
+        if self._target_id:
+            # Reuse the existing owned tab
+            ws_url = self._find_owned_tab_ws()
+            if ws_url:
+                logger.info("Reusing owned tab: %s", self._target_id)
+        if not ws_url:
+            # Try to create a new owned tab (tab isolation)
+            try:
+                ws_url = await self._create_owned_tab()
+                logger.info("Connected via owned tab: %s", self._target_id)
+            except Exception as e:
+                logger.warning("Tab isolation failed (%s) — falling back to shared tab", e)
+                self._target_id = None
+                ws_url = await self._find_page_ws()
         self._ws = await websockets.connect(
             ws_url, max_size=100 * 1024 * 1024,
             ping_interval=20, ping_timeout=10,
@@ -266,7 +302,18 @@ class CDPDriver:
         # Reconnect with backoff
         for attempt, delay in enumerate([2, 5, 10], 1):
             try:
-                ws_url = await self._find_page_ws()
+                ws_url = None
+                # Tab isolation: try to re-find our owned tab first
+                if self._target_id:
+                    ws_url = self._find_owned_tab_ws()
+                    if ws_url:
+                        logger.info("Re-finding owned tab: %s", self._target_id)
+                    else:
+                        # Owned tab is gone — create a new one
+                        logger.info("Owned tab gone, creating new one")
+                        ws_url = await self._create_owned_tab()
+                if not ws_url:
+                    ws_url = await self._find_page_ws()
                 self._ws = await websockets.connect(
                     ws_url, max_size=100 * 1024 * 1024,
                     ping_interval=20, ping_timeout=10,
@@ -321,6 +368,80 @@ class CDPDriver:
         logger.info("Using page (fallback): %s", target.get("title", "")[:60])
         return target["webSocketDebuggerUrl"]
 
+    async def _browser_cdp(self, method: str, params: dict = None, timeout: float = 10) -> dict:
+        """Send a browser-domain CDP command via a short-lived browser WS.
+
+        Used for Target.createTarget and Target.closeTarget. Opens a fresh
+        connection to the browser-level endpoint (/devtools/browser/...),
+        sends one command, awaits the response, closes. Does NOT use the
+        page-level _cdp/_reader_loop machinery — those are for the persistent
+        page WS only.
+        """
+        version = json.loads(
+            urllib.request.urlopen(
+                urllib.request.Request(f"http://127.0.0.1:{self.port}/json/version"),
+                timeout=5,
+            ).read()
+        )
+        browser_ws_url = version["webSocketDebuggerUrl"]
+        mid = self._msg_id + 100000  # offset to avoid collision with page-level ids
+        async with websockets.connect(browser_ws_url, max_size=10 * 1024 * 1024) as bws:
+            await bws.send(json.dumps({"id": mid, "method": method, "params": params or {}}))
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                raw = await asyncio.wait_for(bws.recv(), timeout=max(1, deadline - time.monotonic()))
+                resp = json.loads(raw)
+                if resp.get("id") == mid:
+                    return resp
+            raise TimeoutError(f"Browser CDP timeout: {method}")
+
+    async def _create_owned_tab(self) -> str:
+        """Create a new chatgpt.com tab and return its page WS URL.
+
+        Calls Target.createTarget via the browser WS, stores the targetId,
+        then looks up the new tab's webSocketDebuggerUrl via /json/list.
+        Returns the page WS URL. Sets self._target_id.
+        """
+        resp = await self._browser_cdp("Target.createTarget", {"url": "https://chatgpt.com/"})
+        if "error" in resp:
+            raise RuntimeError(f"Target.createTarget failed: {resp['error']}")
+        self._target_id = resp.get("result", {}).get("targetId")
+        if not self._target_id:
+            raise RuntimeError("Target.createTarget returned no targetId")
+        logger.info("Created owned tab: %s", self._target_id)
+        # Wait for the tab to appear in /json/list, then get its WS URL
+        for _ in range(20):
+            targets = json.loads(
+                urllib.request.urlopen(
+                    urllib.request.Request(f"http://127.0.0.1:{self.port}/json/list"),
+                    timeout=5,
+                ).read()
+            )
+            for t in targets:
+                if t.get("id") == self._target_id:
+                    ws_url = t.get("webSocketDebuggerUrl")
+                    if ws_url:
+                        logger.info("Owned tab WS: %s", ws_url[:80])
+                        return ws_url
+            await asyncio.sleep(0.5)
+        raise RuntimeError(f"Created tab {self._target_id} but couldn't find its WS URL")
+
+    def _find_owned_tab_ws(self) -> Optional[str]:
+        """Look up an owned tab's WS URL from /json/list. Returns None if gone."""
+        try:
+            targets = json.loads(
+                urllib.request.urlopen(
+                    urllib.request.Request(f"http://127.0.0.1:{self.port}/json/list"),
+                    timeout=5,
+                ).read()
+            )
+            for t in targets:
+                if t.get("id") == self._target_id:
+                    return t.get("webSocketDebuggerUrl")
+        except Exception:
+            pass
+        return None
+
     async def _refresh_token(self) -> None:
         """Get a fresh access token from /api/auth/session."""
         raw = await self._js(
@@ -330,7 +451,14 @@ class CDPDriver:
             "  return JSON.stringify({token: d.accessToken || '', user: d.user?.name || ''});"
             "})()"
         )
-        data = json.loads(raw)
+        # _js may return a dict (CDP returnByValue parsed the JSON object)
+        # or a string (the JSON.stringify result). Handle both.
+        if isinstance(raw, dict):
+            data = raw
+        elif isinstance(raw, str):
+            data = json.loads(raw)
+        else:
+            data = {"token": ""}
         self._access_token = data.get("token", "")
         self._user_name = data.get("user", "")
         self._token_fetched_at = time.time()
@@ -1706,6 +1834,16 @@ class CDPDriver:
         if self._ws:
             await self._ws.close()
             self._ws = None
+        # Tab isolation: close our owned tab to prevent accumulation
+        if self._target_id:
+            try:
+                await self._browser_cdp(
+                    "Target.closeTarget", {"targetId": self._target_id}
+                )
+                logger.info("Closed owned tab: %s", self._target_id)
+            except Exception as e:
+                logger.debug("Could not close owned tab %s: %s", self._target_id, e)
+            self._target_id = None
         logger.info("CDP driver closed")
 
     @property
