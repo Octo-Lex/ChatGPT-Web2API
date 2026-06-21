@@ -185,10 +185,12 @@ async def test_phase2_stall_raises_generation_stuck(monkeypatch):
     # `JSON.stringify`; the rate-limit scan contains `body.innerText`.
     state = {"count_polls": 0, "in_phase2": False}
     async def _fake_js(expr, timeout=15):
-        if "JSON.stringify" in expr and "Stop" in expr:
-            # Phase-2 poll
+        if "has_action" in expr:
+            # Phase-2 poll: the action button never appears (has_action=False)
+            # and the text/html/child signals never change, so last_change_time
+            # never resets and the stall detector fires.
             state["in_phase2"] = True
-            return json.dumps({"text": "partial", "done": False})
+            return json.dumps({"text": "partial", "html_len": 10, "child_count": 1, "has_action": False})
         if "body.innerText" in expr:
             # Rate-limit scan (Phase 1)
             return json.dumps({"text": "normal page"})
@@ -222,12 +224,12 @@ async def test_slow_appear_succeeds_without_cap(monkeypatch):
         t[0] += s
     monkeypatch.setattr("chatgpt_web2api.cdp_driver.asyncio.sleep", fast_sleep)
 
-    # Count wobbles 0→1→0→1... every ~10 polls so the stall clock (45s) keeps
+    # Count wobbles 0→1→0→1... every ~10 polls so the stall clock keeps
     # resetting, then settles at 2 (>initial) at poll 150 (~75s) to break Phase 1.
     count_polls = {"n": 0}
     async def _fake_js(expr, timeout=15):
-        if "JSON.stringify" in expr and "Stop" in expr:
-            return json.dumps({"text": "done", "done": True})
+        if "has_action" in expr:
+            return json.dumps({"text": "done", "has_action": True})
         if "body.innerText" in expr:
             return json.dumps({"text": "normal"})
         count_polls["n"] += 1
@@ -263,11 +265,11 @@ async def test_progressing_generation_does_not_raise(monkeypatch):
 
     state = {"phase1_polls": 0, "phase2_polls": 0, "text": ""}
     async def _fake_js(expr, timeout=15):
-        if "JSON.stringify" in expr and "Stop" in expr:
+        if "has_action" in expr:
             state["phase2_polls"] += 1
             state["text"] += "x"
             done = state["phase2_polls"] > 200  # ~100s of progress
-            return json.dumps({"text": state["text"], "done": done})
+            return json.dumps({"text": state["text"], "has_action": done})
         if "body.innerText" in expr:
             return json.dumps({"text": "normal"})
         state["phase1_polls"] += 1

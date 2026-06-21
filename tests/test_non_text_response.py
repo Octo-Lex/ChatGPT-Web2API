@@ -44,13 +44,16 @@ async def test_image_response_does_not_stall(monkeypatch):
     async def _fake_js(expr, timeout=15):
         if "body.innerText" in expr:
             return json.dumps({"text": "normal"})
-        if "JSON.stringify" in expr and "Stop" in expr and "html_len" in expr:
+        if "has_action" in expr:
             # Phase 2 poll (now has html_len — distinguishes from Phase 1)
             state["phase2_polls"] += 1
             n = state["phase2_polls"]
             html_len = 10 + n * 50  # grows each poll (image rendering)
-            done = n > 100  # completes after ~50s of progress
-            return json.dumps({"text": "", "html_len": html_len, "child_count": 1, "done": done})
+            # has_action: the per-turn action button appears only on a finished
+            # message. False while the image renders, True after ~50s of
+            # progress. This is the completion signal the driver now uses.
+            has_action = n > 100
+            return json.dumps({"text": "", "html_len": html_len, "child_count": 1, "has_action": has_action})
         if ".length" in expr and "querySelectorAll" in expr and "JSON.stringify" not in expr:
             # Phase 1 count poll
             state["phase1_polls"] += 1
@@ -91,15 +94,15 @@ async def test_text_response_streams_delta_unchanged(monkeypatch):
     async def _fake_js(expr, timeout=15):
         if "body.innerText" in expr:
             return json.dumps({"text": "normal"})
-        if "JSON.stringify" in expr and "Stop" in expr and "html_len" in expr:
+        if "has_action" in expr:
             state["phase2"] += 1
             state["text"] += "Hello world. "  # text grows
-            done = state["phase2"] > 5
+            has_action = state["phase2"] > 5
             return json.dumps({
                 "text": state["text"],
                 "html_len": len(state["text"]) + 20,
                 "child_count": 1,
-                "done": done,
+                "has_action": has_action,
             })
         if ".length" in expr and "querySelectorAll" in expr and "JSON.stringify" not in expr:
             state["phase1"] += 1
@@ -139,14 +142,14 @@ async def test_placeholder_on_empty_fetch_with_non_text_content(monkeypatch):
     async def _fake_js(expr, timeout=15):
         if "body.innerText" in expr:
             return json.dumps({"text": "normal"})
-        if "JSON.stringify" in expr and "Stop" in expr and "html_len" in expr:
+        if "has_action" in expr:
             state["phase2"] += 1
-            done = state["phase2"] > 3
+            has_action = state["phase2"] > 3
             return json.dumps({
                 "text": "",
                 "html_len": 200,  # non-text content present
                 "child_count": 2,
-                "done": done,
+                "has_action": has_action,
             })
         if ".length" in expr and "querySelectorAll" in expr and "JSON.stringify" not in expr:
             state["phase1"] += 1

@@ -54,8 +54,12 @@ TOKEN_TTL_SECONDS = 3600
 # (image rendering, deep-research thinking) legitimately exceed this and
 # are allowed the full timeout; a true stall fails fast here instead of
 # hanging silently to the deadline. Applied to both Phase 1 (node appear)
-# and Phase 2 (text streaming).
-PHASE_STALL_SECONDS = 45
+# and Phase 2 (text streaming). 90s accommodates reasoning/thinking models,
+# whose ``result-thinking`` placeholder can hold the DOM static for a minute+
+# while the model reasons before the first answer token renders; the
+# is_thinking reset covers the labeled phase, but there is an unlabeled gap
+# between thinking-end and answer-start that also needs this headroom.
+PHASE_STALL_SECONDS = 90
 
 
 class RateLimitError(RuntimeError):
@@ -949,6 +953,28 @@ class CDPDriver:
         last_html_len = 0
         last_child_count = 0
         had_non_text_content = False
+        # Completion detection for Phase-2. The history here matters — three
+        # earlier signals each failed in live testing, all producing an
+        # off-by-one where request N returned request N-1's text:
+        #   1. ``done = !stopBtn && hasContent`` — broke on the FIRST poll.
+        #      Right after send the Stop button hasn't appeared yet (generation
+        #      not begun) but html_len > 50 (the message wrapper), so this was
+        #      True immediately, leaving last_dom_text empty.
+        #   2. ``generation_started && not is_generating`` — the Stop button
+        #      FLICKERS off between token batches, breaking mid-generation with
+        #      truncated text.
+        #   3. Text-stability alone — ``.markdown`` textContent is empty during
+        #      streaming (text renders elsewhere until the turn settles), so
+        #      "stable empty" never completes and the stall detector fires.
+        #
+        # The robust signal is the per-turn ACTION BUTTON. ChatGPT renders a
+        # copy/feedback action row (data-testid containing "copy" or
+        # "response-turn") on an assistant message ONLY once it has finished
+        # generating — it is absent while the message is streaming or thinking.
+        # Polling for that button on the NEW message is immune to the Stop
+        # flicker and to the empty-.markdown-during-streaming quirk. Text is
+        # captured from the message's innerText (which IS populated during
+        # streaming) rather than .markdown textContent (which lags).
         last_change_time = time.monotonic()
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
@@ -956,15 +982,31 @@ class CDPDriver:
                 result = await self._js_strict(
                     "(function() {"
                     "  var msgs = document.querySelectorAll('[data-message-author-role=\"assistant\"]');"
-                    "  if (!msgs.length) return JSON.stringify({text:'', html_len:0, child_count:0, done:false});"
+                    "  if (!msgs.length) return JSON.stringify({text:'', html_len:0, child_count:0, has_action:false, is_thinking:false});"
                     "  var last = msgs[msgs.length - 1];"
+                    # Text: prefer .markdown textContent (settled), fall back to
+                    # the message innerText (populated during streaming). Strip
+                    # trailing whitespace — innerText includes action-row text
+                    # once buttons render, but at that point we're done anyway.
                     "  var md = last.querySelector('.markdown');"
-                    "  var text = md ? (md.textContent || '') : '';"
+                    "  var mdText = md ? (md.textContent || '') : '';"
+                    "  var text = mdText || (last.innerText || '').trim();"
                     "  var html_len = last.innerHTML.length;"
                     "  var child_count = last.children.length;"
-                    "  var stopBtn = document.querySelector('button[aria-label=\"Stop\"]');"
-                    "  var hasContent = !!md || html_len > 50;"
-                    "  return JSON.stringify({text: text, html_len: html_len, child_count: child_count, done: !stopBtn && hasContent});"
+                    # has_action: the per-turn copy/feedback button appears only
+                    # on a completed message. Match common action-button testids.
+                    "  var has_action = !!("
+                    "    last.querySelector('[data-testid*=\"copy\"]')"
+                    "    || last.querySelector('[data-testid*=\"response-turn\"]')"
+                    "  );"
+                    # is_thinking: reasoning/thinking models render a
+                    # ``result-thinking`` placeholder while they reason, during
+                    # which the DOM text/html is static for tens of seconds.
+                    # That is NOT a stall — the model is working — so the stall
+                    # clock must reset while this indicator is present.
+                    "  var is_thinking = !!last.querySelector('.result-thinking')"
+                    "    || /thinking/i.test(last.innerText || '');"
+                    "  return JSON.stringify({text: text, html_len: html_len, child_count: child_count, has_action: has_action, is_thinking: is_thinking});"
                     "})()",
                 )
                 data = json.loads(result)
@@ -975,10 +1017,17 @@ class CDPDriver:
             current = data.get("text", "")
             html_len = data.get("html_len", 0)
             child_count = data.get("child_count", 0)
-            done = data.get("done", False)
+            has_action = data.get("has_action", False)
+            is_thinking = data.get("is_thinking", False)
 
-            # Text delta streaming (unchanged for text responses)
-            if current != last_dom_text:
+            # While the model is thinking, the only "text" on the message is
+            # the ``Thinking`` UI label — not model output. Don't stream it as
+            # a delta (it would leak into the response as a "Thinking" prefix),
+            # and don't let it anchor last_dom_text (the real answer renders
+            # fresh after thinking ends, so we capture it from scratch).
+            if is_thinking:
+                last_change_time = time.monotonic()
+            elif current != last_dom_text:
                 last_change_time = time.monotonic()
                 if len(current) > len(last_dom_text):
                     delta = current[len(last_dom_text):]
@@ -993,7 +1042,11 @@ class CDPDriver:
             last_html_len = html_len
             last_child_count = child_count
 
-            if done:
+            # Done: the new message has its action button (copy/feedback),
+            # which ChatGPT renders only on a finished turn. This is immune to
+            # the Stop-button flicker and the empty-.markdown-during-streaming
+            # quirk that broke the earlier heuristics.
+            if has_action:
                 break
 
             if time.monotonic() - last_change_time > PHASE_STALL_SECONDS:
@@ -1049,6 +1102,13 @@ class CDPDriver:
         AuthExpiredError) from a missing conversation (404) or a network
         error. This parse-and-raise happens here, before any return reaches
         the caller, so callers never see a raw status blob as text.
+
+        Picks the newest assistant text message by ``create_time`` rather than
+        trusting the API's ``current_node`` pointer: that pointer lags behind
+        on continued conversations (it still points at the previous turn right
+        after a send), which produced an off-by-one where request N returned
+        request N-1's text. The newest-by-create-time selection is immune to
+        that lag.
         """
         await self.ensure_token()
         try:
@@ -1061,17 +1121,22 @@ class CDPDriver:
                 "    if (!r.ok) return JSON.stringify({__status: r.status});"
                 "    var conv = await r.json();"
                 "    var mapping = conv.mapping || {};"
-                "    var current = conv.current_node || '';"
-                "    if (current && mapping[current]) {"
-                "      var node = mapping[current];"
-                "      if (node.message && node.message.author && node.message.author.role === 'assistant') {"
-                "        if (node.message.content.content_type === 'text') {"
-                "          var parts = node.message.content.parts || [];"
-                "          if (parts.length > 0 && parts[0]) return parts[0];"
-                "        }"
-                "      }"
+                # Find the NEWEST assistant text message by create_time.
+                # current_node lags on continued conversations, so we cannot
+                # trust it to point at the turn we just sent.
+                "    var best = null;"
+                "    var bestTime = -1;"
+                "    for (var k in mapping) {"
+                "      var n = mapping[k];"
+                "      var m = n.message;"
+                "      if (!m || !m.author || m.author.role !== 'assistant') continue;"
+                "      if (!m.content || m.content.content_type !== 'text') continue;"
+                "      var parts = m.content.parts || [];"
+                "      if (!parts.length || !parts[0]) continue;"
+                "      var t = m.create_time || 0;"
+                "      if (t >= bestTime) { bestTime = t; best = parts[0]; }"
                 "    }"
-                "    return '';"
+                "    return best || '';"
                 "  } catch(e) { return ''; }"
                 "})()",
                 {"conv_id": conversation_id, "token": self._access_token},
