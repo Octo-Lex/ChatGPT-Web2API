@@ -970,18 +970,19 @@ class CDPDriver:
         caught it, since the mocked unit tests returned dicts.
         """
         await self.ensure_token()
-        raw = await self._js_with_data(
-            "(async () => {"
-            "  var r = await fetch('/backend-api/models?iim=false&is_gizmo=false', {"
-            "    headers: {'Authorization': 'Bearer ' + __D.token}"
-            "  });"
-            "  return await r.text();"
-            "})()",
-            {"token": self._access_token},
-        )
         try:
+            raw = await self._js_with_data_strict(
+                "(async () => {"
+                "  var r = await fetch('/backend-api/models?iim=false&is_gizmo=false', {"
+                "    headers: {'Authorization': 'Bearer ' + __D.token}"
+                "  });"
+                "  return await r.text();"
+                "})()",
+                {"token": self._access_token},
+            )
             data = json.loads(raw)
-        except (json.JSONDecodeError, TypeError):
+        except (CDPJSError, json.JSONDecodeError, TypeError) as e:
+            logger.warning("get_models failed: %s", e)
             return []
         if isinstance(data, dict):
             return data.get("models", [])
@@ -992,22 +993,23 @@ class CDPDriver:
     @diagnose("get_projects")
     async def get_projects(self) -> list[dict]:
         await self.ensure_token()
-        raw = await self._js_with_data(
-            "(async () => {"
-            "  var r = await fetch('/backend-api/gizmos/snorlax/sidebar?owned_only=true&conversations_per_gizmo=5&limit=50', {"
-            "    headers: {'Authorization': 'Bearer ' + __D.token}"
-            "  });"
-            "  var data = await r.json();"
-            "  return JSON.stringify((data.items || []).map(function(i) {"
-            "    var g = (i.gizmo || {}).gizmo || {};"
-            "    return {id: g.id, name: (g.display || {}).name || '', memory_scope: g.memory_scope || '', short_url: g.short_url || ''};"
-            "  }));"
-            "})()",
-            {"token": self._access_token},
-        )
         try:
+            raw = await self._js_with_data_strict(
+                "(async () => {"
+                "  var r = await fetch('/backend-api/gizmos/snorlax/sidebar?owned_only=true&conversations_per_gizmo=5&limit=50', {"
+                "    headers: {'Authorization': 'Bearer ' + __D.token}"
+                "  });"
+                "  var data = await r.json();"
+                "  return JSON.stringify((data.items || []).map(function(i) {"
+                "    var g = (i.gizmo || {}).gizmo || {};"
+                "    return {id: g.id, name: (g.display || {}).name || '', memory_scope: g.memory_scope || '', short_url: g.short_url || ''};"
+                "  }));"
+                "})()",
+                {"token": self._access_token},
+            )
             return json.loads(raw)
-        except json.JSONDecodeError:
+        except (CDPJSError, json.JSONDecodeError) as e:
+            logger.warning("get_projects failed: %s", e)
             return []
 
     # ── Conversation Management ──────────────────────────────
@@ -1021,61 +1023,67 @@ class CDPDriver:
     ) -> list[dict]:
         """List recent conversations."""
         await self.ensure_token()
-        raw = await self._js_with_data(
-            "(async () => {"
-            "  var r = await fetch('/backend-api/conversations?offset=' + __D.offset + '&limit=' + __D.limit + '&order=' + __D.order, {"
-            "    headers: {'Authorization': 'Bearer ' + __D.token}"
-            "  });"
-            "  var data = await r.json();"
-            "  return JSON.stringify((data.items || []).map(function(c) {"
-            "    return {id: c.id, title: c.title || 'Untitled', "
-            "      update_time: c.update_time, create_time: c.create_time,"
-            "      is_archived: !!c.is_archived, gizmo_id: c.gizmo_id || null};"
-            "  }));"
-            "})()",
-            {"token": self._access_token, "offset": str(offset), "limit": str(limit), "order": order},
-        )
         try:
+            raw = await self._js_with_data_strict(
+                "(async () => {"
+                "  var r = await fetch('/backend-api/conversations?offset=' + __D.offset + '&limit=' + __D.limit + '&order=' + __D.order, {"
+                "    headers: {'Authorization': 'Bearer ' + __D.token}"
+                "  });"
+                "  var data = await r.json();"
+                "  return JSON.stringify((data.items || []).map(function(c) {"
+                "    return {id: c.id, title: c.title || 'Untitled', "
+                "      update_time: c.update_time, create_time: c.create_time,"
+                "      is_archived: !!c.is_archived, gizmo_id: c.gizmo_id || null};"
+                "  }));"
+                "})()",
+                {"token": self._access_token, "offset": str(offset), "limit": str(limit), "order": order},
+            )
             return json.loads(raw)
-        except json.JSONDecodeError:
+        except (CDPJSError, json.JSONDecodeError) as e:
+            logger.warning("get_conversations failed: %s", e)
             return []
 
     @diagnose("get_conversation")
     async def get_conversation(self, conversation_id: str) -> dict:
         """Get full conversation detail with message mapping."""
         await self.ensure_token()
-        raw = await self._js_with_data(
-            "(async () => {"
-            "  var r = await fetch('/backend-api/conversation/' + __D.conv_id, {"
-            "    headers: {'Authorization': 'Bearer ' + __D.token}"
-            "  });"
-            "  return await r.text();"
-            "})()",
-            {"conv_id": conversation_id, "token": self._access_token},
-            timeout=30,
-        )
         try:
+            raw = await self._js_with_data_strict(
+                "(async () => {"
+                "  var r = await fetch('/backend-api/conversation/' + __D.conv_id, {"
+                "    headers: {'Authorization': 'Bearer ' + __D.token}"
+                "  });"
+                "  return await r.text();"
+                "})()",
+                {"conv_id": conversation_id, "token": self._access_token},
+                timeout=30,
+            )
             return json.loads(raw)
-        except json.JSONDecodeError:
+        except (CDPJSError, json.JSONDecodeError) as e:
+            logger.warning("get_conversation failed: %s", e)
             return {}
 
     @diagnose("delete_conversation")
     async def delete_conversation(self, conversation_id: str) -> bool:
         """Delete a conversation. Returns True on success."""
         await self.ensure_token()
-        result = await self._js_with_data(
-            "(async () => {"
-            "  try {"
-            "    var r = await fetch('/backend-api/conversation/' + __D.conv_id, {"
-            "      method: 'PATCH',"
-            "      headers: {'Authorization': 'Bearer ' + __D.token, 'Content-Type': 'application/json'},"
-            "      body: JSON.stringify({is_visible: false})"
-            "    });"
-            "    return r.ok ? 'true' : 'false';"
-            "  } catch(e) { return 'error:' + e.message; }"
-            "})()",
-            {"conv_id": conversation_id, "token": self._access_token},
-        )
+        try:
+            result = await self._js_with_data_strict(
+                "(async () => {"
+                "  try {"
+                "    var r = await fetch('/backend-api/conversation/' + __D.conv_id, {"
+                "      method: 'PATCH',"
+                "      headers: {'Authorization': 'Bearer ' + __D.token, 'Content-Type': 'application/json'},"
+                "      body: JSON.stringify({is_visible: false})"
+                "    });"
+                "    return r.ok ? 'true' : 'false';"
+                "  } catch(e) { return 'error:' + e.message; }"
+                "})()",
+                {"conv_id": conversation_id, "token": self._access_token},
+            )
+        except CDPJSError as e:
+            logger.warning("delete_conversation JS failed: %s", e)
+            result = "false"
         if result == "true":
             logger.info("Deleted conversation: %s", conversation_id)
             if self._current_conv_id == conversation_id:
@@ -1089,19 +1097,23 @@ class CDPDriver:
     ) -> bool:
         """Rename a conversation. Returns True on success."""
         await self.ensure_token()
-        result = await self._js_with_data(
-            "(async () => {"
-            "  try {"
-            "    var r = await fetch('/backend-api/conversation/' + __D.conv_id, {"
-            "      method: 'PATCH',"
-            "      headers: {'Authorization': 'Bearer ' + __D.token, 'Content-Type': 'application/json'},"
-            "      body: JSON.stringify({title: __D.title})"
-            "    });"
-            "    return r.ok ? 'true' : 'false';"
-            "  } catch(e) { return 'error:' + e.message; }"
-            "})()",
-            {"conv_id": conversation_id, "token": self._access_token, "title": title},
-        )
+        try:
+            result = await self._js_with_data_strict(
+                "(async () => {"
+                "  try {"
+                "    var r = await fetch('/backend-api/conversation/' + __D.conv_id, {"
+                "      method: 'PATCH',"
+                "      headers: {'Authorization': 'Bearer ' + __D.token, 'Content-Type': 'application/json'},"
+                "      body: JSON.stringify({title: __D.title})"
+                "    });"
+                "    return r.ok ? 'true' : 'false';"
+                "  } catch(e) { return 'error:' + e.message; }"
+                "})()",
+                {"conv_id": conversation_id, "token": self._access_token, "title": title},
+            )
+        except CDPJSError as e:
+            logger.warning("rename_conversation JS failed: %s", e)
+            result = "false"
         if result == "true":
             logger.info("Renamed conversation %s to: %s", conversation_id, title)
             return True
@@ -1209,29 +1221,33 @@ class CDPDriver:
         ChatGPT's own UI via Super-Browser network capture.
         """
         await self.ensure_token()
-        result = await self._js_with_data(
-            "(async () => {"
-            "  try {"
-            "    var r0 = await fetch('/backend-api/gizmos/' + __D.project_id, {"
-            "      headers: {'Authorization': 'Bearer ' + __D.token}"
-            "    });"
-            "    var d0 = await r0.json();"
-            "    var g0 = d0.gizmo || d0;"
-            "    var name = ((g0.display) || {}).name || '';"
-            "    var emoji = ((g0.display) || {}).emoji || null;"
-            "    var theme = ((g0.display) || {}).theme || null;"
-            "    var body = {name: name, instructions: __D.instructions, emoji: emoji, theme: theme};"
-            "    var r = await fetch('/backend-api/projects/' + __D.project_id, {"
-            "      method: 'PATCH',"
-            "      headers: {'Authorization': 'Bearer ' + __D.token, 'Content-Type': 'application/json'},"
-            "      body: JSON.stringify(body)"
-            "    });"
-            "    return r.ok ? 'true' : 'false';"
-            "  } catch(e) { return 'error:' + e.message; }"
-            "})()",
-            {"token": self._access_token, "project_id": project_id, "instructions": instructions},
-            timeout=20,
-        )
+        try:
+            result = await self._js_with_data_strict(
+                "(async () => {"
+                "  try {"
+                "    var r0 = await fetch('/backend-api/gizmos/' + __D.project_id, {"
+                "      headers: {'Authorization': 'Bearer ' + __D.token}"
+                "    });"
+                "    var d0 = await r0.json();"
+                "    var g0 = d0.gizmo || d0;"
+                "    var name = ((g0.display) || {}).name || '';"
+                "    var emoji = ((g0.display) || {}).emoji || null;"
+                "    var theme = ((g0.display) || {}).theme || null;"
+                "    var body = {name: name, instructions: __D.instructions, emoji: emoji, theme: theme};"
+                "    var r = await fetch('/backend-api/projects/' + __D.project_id, {"
+                "      method: 'PATCH',"
+                "      headers: {'Authorization': 'Bearer ' + __D.token, 'Content-Type': 'application/json'},"
+                "      body: JSON.stringify(body)"
+                "    });"
+                "    return r.ok ? 'true' : 'false';"
+                "  } catch(e) { return 'error:' + e.message; }"
+                "})()",
+                {"token": self._access_token, "project_id": project_id, "instructions": instructions},
+                timeout=20,
+            )
+        except CDPJSError as e:
+            logger.warning("update_project_instructions JS failed: %s", e)
+            result = "false"
         if result == "true":
             logger.info("Updated instructions for project: %s", project_id)
             return True
@@ -1269,19 +1285,23 @@ class CDPDriver:
     ) -> bool:
         """Archive or unarchive a conversation. Returns True on success."""
         await self.ensure_token()
-        result = await self._js_with_data(
-            "(async () => {"
-            "  try {"
-            "    var r = await fetch('/backend-api/conversation/' + __D.conv_id, {"
-            "      method: 'PATCH',"
-            "      headers: {'Authorization': 'Bearer ' + __D.token, 'Content-Type': 'application/json'},"
-            "      body: JSON.stringify({is_archived: __D.archive})"
-            "    });"
-            "    return r.ok ? 'true' : 'false';"
-            "  } catch(e) { return 'error:' + e.message; }"
-            "})()",
-            {"conv_id": conversation_id, "token": self._access_token, "archive": archive},
-        )
+        try:
+            result = await self._js_with_data_strict(
+                "(async () => {"
+                "  try {"
+                "    var r = await fetch('/backend-api/conversation/' + __D.conv_id, {"
+                "      method: 'PATCH',"
+                "      headers: {'Authorization': 'Bearer ' + __D.token, 'Content-Type': 'application/json'},"
+                "      body: JSON.stringify({is_archived: __D.archive})"
+                "    });"
+                "    return r.ok ? 'true' : 'false';"
+                "  } catch(e) { return 'error:' + e.message; }"
+                "})()",
+                {"conv_id": conversation_id, "token": self._access_token, "archive": archive},
+            )
+        except CDPJSError as e:
+            logger.warning("archive_conversation JS failed: %s", e)
+            result = "false"
         if result == "true":
             logger.info("%s conversation: %s", 'Archived' if archive else 'Unarchived', conversation_id)
             return True
@@ -1294,21 +1314,21 @@ class CDPDriver:
     async def get_memories(self) -> list[dict]:
         """List all ChatGPT memories."""
         await self.ensure_token()
-        raw = await self._js_with_data(
-            "(async () => {"
-            "  try {"
-            "    var r = await fetch('/backend-api/memories', {"
-            "      headers: {'Authorization': 'Bearer ' + __D.token}"
-            "    });"
-            "    if (!r.ok) return JSON.stringify({error: 'HTTP ' + r.status});"
-            "    var data = await r.json();"
-            "    return JSON.stringify(data);"
-            "  } catch(e) { return JSON.stringify({error: e.message}); }"
-            "})()",
-            {"token": self._access_token},
-            timeout=15,
-        )
         try:
+            raw = await self._js_with_data_strict(
+                "(async () => {"
+                "  try {"
+                "    var r = await fetch('/backend-api/memories', {"
+                "      headers: {'Authorization': 'Bearer ' + __D.token}"
+                "    });"
+                "    if (!r.ok) return JSON.stringify({error: 'HTTP ' + r.status});"
+                "    var data = await r.json();"
+                "    return JSON.stringify(data);"
+                "  } catch(e) { return JSON.stringify({error: e.message}); }"
+                "})()",
+                {"token": self._access_token},
+                timeout=15,
+            )
             data = json.loads(raw)
             if isinstance(data, dict) and "error" in data:
                 logger.error("Get memories failed: %s", data["error"])
@@ -1319,7 +1339,8 @@ class CDPDriver:
                 if key in data and isinstance(data[key], list):
                     return data[key]
             return []
-        except json.JSONDecodeError:
+        except (CDPJSError, json.JSONDecodeError) as e:
+            logger.warning("get_memories failed: %s", e)
             return []
 
     @diagnose("create_memory")
@@ -1363,19 +1384,23 @@ class CDPDriver:
     async def delete_memory(self, memory_id: str) -> bool:
         """Delete a ChatGPT memory by ID. Returns True on success."""
         await self.ensure_token()
-        result = await self._js_with_data(
-            "(async () => {"
-            "  try {"
-            "    var r = await fetch('/backend-api/memories/' + __D.memory_id, {"
-            "      method: 'DELETE',"
-            "      headers: {'Authorization': 'Bearer ' + __D.token}"
-            "    });"
-            "    return r.ok ? 'true' : 'false';"
-            "  } catch(e) { return 'error:' + e.message; }"
-            "})()",
-            {"memory_id": memory_id, "token": self._access_token},
-            timeout=15,
-        )
+        try:
+            result = await self._js_with_data_strict(
+                "(async () => {"
+                "  try {"
+                "    var r = await fetch('/backend-api/memories/' + __D.memory_id, {"
+                "      method: 'DELETE',"
+                "      headers: {'Authorization': 'Bearer ' + __D.token}"
+                "    });"
+                "    return r.ok ? 'true' : 'false';"
+                "  } catch(e) { return 'error:' + e.message; }"
+                "})()",
+                {"memory_id": memory_id, "token": self._access_token},
+                timeout=15,
+            )
+        except CDPJSError as e:
+            logger.warning("delete_memory JS failed: %s", e)
+            result = "false"
         if result == "true":
             logger.info("Deleted memory: %s", memory_id)
             return True
@@ -1392,19 +1417,23 @@ class CDPDriver:
         Verified to return 200 against a live account.
         """
         await self.ensure_token()
-        result = await self._js_with_data(
-            "(async () => {"
-            "  try {"
-            "    var r = await fetch('/backend-api/gizmos/' + __D.project_id, {"
-            "      method: 'DELETE',"
-            "      headers: {'Authorization': 'Bearer ' + __D.token}"
-            "    });"
-            "    return r.ok ? 'true' : 'false';"
-            "  } catch(e) { return 'error:' + e.message; }"
-            "})()",
-            {"project_id": project_id, "token": self._access_token},
-            timeout=15,
-        )
+        try:
+            result = await self._js_with_data_strict(
+                "(async () => {"
+                "  try {"
+                "    var r = await fetch('/backend-api/gizmos/' + __D.project_id, {"
+                "      method: 'DELETE',"
+                "      headers: {'Authorization': 'Bearer ' + __D.token}"
+                "    });"
+                "    return r.ok ? 'true' : 'false';"
+                "  } catch(e) { return 'error:' + e.message; }"
+                "})()",
+                {"project_id": project_id, "token": self._access_token},
+                timeout=15,
+            )
+        except CDPJSError as e:
+            logger.warning("delete_project JS failed: %s", e)
+            result = "false"
         success = result == "true"
         if success:
             logger.info("Deleted project: %s", project_id)
@@ -1449,26 +1478,27 @@ class CDPDriver:
         are returned.
         """
         await self.ensure_token()
-        raw = await self._js_with_data(
-            "(async () => {"
-            "  var r = await fetch('/backend-api/gizmos/snorlax/sidebar?owned_only=false&conversations_per_gizmo=0&limit=100', {"
-            "    headers: {'Authorization': 'Bearer ' + __D.token}"
-            "  });"
-            "  var data = await r.json();"
-            "  return JSON.stringify((data.items || []).map(function(i) {"
-            "    var g = (i.gizmo || {}).gizmo || {};"
-            "    if (g.gizmo_type === 'snorlax' && g.memory_scope) return null;"
-            "    return {id: g.id, name: (g.display || {}).name || '', "
-            "      description: (g.display || {}).description || '',"
-            "      gizmo_type: g.gizmo_type || ''};"
-            "  }).filter(Boolean));"
-            "})()",
-            {"token": self._access_token},
-            timeout=20,
-        )
         try:
+            raw = await self._js_with_data_strict(
+                "(async () => {"
+                "  var r = await fetch('/backend-api/gizmos/snorlax/sidebar?owned_only=false&conversations_per_gizmo=0&limit=100', {"
+                "    headers: {'Authorization': 'Bearer ' + __D.token}"
+                "  });"
+                "  var data = await r.json();"
+                "  return JSON.stringify((data.items || []).map(function(i) {"
+                "    var g = (i.gizmo || {}).gizmo || {};"
+                "    if (g.gizmo_type === 'snorlax' && g.memory_scope) return null;"
+                "    return {id: g.id, name: (g.display || {}).name || '', "
+                "      description: (g.display || {}).description || '',"
+                "      gizmo_type: g.gizmo_type || ''};"
+                "  }).filter(Boolean));"
+                "})()",
+                {"token": self._access_token},
+                timeout=20,
+            )
             return json.loads(raw)
-        except json.JSONDecodeError:
+        except (CDPJSError, json.JSONDecodeError) as e:
+            logger.warning("list_gpts failed: %s", e)
             return []
 
     # ── Project Files ─────────────────────────────────────────
@@ -1477,28 +1507,29 @@ class CDPDriver:
     async def get_project_files(self, project_id: str) -> list[dict]:
         """List files attached to a ChatGPT project."""
         await self.ensure_token()
-        raw = await self._js_with_data(
-            "(async () => {"
-            "  try {"
-            "    var r = await fetch('/backend-api/gizmos/' + __D.project_id, {"
-            "      headers: {'Authorization': 'Bearer ' + __D.token}"
-            "    });"
-            "    if (!r.ok) return '[]';"
-            "    var data = await r.json();"
-            "    var gizmo = data.gizmo || data;"
-            "    var files = gizmo.files || [];"
-            "    return JSON.stringify(files.map(function(f) {"
-            "      return {id: f.id || '', name: f.file_name || f.name || '', "
-            "        size: f.size || 0, mime_type: f.mime_type || ''};"
-            "    }));"
-            "  } catch(e) { return '[]'; }"
-            "})()",
-            {"token": self._access_token, "project_id": project_id},
-            timeout=15,
-        )
         try:
+            raw = await self._js_with_data_strict(
+                "(async () => {"
+                "  try {"
+                "    var r = await fetch('/backend-api/gizmos/' + __D.project_id, {"
+                "      headers: {'Authorization': 'Bearer ' + __D.token}"
+                "    });"
+                "    if (!r.ok) return '[]';"
+                "    var data = await r.json();"
+                "    var gizmo = data.gizmo || data;"
+                "    var files = gizmo.files || [];"
+                "    return JSON.stringify(files.map(function(f) {"
+                "      return {id: f.id || '', name: f.file_name || f.name || '', "
+                "        size: f.size || 0, mime_type: f.mime_type || ''};"
+                "    }));"
+                "  } catch(e) { return '[]'; }"
+                "})()",
+                {"token": self._access_token, "project_id": project_id},
+                timeout=15,
+            )
             return json.loads(raw)
-        except json.JSONDecodeError:
+        except (CDPJSError, json.JSONDecodeError) as e:
+            logger.warning("get_project_files failed: %s", e)
             return []
 
     # ── Token Management ──────────────────────────────────────

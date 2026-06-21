@@ -90,7 +90,7 @@ async def test_read_methods_call_ensure_token_first():
     async def _rec_js(template, data, timeout=15):
         call_order.append("fetch")
         return json.dumps({"title": "M", "models": [{"slug": "auto", "title": "A"}]})
-    d._js_with_data = _rec_js
+    d._js_with_data_strict = _rec_js
     await d.get_models()
     assert call_order == ["ensure_token", "fetch"], f"order: {call_order}"
 
