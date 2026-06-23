@@ -164,8 +164,11 @@ class Service:
         names it so a user who hits the failure knows the escape hatch.
         """
         import os
-        host = (cfg.server.host or "").lower()
-        loopback = host in ("127.0.0.1", "::1", "localhost", "")
+        # Normalize empty/None to explicit loopback — security defaults must
+        # not rely on empty-string semantics (aiohttp's empty-host bind is
+        # loopback today, but making it explicit avoids ambiguity).
+        host = (cfg.server.host or "127.0.0.1").lower()
+        loopback = host in ("127.0.0.1", "::1", "localhost")
         has_keys = bool(cfg.server.api_keys)
         allow_unauth_remote = os.environ.get("W2A_ALLOW_UNAUTH_REMOTE", "").strip() == "1"
 
