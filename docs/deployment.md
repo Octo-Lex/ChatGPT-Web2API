@@ -213,4 +213,4 @@ server {
 | "Chrome CDP did not respond" | Chrome isn't running. Check `chrome_path` in config |
 | "Timed out waiting for assistant" | Page may be stuck. Restart the proxy |
 | Cookies not working | Re-export fresh cookies. They expire every ~2 weeks |
-| Headless fails | Anti-bot detection blocks headless. Use cookie injection + headed mode on a VNC/display |
+| Headless fails | Anti-bot detection blocks headless. Use cookie injection + headed mode on a VNC/display. The Dockerfile ships `W2A_HEADLESS=false` for this reason; set `W2A_HEADLESS=true` only if you accept the anti-bot risk |

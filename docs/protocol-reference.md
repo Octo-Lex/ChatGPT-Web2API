@@ -251,13 +251,13 @@ Captured from real conversation: "Model Inquiry" (gpt-5-5-thinking)
 ## User Info Captured
 ```json
 {
-  "id": "ua-87c65f22-31e2-4f62-970f-05e4bd43da81",
+  "id": "ua-<opaque-user-id>",
   "name": "User",
   "email": "user@example.com",
-  "country": "SA",
-  "region": "Mecca Region",
-  "plan_type": "plus",
-  "subscription_plan": "chatgptplusplan"
+  "country": "<country_code>",
+  "region": "<region_name>",
+  "plan_type": "<free|plus|team|enterprise>",
+  "subscription_plan": "<subscription_plan_id>"
 }
 ```
 
