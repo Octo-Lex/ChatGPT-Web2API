@@ -510,7 +510,124 @@ async def test_phase2_dom_action_wins_over_backend(monkeypatch):
     assert end_turn_calls["n"] == 0
 
 
-# ── 9. MCP mapping ─────────────────────────────────────────────
+# ── 9. Thinking-stall fix: is_thinking as progress + fallback unlock ──
+
+@pytest.mark.asyncio
+async def test_thinking_placeholder_does_not_stall_past_90s(monkeypatch):
+    """A static 'Thinking...' placeholder for >90s of simulated polls must NOT
+    raise GenerationStuckError. is_thinking resets the stall clock — reasoning
+    is active generation, not a stall. This is the root fix for the bug that
+    broke long reasoning responses."""
+    d = _make_driver()
+    t = [0.0]
+    monkeypatch.setattr("chatgpt_web2api.cdp_driver.time.monotonic", lambda: t[0])
+    async def fast_sleep(s):
+        t[0] += s
+    monkeypatch.setattr("chatgpt_web2api.cdp_driver.asyncio.sleep", fast_sleep)
+    d._current_conv_id = "conv-think"
+    d._access_token = "tok"
+
+    state = {"count_polls": 0, "phase2_polls": 0}
+    async def _fake_js(expr, timeout=15):
+        if "has_action" in expr:
+            state["phase2_polls"] += 1
+            if state["phase2_polls"] > 10:
+                return json.dumps({"text": "the answer", "md_text": "the answer",
+                                   "html_len": 10, "child_count": 1,
+                                   "has_action": True, "is_thinking": False})
+            return json.dumps({"text": "", "md_text": "", "html_len": 0,
+                               "child_count": 0, "has_action": False, "is_thinking": True})
+        if "body.innerText" in expr:
+            return json.dumps({"text": "normal page"})
+        state["count_polls"] += 1
+        return "1" if state["count_polls"] > 1 else "0"
+    d._js_strict = _fake_js
+    d.type_message = AsyncMock()
+    d.click_send = AsyncMock()
+    d._fetch_text = AsyncMock(return_value="the answer")
+    d._fetch_end_turn = AsyncMock(return_value=False)
+
+    chunks = []
+    async for chunk in d.send_and_stream("think hard", timeout=10000):
+        chunks.append(chunk)
+    assert any(c.delta for c in chunks)
+
+
+@pytest.mark.asyncio
+async def test_saw_thinking_unlocks_fallback_but_empty_end_turn_does_not_finish(monkeypatch):
+    """saw_thinking=True, backend end_turn=true BUT empty content → must NOT
+    finish. Completion stays strict even when the fallback is unlocked."""
+    d = _make_driver()
+    t = [0.0]
+    monkeypatch.setattr("chatgpt_web2api.cdp_driver.time.monotonic", lambda: t[0])
+    async def fast_sleep(s):
+        t[0] += s
+    monkeypatch.setattr("chatgpt_web2api.cdp_driver.asyncio.sleep", fast_sleep)
+    d._current_conv_id = "conv-empty-think"
+    d._access_token = "tok"
+
+    state = {"count_polls": 0}
+    async def _fake_js(expr, timeout=15):
+        if "has_action" in expr:
+            return json.dumps({"text": "", "md_text": "", "html_len": 0,
+                               "child_count": 0, "has_action": False, "is_thinking": True})
+        if "body.innerText" in expr:
+            return json.dumps({"text": "normal page"})
+        state["count_polls"] += 1
+        return "1" if state["count_polls"] > 1 else "0"
+    d._js_strict = _fake_js
+    d.type_message = AsyncMock()
+    d.click_send = AsyncMock()
+    d._fetch_text = AsyncMock(return_value="")
+    d._fetch_end_turn = AsyncMock(return_value=True)
+
+    # is_thinking keeps resetting the stall clock, and the strict content
+    # guard prevents completing on empty. The loop runs to the deadline and
+    # returns WITHOUT emitting any delta — proving the fallback didn't
+    # prematurely complete on an empty end_turn.
+    chunks = []
+    async for chunk in d.send_and_stream("think", timeout=5):
+        chunks.append(chunk)
+    assert not any(c.delta for c in chunks), \
+        "fallback must not complete an empty answer even with end_turn=true"
+
+
+@pytest.mark.asyncio
+async def test_saw_thinking_with_end_turn_and_content_finishes(monkeypatch):
+    """saw_thinking=True, backend end_turn=true WITH usable text → finishes.
+    The rescue path for long reasoning: DOM action slow, backend confirms done."""
+    d = _make_driver()
+    t = [0.0]
+    monkeypatch.setattr("chatgpt_web2api.cdp_driver.time.monotonic", lambda: t[0])
+    async def fast_sleep(s):
+        t[0] += s
+    monkeypatch.setattr("chatgpt_web2api.cdp_driver.asyncio.sleep", fast_sleep)
+    d._current_conv_id = "conv-rescue"
+    d._access_token = "tok"
+
+    state = {"count_polls": 0}
+    async def _fake_js(expr, timeout=15):
+        if "has_action" in expr:
+            return json.dumps({"text": "the full answer", "md_text": "the full answer",
+                               "html_len": 10, "child_count": 1,
+                               "has_action": False, "is_thinking": False})
+        if "body.innerText" in expr:
+            return json.dumps({"text": "normal page"})
+        state["count_polls"] += 1
+        return "1" if state["count_polls"] > 1 else "0"
+    d._js_strict = _fake_js
+    d.type_message = AsyncMock()
+    d.click_send = AsyncMock()
+    d._fetch_text = AsyncMock(return_value="the full answer")
+    d._fetch_end_turn = AsyncMock(return_value=True)
+
+    chunks = []
+    async for chunk in d.send_and_stream("think then answer", timeout=10000):
+        chunks.append(chunk)
+    assert any(c.delta for c in chunks)
+
+
+# ── 10. MCP mapping ─────────────────────────────────────────────
 
 @pytest.mark.asyncio
 async def test_mcp_auth_expired_returns_error_result():

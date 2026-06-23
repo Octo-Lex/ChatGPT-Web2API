@@ -1482,6 +1482,11 @@ class CDPDriver:
         last_html_len = 0
         last_child_count = 0
         had_non_text_content = False
+        # saw_thinking: has the model shown a reasoning phase this turn? Used
+        # to unlock the R4 backend fallback DURING thinking (when last_dom_text
+        # is empty) — without this, a long reasoning response (>90s think time
+        # with no DOM text change) stalls before the answer ever streams.
+        saw_thinking = False
         # Completion detection for Phase-2. The history here matters — three
         # earlier signals each failed in live testing, all producing an
         # off-by-one where request N returned request N-1's text:
@@ -1584,7 +1589,12 @@ class CDPDriver:
                     # and on any answer that mentioned the word "thinking",
                     # which suppressed all delta emission (see the elif below)
                     # and produced empty responses when _fetch_text lagged.
-                    "  var is_thinking = !has_action && !!last.querySelector('.result-thinking');"
+                    # Also recognize a plain "Thinking..." innerText placeholder
+                    # (some layouts show reasoning text without .result-thinking)
+                    # so the stall clock treats it as active generation, not a stall.
+                    "  var hasThinkingEl = !!last.querySelector('.result-thinking');"
+                    "  var visibleThinking = /^(thinking|reasoning)\\b/i.test(rawText.trim());"
+                    "  var is_thinking = !has_action && (hasThinkingEl || (visibleThinking && !mdText));"
                     "  return JSON.stringify({text: text, md_text: mdText, html_len: html_len, child_count: child_count, has_action: has_action, is_thinking: is_thinking});"
                     "})()",
                 )
@@ -1620,6 +1630,7 @@ class CDPDriver:
             # stream are independent concerns — handle them independently.
             if is_thinking:
                 last_change_time = time.monotonic()
+                saw_thinking = True
             if current != last_dom_text:
                 last_change_time = time.monotonic()
                 if len(current) > len(last_dom_text):
@@ -1647,23 +1658,36 @@ class CDPDriver:
             # sibling-container layout), has_action stays false and the loop
             # would stall. The conversation API's end_turn flag on the latest
             # assistant text node is a stable secondary signal. Throttled to
-            # one fetch per 3s, only when has_action is false, only if we have
-            # a conversation id and SOME streamed content (don't complete an
-            # empty answer on a bare end_turn). Fetch failures are ignored —
-            # the DOM poll and stall detector still govern.
+            # one fetch per 3s, only when has_action is false. Eligible when
+            # we have streamed text OR have seen a thinking phase — a long
+            # reasoning response has empty last_dom_text during thinking, but
+            # the backend can still report end_turn once the model finishes.
+            # Completion stays strict (end_turn AND usable content), so this
+            # unlock can't complete an empty answer. Fetch failures ignored.
             if (
                 conv_id_for_check
-                and last_dom_text
+                and (last_dom_text or saw_thinking or is_thinking)
                 and time.monotonic() - last_backend_check > 3.0
             ):
                 last_backend_check = time.monotonic()
                 try:
                     if await self._fetch_end_turn(conv_id_for_check):
-                        logger.info(
-                            "Backend end_turn=true (completion fallback) for %s",
+                        # Completion stays STRICT: end_turn AND usable content.
+                        # The unlock (saw_thinking) lets us CONSULT the backend
+                        # during thinking, but we must not finish on a bare
+                        # end_turn with no answer text/non-text content — that
+                        # would complete an empty response.
+                        if last_dom_text or had_non_text_content:
+                            logger.info(
+                                "Backend end_turn=true (completion fallback) for %s",
+                                conv_id_for_check,
+                            )
+                            break
+                        logger.debug(
+                            "Backend end_turn=true but no content yet for %s — "
+                            "not completing (strict content guard)",
                             conv_id_for_check,
                         )
-                        break
                 except Exception as e:
                     logger.debug("end_turn fallback fetch failed (ignored): %s", e)
 
