@@ -262,6 +262,12 @@ class CDPDriver:
         self._access_token = ""
         self._user_name = ""
         self._token_fetched_at: float = 0.0
+        # Observability for refresh attempts distinct from the last *accepted*
+        # token time. _token_fetched_at advances only on a non-empty token;
+        # _last_refresh_attempt_at advances on every fetch attempt (success
+        # or fail), so backoff/diagnostics can distinguish "stale token, last
+        # refresh tried Ns ago" from "never refreshed."
+        self._last_refresh_attempt_at: float = 0.0
         self._current_conv_id: Optional[str] = None
         self._current_model: Optional[str] = None
         # CDP response routing (#7): id-keyed futures + background reader
@@ -655,6 +661,7 @@ class CDPDriver:
         """
         last_error: Exception | None = None
         for attempt in range(1, 4):
+            self._last_refresh_attempt_at = time.time()
             try:
                 raw = await self._js(
                     "(async () => {"
@@ -671,10 +678,18 @@ class CDPDriver:
                     data = json.loads(raw)
                 else:
                     data = {"token": ""}
-                self._access_token = data.get("token", "")
-                self._user_name = data.get("user", "")
-                self._token_fetched_at = time.time()
-                if self._access_token:
+                # Parse into locals FIRST. Only commit to instance state after
+                # a non-empty token is observed — a transient empty fetch (cold
+                # tab, navigation in flight, CDP blip) must not clobber a
+                # previously-valid token. The exception path already avoided
+                # clobbering; this closes the empty-SUCCESS path too. A real
+                # auth expiry surfaces as a typed 401 on the next backend call.
+                new_token = data.get("token", "")
+                new_user = data.get("user", "")
+                if new_token:
+                    self._access_token = new_token
+                    self._user_name = new_user
+                    self._token_fetched_at = time.time()
                     logger.info(
                         "Auth: %d chars, user: %s (attempt %d)",
                         len(self._access_token), self._user_name, attempt,
@@ -1108,30 +1123,97 @@ class CDPDriver:
             raise RuntimeError("No composer found")
         focused_target = focus_result  # 'composer' or 'fallback'
 
-        # Clear existing text by selecting all first. Works for both the
-        # contenteditable div and the textarea (both honor Select-All).
-        await self._cdp("Input.dispatchKeyEvent", {"type": "rawKeyDown", "key": "a", "code": "KeyA", "windowsVirtualKeyCode": 65, "modifiers": 2})
-        await self._cdp("Input.dispatchKeyEvent", {"type": "keyUp", "key": "a", "code": "KeyA", "windowsVirtualKeyCode": 65, "modifiers": 2})
+        # Clear existing text and insert. Prefer a platform-aware select-all
+        # via keyboard events (modifiers: 2 = Ctrl on Win/Linux, 4 = Cmd on
+        # macOS — detected at runtime so select-all doesn't silently no-op on
+        # Mac). Insert via CDP, dispatched to the focused composer.
+        select_all_mods = await self._detect_select_all_modifier()
+        await self._cdp("Input.dispatchKeyEvent", {"type": "rawKeyDown", "key": "a", "code": "KeyA", "windowsVirtualKeyCode": 65, "modifiers": select_all_mods})
+        await self._cdp("Input.dispatchKeyEvent", {"type": "keyUp", "key": "a", "code": "KeyA", "windowsVirtualKeyCode": 65, "modifiers": select_all_mods})
         await asyncio.sleep(0.1)
-
-        # Insert text via CDP — dispatched to the focused element, which
-        # is the composer regardless of layout.
         await self._cdp("Input.insertText", {"text": text})
         await asyncio.sleep(0.5)
 
-        # Verify — read text from whichever element we focused, using
-        # _js_strict so a CDP/JS error surfaces as the real cause rather
-        # than a generic "Failed to insert text".
+        # Verify the composer holds EXACTLY the intended input (canonicalized),
+        # not just "is non-empty". With ProseMirror contenteditable, a stale or
+        # partially-cleared composer passes a non-empty check while corrupting
+        # the prompt — so we compare canonical editor-visible text. On mismatch,
+        # retry once: clear via execCommand('selectAll') + delete (ProseMirror
+        # sees editor-like input events), re-insert, re-verify. Only then raise.
         verify_selector = COMPOSER_SELECTOR if focused_target == "composer" else COMPOSER_FALLBACK_SELECTOR
-        try:
-            content = await self._js_strict(
-                f"(document.querySelector('{verify_selector}')?.textContent || '')"
+        if not await self._verify_composer_text(verify_selector, text):
+            logger.warning("Composer text mismatch on first insert; retrying with execCommand clear")
+            await self._js_strict(
+                "(function(){"
+                f"  var el = document.querySelector('{verify_selector}');"
+                "  if (el) { el.focus();"
+                "    var sel = window.getSelection(); sel.removeAllRanges();"
+                "    var range = document.createRange(); range.selectNodeContents(el);"
+                "    sel.addRange(range);"
+                "    try { document.execCommand('delete'); } catch(e) {}"
+                "  }"
+                "  return true;"
+                "})()"
             )
-        except CDPJSError as e:
-            raise RuntimeError(f"Failed to verify text insertion: {e}") from e
-        if not content:
-            raise RuntimeError("Failed to insert text into composer")
+            await asyncio.sleep(0.1)
+            await self._cdp("Input.insertText", {"text": text})
+            await asyncio.sleep(0.5)
+            if not await self._verify_composer_text(verify_selector, text):
+                raise RuntimeError(
+                    f"Composer text verification failed after retry; "
+                    f"expected {text[:60]!r}"
+                )
         logger.info("Typed: %s", text[:80])
+
+    async def _detect_select_all_modifier(self) -> int:
+        """Return the CDP modifiers value for select-all on the live platform.
+
+        ``2`` = Ctrl (Windows/Linux), ``4`` = Cmd (macOS). Probed once via
+        ``navigator.userAgentData``/``navigator.platform`` so the keyboard
+        select-all doesn't silently no-op on macOS (where Cmd, not Ctrl,
+        selects all). Falls back to Ctrl (2) on any probe failure.
+        """
+        try:
+            ua = await self._js_strict(
+                "(navigator.userAgentData && navigator.userAgentData.platform)"
+                " || navigator.platform || ''"
+            )
+            if ua and "mac" in ua.lower():
+                return 4
+        except CDPJSError:
+            pass
+        return 2
+
+    async def _verify_composer_text(self, selector: str, expected: str) -> bool:
+        """Canonical-equality check: does the composer hold *expected*?
+
+        Compares editor-visible text with canonical normalization (CRLF→LF,
+        NBSP→space, tolerate a trailing block newline ProseMirror adds) — but
+        does NOT broadly collapse internal whitespace, since that would hide
+        real corruption of code/YAML/Markdown indentation. Reads .value for a
+        legacy textarea, .innerText for a contenteditable div (textContent
+        joins block nodes differently than what the user sees).
+        """
+        try:
+            actual = await self._js_strict(
+                "(function(){"
+                f"  var el = document.querySelector('{selector}');"
+                "  if (!el) return '';"
+                "  var t = el.tagName === 'TEXTAREA' ? el.value : (el.innerText || '');"
+                "  return t;"
+                "})()"
+            )
+        except CDPJSError:
+            return False
+        if not actual:
+            return False
+        canon_actual = actual.replace("\r\n", "\n").replace("\r", "\n").replace("\u00a0", " ")
+        canon_expected = expected.replace("\r\n", "\n").replace("\r", "\n").replace("\u00a0", " ")
+        # ProseMirror wraps input in a <p> and may append a trailing block
+        # newline; tolerate it by stripping a single trailing newline.
+        if canon_actual.endswith("\n"):
+            canon_actual = canon_actual[:-1]
+        return canon_actual == canon_expected
 
     async def click_send(self) -> None:
         """Click the send button via JS MouseEvent sequence.

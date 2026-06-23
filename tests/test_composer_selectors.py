@@ -129,6 +129,8 @@ async def test_type_message_focuses_new_composer_when_present(monkeypatch):
         calls["strict"].append(expr)
         return "hello"  # verify succeeds
     d._js_strict = _fake_strict
+    # Bypass the platform-probe so _js_strict calls stay focused on verify.
+    d._detect_select_all_modifier = AsyncMock(return_value=2)
 
     await d.type_message("hello")
 
@@ -164,6 +166,7 @@ async def test_type_message_falls_back_to_legacy_textarea(monkeypatch):
         calls["strict"].append(expr)
         return "hello"
     d._js_strict = _fake_strict
+    d._detect_select_all_modifier = AsyncMock(return_value=2)
 
     await d.type_message("hello")
 
@@ -179,14 +182,19 @@ async def test_type_message_falls_back_to_legacy_textarea(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_type_message_raises_when_verify_returns_empty(monkeypatch):
-    """If the composer appears focused but verify reads empty text, the
-    insert failed — raise rather than send an empty message."""
+    """If the composer appears focused but verify reads empty/stale text on
+    both the first attempt AND the retry, the insert failed — raise rather
+    than send an empty/corrupt message. The new verifier canonicalizes and
+    retries once via execCommand clear before giving up."""
     d = _make_driver()
     d._js = AsyncMock(return_value="composer")
     d._cdp = AsyncMock(return_value={})
-    d._js_strict = AsyncMock(return_value="")  # empty → failure
+    d._js_strict = AsyncMock(return_value="")  # empty → verify fails
+    d._detect_select_all_modifier = AsyncMock(return_value=2)
+    # Collapse sleeps so the retry path runs instantly.
+    monkeypatch.setattr("chatgpt_web2api.cdp_driver.asyncio.sleep", AsyncMock())
 
-    with pytest.raises(RuntimeError, match="Failed to insert"):
+    with pytest.raises(RuntimeError, match="verification failed after retry"):
         await d.type_message("hello")
 
 
@@ -271,3 +279,123 @@ async def test_navigate_new_chat_ready_when_prosemirror_present(monkeypatch):
     monkeypatch.setattr("chatgpt_web2api.cdp_driver.asyncio.sleep", AsyncMock())
 
     await d.navigate_new_chat()  # must not raise / must not loop forever
+
+
+# ── 5. canonical composer verification (R1) ────────────────────────────
+
+@pytest.mark.asyncio
+async def test_type_message_retries_on_stale_text_then_succeeds(monkeypatch):
+    """ProseMirror stale-text regression: first insert leaves stale text
+    (verify FAILS canonical equality), retry via execCommand clear, second
+    insert matches. The old non-empty check would have passed the stale text;
+    the new canonical check catches it and retries."""
+    d = _make_driver()
+    d._js = AsyncMock(return_value="composer")
+    d._cdp = AsyncMock(return_value={})
+    d._detect_select_all_modifier = AsyncMock(return_value=2)
+    # First verify returns STALE text, the execCommand-clear call returns
+    # "true", then the post-retry verify returns the correct input.
+    verify_returns = ["old stale content", "true", "correct input"]
+    async def _fake_strict(expr, timeout=15):
+        # execCommand-clear + re-verify both call _js_strict; return the
+        # sequence. The platform probe is bypassed via _detect_select_all_modifier.
+        return verify_returns.pop(0) if verify_returns else ""
+    d._js_strict = _fake_strict
+    monkeypatch.setattr("chatgpt_web2api.cdp_driver.asyncio.sleep", AsyncMock())
+
+    await d.type_message("correct input")  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_verify_composer_text_canonicalizes_crlf_and_nbsp():
+    """Canonical equality: CRLF→LF, NBSP→space are normalized; internal
+    spacing is NOT collapsed (would hide code/YAML corruption)."""
+    d = _make_driver()
+    # Input with CRLF and NBSP; composer returns the same → match.
+    async def _fake_strict(expr, timeout=15):
+        return "line1\r\nline2\u00a0end"
+    d._js_strict = _fake_strict
+    assert await d._verify_composer_text(COMPOSER_SELECTOR, "line1\nline2 end") is True
+
+
+@pytest.mark.asyncio
+async def test_verify_composer_text_tolerates_trailing_newline():
+    """ProseMirror wraps input in a <p> and may append a trailing block
+    newline; a single trailing newline must not fail verification."""
+    d = _make_driver()
+    async def _fake_strict(expr, timeout=15):
+        return "hello\n"  # composer added a trailing newline
+    d._js_strict = _fake_strict
+    assert await d._verify_composer_text(COMPOSER_SELECTOR, "hello") is True
+
+
+@pytest.mark.asyncio
+async def test_verify_composer_text_does_not_collapse_internal_whitespace():
+    """Broad whitespace collapse would hide corruption of code/Markdown
+    indentation. Double spaces in the input must be preserved EXACTLY."""
+    d = _make_driver()
+    async def _fake_strict(expr, timeout=15):
+        return "two  spaces"  # two spaces, as input
+    d._js_strict = _fake_strict
+    # Match: two spaces == two spaces.
+    assert await d._verify_composer_text(COMPOSER_SELECTOR, "two  spaces") is True
+    # Mismatch: the composer has two spaces but expected one → must fail.
+    assert await d._verify_composer_text(COMPOSER_SELECTOR, "two spaces") is False
+
+
+@pytest.mark.asyncio
+async def test_detect_select_all_modifier_returns_cmd_on_mac():
+    """On macOS, select-all needs Cmd (modifiers: 4), not Ctrl (2). The old
+    hardcoded modifiers:2 silently no-op'd on Mac."""
+    d = _make_driver()
+    d._js_strict = AsyncMock(return_value="macOS")
+    assert await d._detect_select_all_modifier() == 4
+
+
+@pytest.mark.asyncio
+async def test_detect_select_all_modifier_returns_ctrl_on_windows():
+    d = _make_driver()
+    d._js_strict = AsyncMock(return_value="Windows")
+    assert await d._detect_select_all_modifier() == 2
+
+
+# ── 6. token refresh preserves prior token on empty fetch (R2) ─────────
+
+@pytest.mark.asyncio
+async def test_refresh_token_preserves_prior_on_transient_empty(monkeypatch):
+    """A transient empty-token fetch must NOT clobber a previously-valid
+    token. The old code assigned before the non-empty check, wiping the good
+    token. New code parses to locals and only commits on non-empty."""
+    d = _make_driver()
+    d._access_token = "PRIOR_VALID_TOKEN_1977chars"
+    d._user_name = "Prior User"
+    d._token_fetched_at = 1000.0
+    # _js returns an empty-token payload on all 3 attempts.
+    d._js = AsyncMock(return_value='{"token": "", "user": ""}')
+    monkeypatch.setattr("chatgpt_web2api.cdp_driver.asyncio.sleep", AsyncMock())
+
+    with pytest.raises(RuntimeError):
+        await d._refresh_token()
+
+    # Prior token + user + fetched_at preserved; attempt timestamp advanced.
+    assert d._access_token == "PRIOR_VALID_TOKEN_1977chars"
+    assert d._user_name == "Prior User"
+    assert d._token_fetched_at == 1000.0
+    assert d._last_refresh_attempt_at > 1000.0
+
+
+@pytest.mark.asyncio
+async def test_refresh_token_commits_only_on_non_empty(monkeypatch):
+    """A successful non-empty fetch commits token, user, and advances BOTH
+    timestamps. _token_fetched_at and _last_refresh_attempt_at are distinct."""
+    d = _make_driver()
+    d._access_token = "OLD"
+    d._token_fetched_at = 0.0
+    d._js = AsyncMock(return_value='{"token": "FRESH_TOKEN", "user": "New"}')
+
+    await d._refresh_token()
+
+    assert d._access_token == "FRESH_TOKEN"
+    assert d._user_name == "New"
+    assert d._token_fetched_at > 0.0
+    assert d._last_refresh_attempt_at == d._token_fetched_at
