@@ -89,3 +89,18 @@ only works with JS off — typing into it does not reach the composer.
 Typing into the ProseMirror div requires `document.execCommand('insertText', …)`
 (or an InputEvent dispatch); setting `.value` does nothing (it's not a
 form control).
+
+## 5. Why the bridge drives the DOM, not the API
+
+An earlier experiment (removed `scripts/curl_cffi_test.py`) tried sending
+messages by POSTing directly to `/backend-api/f/conversation` with the
+sentinel prepare/finalize tokens. Even with a fully-correct body, headers,
+PoW, and a Chrome-impersonated TLS fingerprint (via `curl_cffi`), the
+direct send **403'd with "Unusual activity"**. The sentinel flow
+(prepare → finalize → token) succeeds via plain urllib, but the message
+send itself is gated behind TLS/behavioral fingerprinting that the
+in-page `fetch()` (the bridge's approach) passes naturally because it
+runs in the real browser context. This is *why* the driver types into the
+composer and polls the DOM rather than calling the conversation API
+directly for sends — the reads (GET) work over plain HTTP, but the
+write path requires the browser's full fingerprint.
