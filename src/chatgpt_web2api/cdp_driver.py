@@ -16,6 +16,7 @@ import json
 import logging
 import re
 import time
+import urllib.parse
 import urllib.request
 import uuid
 from dataclasses import dataclass
@@ -956,13 +957,25 @@ class CDPDriver:
         self._current_conv_id = None
 
     async def navigate_conversation(self, conversation_id: str) -> None:
-        """Navigate to an existing conversation for multi-turn."""
+        """Navigate to an existing conversation for multi-turn.
+
+        Sets ``self._current_conv_id`` ONLY after the live tab is verified
+        to be at ``/c/{conversation_id}`` with the composer ready. On a
+        verified failure (wrong landing URL, or readiness never observed)
+        clears any stale ``_current_conv_id`` matching the request and
+        raises — never admits an unverified conversation as current. This
+        is the invariant the auto-continue paths depend on: ``_current_conv_id``
+        means "the live tab is here", not "we attempted to go here".
+        """
         url = f"https://chatgpt.com/c/{conversation_id}"
         logger.info("Navigate to conversation: %s", url)
         await self._cdp("Page.navigate", {"url": url})
         await asyncio.sleep(3)
 
-        # Wait for composer (new ProseMirror div, or legacy textarea)
+        # Wait for composer (new ProseMirror div, or legacy textarea) AND a
+        # verified landing. A for/else means: if the loop completes without
+        # `break` (never became ready at the right URL), the else runs and we
+        # fail rather than falling through to admit an unverified conversation.
         for _ in range(30):
             result = await self._js(
                 "(function() {"
@@ -974,21 +987,82 @@ class CDPDriver:
             )
             try:
                 state = json.loads(result)
-                if state.get("ready"):
-                    actual_url = state.get("url", "")
-                    # #14: verify we landed on the right conversation
-                    if conversation_id not in actual_url:
-                        raise RuntimeError(
-                            f"Navigation to {conversation_id} landed on {actual_url}"
-                        )
-                    logger.info("Conversation ready: %s", actual_url)
-                    break
             except (json.JSONDecodeError, TypeError):
-                pass
+                state = {}
+            if state.get("ready") and self._is_url_at_conversation(
+                state.get("url", ""), conversation_id
+            ):
+                logger.info("Conversation ready: %s", state.get("url", ""))
+                break
             await asyncio.sleep(0.5)
+        else:
+            # Loop exhausted without a verified landing. Clear any stale
+            # state that might point here so a later auto-continue can't
+            # reuse a known-unverified id, then surface the failure.
+            if self._current_conv_id == conversation_id:
+                self._current_conv_id = None
+            raise RuntimeError(
+                f"Navigation to {conversation_id} did not reach a ready "
+                f"composer within the timeout"
+            )
 
         await asyncio.sleep(1)
         self._current_conv_id = conversation_id
+
+    @staticmethod
+    def _is_url_at_conversation(url: str, conversation_id: str) -> bool:
+        """Exact path-segment match: is *url* at ``/c/{conversation_id}``?
+
+        Uses urllib to parse the path and compare the second segment, so a
+        high-entropy id can't accidentally match as a substring of another
+        path. Query strings and trailing slashes are tolerated; a different
+        conversation id or a non-conversation URL returns False.
+        """
+        if not url or not conversation_id:
+            return False
+        try:
+            parsed = urllib.parse.urlparse(url)
+        except ValueError:
+            return False
+        if "chatgpt.com" not in (parsed.netloc or "").lower():
+            return False
+        parts = [p for p in parsed.path.split("/") if p]
+        # Expected shape: ["c", "<conversation_id>"]
+        return len(parts) >= 2 and parts[0] == "c" and parts[1] == conversation_id
+
+    async def _is_live_conversation_url(self, conversation_id: str) -> bool:
+        """Read ``location.href`` and check it is at *conversation_id*.
+
+        Returns False on any read/parse failure rather than raising — callers
+        that need fail-closed behavior use ``ensure_current_conversation``,
+        which turns an unreadable URL into a navigation attempt.
+        """
+        try:
+            url = await self._js_strict("location.href")
+        except CDPJSError:
+            return False
+        return self._is_url_at_conversation(url or "", conversation_id)
+
+    async def ensure_current_conversation(self, conversation_id: str) -> None:
+        """Guarantee the live tab is at *conversation_id* before sending.
+
+        If the live URL already matches, returns without navigating. Otherwise
+        navigates and verifies the landing. Raises if the tab cannot be brought
+        to the requested conversation — fail-closed, never silently proceeding
+        into an unknown tab state. ``_current_conv_id`` is only set on success
+        (by ``navigate_conversation``); on failure it is cleared if it matched.
+        """
+        if await self._is_live_conversation_url(conversation_id):
+            return
+        await self.navigate_conversation(conversation_id)
+        # navigate_conversation raises on failure, so reaching here means it
+        # verified the landing. Belt-and-braces: re-check before returning.
+        if not await self._is_live_conversation_url(conversation_id):
+            if self._current_conv_id == conversation_id:
+                self._current_conv_id = None
+            raise RuntimeError(
+                f"Failed to restore conversation context: {conversation_id}"
+            )
 
     # ── Message Input ─────────────────────────────────────────
 

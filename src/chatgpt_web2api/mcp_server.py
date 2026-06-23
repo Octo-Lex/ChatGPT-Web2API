@@ -704,7 +704,13 @@ async def do_chat_completion(
     if validated.conversation_id:
         await driver.navigate_conversation(validated.conversation_id)
     elif driver._current_conv_id and not validated.system_prompt and not project_id:
+        # Auto-continue: reconcile against the live tab before sending. Another
+        # process sharing the Chrome tab may have navigated it, leaving
+        # _current_conv_id stale. ensure_current_conversation verifies the live
+        # URL and navigates back if needed (fail-closed). Raises rather than
+        # typing into the wrong conversation.
         logger.info("Auto-continuing conversation: %s", driver._current_conv_id)
+        await driver.ensure_current_conversation(driver._current_conv_id)
     else:
         await driver.navigate_new_chat(gizmo_id=project_id)
 

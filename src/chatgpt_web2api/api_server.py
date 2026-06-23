@@ -233,9 +233,13 @@ class APIServer:
                       and self._driver._current_conv_id == self._last_conv_id
                       and project_id == self._last_project_id
                       and not system_parts):
-                    # Same session, same project, no system prompt override — continue
+                    # Same session, same project, no system prompt override — continue.
+                    # Reconcile against the live tab before sending: another process
+                    # sharing the Chrome tab may have navigated it since our last turn,
+                    # which would leave _current_conv_id stale. ensure_current_conversation
+                    # verifies location.href and navigates back if needed (fail-closed).
                     logger.info("Continuing conversation: %s", self._last_conv_id)
-                    await asyncio.sleep(2)  # Let the page settle
+                    await self._driver.ensure_current_conversation(self._last_conv_id)
                 else:
                     # Fresh chat
                     await self._driver.navigate_new_chat(gizmo_id=project_id)
