@@ -1392,6 +1392,13 @@ class CDPDriver:
         # streaming) rather than .markdown textContent (which lags).
         last_change_time = time.monotonic()
         deadline = time.monotonic() + timeout
+        # Backend end_turn fallback throttle (R4): if the DOM action-button
+        # selector drifts again, the conversation API's end_turn flag is a
+        # secondary completion signal. Throttled to once per 3s to respect the
+        # shared account rate budget, and only fires when has_action is false
+        # (so it never races the primary DOM signal). Never the sole signal.
+        last_backend_check = 0.0
+        conv_id_for_check = self._current_conv_id or ""
         while time.monotonic() < deadline:
             try:
                 result = await self._js_strict(
@@ -1521,6 +1528,31 @@ class CDPDriver:
             if has_action:
                 break
 
+            # Backend end_turn fallback (R4): when the DOM action-button
+            # selector drifts (it has, twice — composer redesign + the
+            # sibling-container layout), has_action stays false and the loop
+            # would stall. The conversation API's end_turn flag on the latest
+            # assistant text node is a stable secondary signal. Throttled to
+            # one fetch per 3s, only when has_action is false, only if we have
+            # a conversation id and SOME streamed content (don't complete an
+            # empty answer on a bare end_turn). Fetch failures are ignored —
+            # the DOM poll and stall detector still govern.
+            if (
+                conv_id_for_check
+                and last_dom_text
+                and time.monotonic() - last_backend_check > 3.0
+            ):
+                last_backend_check = time.monotonic()
+                try:
+                    if await self._fetch_end_turn(conv_id_for_check):
+                        logger.info(
+                            "Backend end_turn=true (completion fallback) for %s",
+                            conv_id_for_check,
+                        )
+                        break
+                except Exception as e:
+                    logger.debug("end_turn fallback fetch failed (ignored): %s", e)
+
             if time.monotonic() - last_change_time > PHASE_STALL_SECONDS:
                 raise GenerationStuckError(
                     "phase_2_stream", time.monotonic() - last_change_time
@@ -1632,6 +1664,56 @@ class CDPDriver:
             if status is not None:
                 raise RuntimeError(f"_fetch_text HTTP {status} for {conversation_id}")
         return raw
+
+    async def _fetch_end_turn(self, conversation_id: str) -> bool:
+        """Backend secondary completion signal: is the latest assistant TEXT
+        node marked ``end_turn === true``?
+
+        A fallback for the Phase-2 DOM completion detector: if the action-
+        button selector drifts again (as it did when ChatGPT moved the buttons
+        to a sibling container), the DOM ``has_action`` stays false forever
+        and the loop stalls. This reads the conversation API and checks the
+        terminal flag on the newest assistant text node — the same
+        newest-by-create-time selection ``_fetch_text`` uses (NOT current_node,
+        which lags on continued conversations, and NOT reasoning_recap nodes,
+        which carry empty text).
+
+        Returns False on ANY failure (fetch error, parse error, no assistant
+        text node, end_turn falsy). Callers treat False as "not confirmed,
+        keep polling DOM" — this is defense-in-depth, never the sole signal.
+        """
+        await self.ensure_token()
+        try:
+            raw = await self._js_with_data_strict(
+                "(async function() {"
+                "  try {"
+                "    var r = await fetch('/backend-api/conversation/' + __D.conv_id + '?offset=0&limit=5', {"
+                "      headers: {'Authorization': 'Bearer ' + __D.token}"
+                "    });"
+                "    if (!r.ok) return 'false';"
+                "    var conv = await r.json();"
+                "    var mapping = conv.mapping || {};"
+                # Newest assistant TEXT node by create_time (mirrors
+                # _fetch_text: current_node lags; reasoning_recap has no text).
+                "    var bestTime = -1; var bestEnd = false;"
+                "    for (var k in mapping) {"
+                "      var n = mapping[k]; var m = n.message;"
+                "      if (!m || !m.author || m.author.role !== 'assistant') continue;"
+                "      if (!m.content || m.content.content_type !== 'text') continue;"
+                "      var parts = m.content.parts || [];"
+                "      if (!parts.length || !parts[0]) continue;"
+                "      var t = m.create_time || 0;"
+                "      if (t >= bestTime) { bestTime = t; bestEnd = !!m.end_turn; }"
+                "    }"
+                "    return bestEnd ? 'true' : 'false';"
+                "  } catch(e) { return 'false'; }"
+                "})()",
+                {"conv_id": conversation_id, "token": self._access_token},
+                timeout=15,
+            )
+        except CDPJSError:
+            return False
+        return raw == "true"
 
     async def dismiss_rate_limit(self) -> bool:
         """Dismiss ChatGPT's 'Too many requests' pop-up by clicking 'Got it'.
