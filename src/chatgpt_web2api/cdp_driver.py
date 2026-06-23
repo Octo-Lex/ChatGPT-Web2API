@@ -1323,14 +1323,45 @@ class CDPDriver:
                     # Strip a leading "Thinking..." / "Thought for …" reasoning
                     # label so the innerText fallback can't leak it as a delta.
                     "  var text = mdText || rawText.replace(/^Think(ing|\\s+for)[^\\n]*\\n?/i, '');"
-                    "  var html_len = last.innerHTML.length;"
-                    "  var child_count = last.children.length;"
-                # has_action: the per-turn copy/feedback button appears only
-                # on a completed message. Match common action-button testids.
-                "  var has_action = !!("
-                "    last.querySelector('[data-testid*=\"copy\"]')"
-                "    || last.querySelector('[data-testid*=\"response-turn\"]')"
-                "  );"
+                "  var html_len = last.innerHTML.length;"
+                "  var child_count = last.children.length;"
+                # has_action: the per-turn copy/feedback action row appears
+                # only on a COMPLETED message. ChatGPT's DOM layout puts these
+                # buttons in a SIBLING/UNCLE container, NOT as descendants of
+                # the assistant message node — so a plain
+                # ``last.querySelector(...)`` finds nothing and completion is
+                # never detected (every send stalled at the 90s ceiling). The
+                # fix: walk up to 4 ancestors, querying down at each scope,
+                # and require the button to be GEOMETRICALLY NEAR the message
+                # (below it, within ~240px) so an older turn's action row
+                # can't falsely complete a brand-new answer. New testid scheme
+                # is ``*-turn-action-button`` (copy/good-response/bad-response);
+                # the legacy ``response-turn`` selector is retained for older
+                # deployments but no longer matches anything on current ChatGPT.
+                "  var ACT = '[data-testid=\"copy-turn-action-button\"],"
+                "            [data-testid=\"good-response-turn-action-button\"],"
+                "            [data-testid=\"bad-response-turn-action-button\"],"
+                "            [data-testid*=\"turn-action-button\"],"
+                "            [data-testid*=\"copy\"],"
+                "            [data-testid*=\"response-turn\"]';"
+                "  var has_action = (function() {"
+                "    var lastRect = last.getBoundingClientRect();"
+                "    var scope = last;"
+                "    for (var d = 0; scope && d <= 4; d++, scope = scope.parentElement) {"
+                "      var btns = Array.prototype.filter.call("
+                "        scope.querySelectorAll(ACT),"
+                "        function(el){ return el.offsetParent !== null || el.getClientRects().length > 0; }"
+                "      );"
+                "      if (!btns.length) continue;"
+                "      for (var i = 0; i < btns.length; i++) {"
+                "        var r = btns[i].getBoundingClientRect();"
+                "        if (r.top >= lastRect.top - 8 && r.top <= lastRect.bottom + 240) {"
+                "          return true;"
+                "        }"
+                "      }"
+                "    }"
+                "    return false;"
+                "  })();"
                     # is_thinking: the active-reasoning indicator. Narrowed to
                     # ``.result-thinking`` AND ``!has_action`` — the action
                     # button marks a finished turn, and ``.result-thinking``
