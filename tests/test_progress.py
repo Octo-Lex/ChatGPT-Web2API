@@ -186,7 +186,7 @@ async def test_backoff_notifies_before_sleep(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_backoff_no_callback_still_works():
+async def test_backoff_no_callback_still_works(monkeypatch):
     """retry_on_rate_limit with on_progress=None (default) behaves as before."""
     from chatgpt_web2api import resilience
     driver = MagicMock()
@@ -199,16 +199,27 @@ async def test_backoff_no_callback_still_works():
             raise RateLimitError(retry_after=0)  # minimal backoff
         return "ok"
 
-    # Patch sleep to be instant
+    # Patch sleep to be instant. Use the monkeypatch fixture (not the bare
+    # module assignment in monkeypatch_setattr_sleep) so it auto-reverts —
+    # otherwise the global asyncio.sleep stays patched for every later test,
+    # breaking any test whose fakes rely on real asyncio.sleep yielding
+    # (e.g. FakeWebSocket.recv's poll loop in test_tab_isolation).
     async def fast_sleep(s):
         return
-    monkeypatch_setattr_sleep(resilience, fast_sleep)
+    monkeypatch.setattr(resilience.asyncio, "sleep", fast_sleep)
     result = await resilience.retry_on_rate_limit(driver, factory)
     assert result == "ok"
 
 
 def monkeypatch_setattr_sleep(module, fn):
-    """Helper to monkeypatch asyncio.sleep on a module without the fixture."""
+    """Helper to monkeypatch asyncio.sleep on a module without the fixture.
+
+    NOTE: this performs a bare ``module.asyncio.sleep = fn`` with NO teardown.
+    Because ``module.asyncio`` is the global asyncio module, this leaks the
+    patch to every subsequent test in the session. Prefer ``monkeypatch.setattr``
+    (auto-reverting) for new tests; this helper is retained only for existing
+    call sites.
+    """
     module.asyncio.sleep = fn
 
 

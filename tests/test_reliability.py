@@ -285,6 +285,68 @@ async def test_progressing_generation_does_not_raise(monkeypatch):
     assert chunks[-1].finish_reason == "stop"
 
 
+# ── 7b. Thinking-model streaming regression ────────────────────
+
+@pytest.mark.asyncio
+async def test_thinking_model_streams_during_answer_phase(monkeypatch):
+    """Regression: when is_thinking is true but the answer is actively
+    streaming, deltas MUST still be emitted.
+
+    The old `if is_thinking / elif text-changed` structure meant
+    is_thinking=true suppressed ALL delta emission — freezing
+    last_dom_text="" and producing an empty response whenever the
+    _fetch_text fallback lagged (the common case for thinking models,
+    whose conversation-API text commits late).
+
+    Simulates the post-reasoning gap: is_thinking=true throughout
+    (.result-thinking lingers after reasoning ends), answer text grows
+    each poll, has_action fires at the end. With _fetch_text mocked
+    empty (fallback lag), the answer MUST still arrive via deltas."""
+    d = _make_driver()
+    t = [0.0]
+    monkeypatch.setattr("chatgpt_web2api.cdp_driver.time.monotonic", lambda: t[0])
+    async def fast_sleep(s):
+        t[0] += s
+    monkeypatch.setattr("chatgpt_web2api.cdp_driver.asyncio.sleep", fast_sleep)
+
+    state = {"phase1": 0, "phase2": 0, "text": ""}
+    async def _fake_js(expr, timeout=15):
+        if "body.innerText" in expr:
+            return json.dumps({"text": "normal"})
+        if "has_action" in expr:
+            state["phase2"] += 1
+            state["text"] += "answer chunk. "
+            return json.dumps({
+                "text": "Thinking... " + state["text"],  # innerText w/ reasoning label
+                "md_text": state["text"],                 # clean answer from .markdown
+                "html_len": len(state["text"]) + 20,
+                "child_count": 1,
+                "has_action": state["phase2"] > 5,
+                "is_thinking": True,  # .result-thinking lingers post-reasoning
+            })
+        if ".length" in expr and "querySelectorAll" in expr and "JSON.stringify" not in expr:
+            state["phase1"] += 1
+            return "1" if state["phase1"] > 1 else "0"
+        return ""
+    d._js_strict = _fake_js
+    d.type_message = AsyncMock()
+    d.click_send = AsyncMock()
+    d._fetch_text = AsyncMock(return_value="")  # fallback lag → empty
+
+    chunks = []
+    async for chunk in d.send_and_stream("think then answer", timeout=10000):
+        chunks.append(chunk)
+
+    full = "".join(c.delta for c in chunks if c.delta)
+    assert "answer chunk" in full, (
+        f"is_thinking suppressed streaming — no answer deltas: {chunks}"
+    )
+    assert "Thinking" not in full, (
+        f"reasoning UI label leaked as a delta: {full}"
+    )
+    assert chunks[-1].finish_reason == "stop"
+
+
 # ── 8. MCP mapping ─────────────────────────────────────────────
 
 @pytest.mark.asyncio

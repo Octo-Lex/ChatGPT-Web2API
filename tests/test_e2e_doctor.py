@@ -6,10 +6,14 @@ when a driver method returns a broken shape, an artifact is captured, and
 
 To keep the tests STABLE — independent of which functions happen to be broken
 against the live API at any given time — the breakage is SYNTHETIC: we patch
-the driver's low-level _js_with_data to return a payload that the method
-parses into a broken shape. The real @diagnose-decorated method runs, hits the
-broken path, returns the broken shape, and the decorator captures it — exactly
-the production code path, just with a forced failure.
+the driver's low-level JS-eval helpers (BOTH _js_with_data and its strict
+variant _js_with_data_strict) to return a payload that the method parses into
+a broken shape. Patching both is deliberate: decorated methods may use either
+variant, and coupling the test to which one a given method happens to call
+broke this suite silently when get_projects migrated to the strict variant.
+The real @diagnose-decorated method runs, hits the broken path, returns the
+broken shape, and the decorator captures it — exactly the production code path,
+just with a forced failure.
 
 Run with:  W2A_E2E_RUN=1 pytest tests/test_e2e_doctor.py -m e2e -v
 """
@@ -38,10 +42,13 @@ async def test_broken_return_triggers_capture(e2e_driver: CDPDriver, tmp_path, m
 
     # Force get_projects' fetch to return an error-shaped JSON. get_projects
     # parses the response; an {"error": ...} body yields a broken dict result.
+    # Patch BOTH JS-eval variants so the test is immune to which one the
+    # decorated method calls (get_projects uses the strict variant today).
     async def _broken_js_with_data(self, template, data, timeout=15):
         return json.dumps({"error": "HTTP 500", "body": "synthetic drift"})
 
     monkeypatch.setattr(type(e2e_driver), "_js_with_data", _broken_js_with_data)
+    monkeypatch.setattr(type(e2e_driver), "_js_with_data_strict", _broken_js_with_data)
 
     result = await e2e_driver.get_projects()
     assert isinstance(result, dict) and "error" in result, \
@@ -70,6 +77,7 @@ async def test_doctor_auto_discovers_and_prints_broken_function(
         return json.dumps({"error": "HTTP 500", "body": "synthetic drift"})
 
     monkeypatch.setattr(type(e2e_driver), "_js_with_data", _broken_js_with_data)
+    monkeypatch.setattr(type(e2e_driver), "_js_with_data_strict", _broken_js_with_data)
     await e2e_driver.get_projects()
 
     from chatgpt_web2api.doctor import list_broken_functions, latest_artifact_for, print_evidence
