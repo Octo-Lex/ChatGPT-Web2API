@@ -17,11 +17,11 @@ These tests pin:
 """
 
 import json
-import pytest
 from unittest.mock import AsyncMock, MagicMock
 
-from chatgpt_web2api.cdp_driver import CDPDriver
+import pytest
 
+from chatgpt_web2api.cdp_driver import CDPDriver
 
 # ── 1. Static URL matcher ─────────────────────────────────────────────
 
@@ -273,7 +273,6 @@ async def test_rest_auto_continue_invokes_ensure_current(monkeypatch):
     })
 
     # Bypass the cross-process file lock so the test runs without it.
-    from chatgpt_web2api.cross_process_lock import CrossProcessLock
     class _NullLock:
         def __init__(self, *a, **kw): pass
         async def __aenter__(self): return self

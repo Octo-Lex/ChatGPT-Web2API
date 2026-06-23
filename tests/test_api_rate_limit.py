@@ -9,7 +9,6 @@ This tests the error-mapping seam directly (APIServer._error_response),
 which both the streaming and non-streaming paths use.
 """
 
-import pytest
 from aiohttp import web
 
 from chatgpt_web2api.api_server import APIServer
@@ -19,6 +18,7 @@ from chatgpt_web2api.cdp_driver import RateLimitError
 def _server():
     """An APIServer with a throwaway config + driver (only _error_response used)."""
     from unittest.mock import MagicMock
+
     from chatgpt_web2api.config import Config
     return APIServer(Config.load(None), MagicMock())
 

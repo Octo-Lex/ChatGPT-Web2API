@@ -13,14 +13,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
-import signal
 import subprocess
 import sys
 import time
 import urllib.request
 from pathlib import Path
-from typing import Optional
 
 from .config import Config
 
@@ -32,8 +29,8 @@ class ChromeProcess:
 
     def __init__(self, config: Config) -> None:
         self._cfg = config.chrome
-        self._process: Optional[subprocess.Popen] = None
-        self._monitor_task: Optional[asyncio.Task] = None
+        self._process: subprocess.Popen | None = None
+        self._monitor_task: asyncio.Task | None = None
         self._healthy = False
         self._started_at: float = 0
         self._restart_count = 0

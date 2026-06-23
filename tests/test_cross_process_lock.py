@@ -6,8 +6,9 @@ cleanly, and is transparent when uncontested (single-process operation).
 
 import asyncio
 import os
-import pytest
 import tempfile
+
+import pytest
 
 from chatgpt_web2api.cross_process_lock import CrossProcessLock, LockAcquisitionError
 

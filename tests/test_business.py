@@ -4,11 +4,10 @@ Tests the do_* functions in mcp_server.py and API handler logic
 with AsyncMock to avoid needing a live Chrome instance.
 """
 
-import asyncio
 import json
-import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
+import pytest
 
 # ── Fixtures ──────────────────────────────────────────────────
 
@@ -151,6 +150,7 @@ def _long_conversation_driver(n_messages):
     n_messages user/assistant messages (node-0 -> node-1 -> ... -> node-(n-1)),
     current_node = the last node. Mirrors the real ChatGPT mapping shape."""
     from unittest.mock import AsyncMock, MagicMock
+
     from chatgpt_web2api.cdp_driver import CDPDriver
 
     driver = MagicMock(spec=CDPDriver)
@@ -346,7 +346,7 @@ def test_delete_memory_output_schema_matches_returned_shape():
     (which requires conversation_id), but the handler returns memory_id —
     so any actual call failed MCP output validation.
     """
-    from chatgpt_web2api.mcp_server import _build_tools, ToolName
+    from chatgpt_web2api.mcp_server import ToolName, _build_tools
     tools = {t.name: t for t in _build_tools()}
     schema = tools[ToolName.DELETE_MEMORY.value].outputSchema
     required = set(schema["required"])
@@ -429,7 +429,7 @@ async def test_chat_completion_with_model(mock_driver, mock_config):
 @pytest.mark.asyncio
 async def test_chat_completion_auto_model_no_select(mock_driver, mock_config):
     from chatgpt_web2api.mcp_server import do_chat_completion
-    result = await do_chat_completion(mock_driver, {
+    _result = await do_chat_completion(mock_driver, {
         "message": "Hello",
         "model": "auto",
     }, mock_config)
@@ -454,9 +454,9 @@ async def test_chat_with_gpt(mock_driver):
 @pytest.mark.asyncio
 async def test_api_message_history_includes_assistant():
     """Verify that assistant messages are preserved in the conversation text."""
-    from chatgpt_web2api.api_server import APIServer, MODEL_MAP
-    from chatgpt_web2api.config import Config
+    from chatgpt_web2api.api_server import APIServer
     from chatgpt_web2api.cdp_driver import CDPDriver, StreamChunk
+    from chatgpt_web2api.config import Config
 
     config = Config.load(None)
     driver = MagicMock(spec=CDPDriver)
@@ -476,7 +476,7 @@ async def test_api_message_history_includes_assistant():
     driver.navigate_new_chat = AsyncMock()
     driver.navigate_conversation = AsyncMock()
 
-    server = APIServer(config, driver)
+    _server = APIServer(config, driver)
 
     # Simulate a request with multi-turn messages
     messages = [
@@ -524,14 +524,14 @@ async def test_api_model_selection_called():
     driver.navigate_new_chat = AsyncMock()
     driver.navigate_conversation = AsyncMock()
 
-    from chatgpt_web2api.config import Config
     from chatgpt_web2api.api_server import APIServer
+    from chatgpt_web2api.config import Config
 
     config = Config.load(None)
     server = APIServer(config, driver)
 
     # Call the handler via internal method
-    result = await server._full_response(
+    _result = await server._full_response(
         MagicMock(), "gpt-5-5", "Test message", 30,
     )
 
@@ -566,7 +566,6 @@ def test_config_headless_env(monkeypatch):
 
 def test_js_with_data_escapes_properly():
     """Verify that _js_with_data uses json.dumps for safe serialization."""
-    import json
 
     # The method uses json.dumps(data) as prefix
     data = {

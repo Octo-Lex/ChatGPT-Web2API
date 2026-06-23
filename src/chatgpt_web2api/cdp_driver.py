@@ -18,9 +18,8 @@ import re
 import time
 import urllib.parse
 import urllib.request
-import uuid
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from typing import AsyncIterator, Optional
 
 from .diagnostics import diagnose
 
@@ -36,7 +35,7 @@ logger = logging.getLogger(__name__)
 class StreamChunk:
     """A single streaming chunk."""
     delta: str
-    finish_reason: Optional[str] = None
+    finish_reason: str | None = None
 
 
 # Conservative fallback wait (seconds) when ChatGPT's pop-up gives no exact
@@ -130,7 +129,7 @@ class RateLimitError(RuntimeError):
         self.retry_after = int(retry_after)
 
     @classmethod
-    def from_text(cls, text: str) -> "RateLimitError":
+    def from_text(cls, text: str) -> RateLimitError:
         """Build a RateLimitError, parsing the wait from the pop-up *text*."""
         retry_after = parse_retry_after(text)
         return cls(retry_after=retry_after)
@@ -253,7 +252,7 @@ class CDPDriver:
         self,
         cdp_port: int = 9222,
         tab_mode: str = "owned",
-        instance_id: Optional[str] = None,
+        instance_id: str | None = None,
     ) -> None:
         self.port = cdp_port
         # Tab isolation strategy: "owned" creates a dedicated chatgpt.com tab
@@ -274,7 +273,7 @@ class CDPDriver:
             if tab_mode == "owned"
             else None
         )
-        self._heartbeat_task: Optional[asyncio.Task] = None
+        self._heartbeat_task: asyncio.Task | None = None
         self._ws = None
         self._msg_id = 0
         self._access_token = ""
@@ -286,18 +285,18 @@ class CDPDriver:
         # or fail), so backoff/diagnostics can distinguish "stale token, last
         # refresh tried Ns ago" from "never refreshed."
         self._last_refresh_attempt_at: float = 0.0
-        self._current_conv_id: Optional[str] = None
-        self._current_model: Optional[str] = None
+        self._current_conv_id: str | None = None
+        self._current_model: str | None = None
         # CDP response routing (#7): id-keyed futures + background reader
         self._pending: dict[int, asyncio.Future] = {}
-        self._reader_task: Optional[asyncio.Task] = None
+        self._reader_task: asyncio.Task | None = None
         # Tab isolation: the targetId of the tab this driver is attached to.
         # _owns_target records whether *we* created it: only tabs we created are
         # closed in close(), so a driver that adopted an existing tab (e.g.
         # Chrome's launch tab) never closes a tab it didn't open — preventing
         # tab accumulation across service restarts while preserving the user's
         # open tabs on clean shutdown.
-        self._target_id: Optional[str] = None
+        self._target_id: str | None = None
         self._owns_target: bool = False
 
     # ── Connection ────────────────────────────────────────────
@@ -320,7 +319,7 @@ class CDPDriver:
             self._reader_task.cancel()
             try:
                 await asyncio.wait_for(self._reader_task, timeout=2)
-            except (asyncio.TimeoutError, asyncio.CancelledError):
+            except (TimeoutError, asyncio.CancelledError):
                 pass
             self._reader_task = None
 
@@ -490,7 +489,7 @@ class CDPDriver:
             self._reader_task.cancel()
             try:
                 await asyncio.wait_for(self._reader_task, timeout=2)
-            except (asyncio.TimeoutError, asyncio.CancelledError):
+            except (TimeoutError, asyncio.CancelledError):
                 pass
         self._reader_task = None
         # Close the dead socket if present
@@ -639,7 +638,7 @@ class CDPDriver:
             await asyncio.sleep(0.5)
         raise RuntimeError(f"Created tab {self._target_id} but couldn't find its WS URL")
 
-    def _find_owned_tab_ws(self) -> Optional[str]:
+    def _find_owned_tab_ws(self) -> str | None:
         """Look up an owned tab's WS URL from /json/list. Returns None if gone."""
         try:
             targets = json.loads(
@@ -655,7 +654,7 @@ class CDPDriver:
             pass
         return None
 
-    def _adopt_existing_chatgpt_tab(self) -> Optional[str]:
+    def _adopt_existing_chatgpt_tab(self) -> str | None:
         """Find an existing chatgpt.com tab in /json/list to adopt.
 
         ``Target.createTarget`` always opens a new tab, but at startup Chrome
@@ -879,7 +878,7 @@ class CDPDriver:
             raise
         try:
             return await asyncio.wait_for(fut, timeout)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             self._pending.pop(mid, None)
             raise TimeoutError(f"CDP timeout: {method}")
 
@@ -2557,7 +2556,7 @@ class CDPDriver:
             self._reader_task.cancel()
             try:
                 await asyncio.wait_for(self._reader_task, timeout=2)
-            except (asyncio.TimeoutError, asyncio.CancelledError):
+            except (TimeoutError, asyncio.CancelledError):
                 pass
         self._reader_task = None
         # Stop the heartbeat lease task and clear our registry entry so a
@@ -2567,7 +2566,7 @@ class CDPDriver:
             self._heartbeat_task.cancel()
             try:
                 await asyncio.wait_for(self._heartbeat_task, timeout=2)
-            except (asyncio.TimeoutError, asyncio.CancelledError):
+            except (TimeoutError, asyncio.CancelledError):
                 pass
         self._heartbeat_task = None
         if self._tab_registry:

@@ -9,7 +9,7 @@ A live integration test surfaced it; these tests guard the fix.
 """
 
 import json
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -20,7 +20,6 @@ def _capture_generated_expr(monkeypatch):
     We intercept ``CDPDriver._js`` to capture the assembled expression so we
     can assert on its structure (IIFE scoping) without a live browser.
     """
-    from chatgpt_web2api import cdp_driver
 
     captured: dict = {}
 

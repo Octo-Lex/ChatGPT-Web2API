@@ -8,12 +8,10 @@ name the function) and prints the evidence an AI repair agent reads.
 import json
 from pathlib import Path
 
-import pytest
-
 from chatgpt_web2api.doctor import (
-    print_evidence,
-    list_broken_functions,
     latest_artifact_for,
+    list_broken_functions,
+    print_evidence,
 )
 
 
@@ -70,8 +68,6 @@ def test_print_evidence_outputs_key_fields(capsys, tmp_path):
 import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
-import pytest
-
 from chatgpt_web2api import doctor_verify
 
 
@@ -108,7 +104,7 @@ def test_verify_returns_no_runner_for_mutating_tools(monkeypatch, capsys):
     driver.close = AsyncMock()
     monkeypatch.setattr(doctor_verify, "_connect_driver", AsyncMock(return_value=driver))
 
-    code = asyncio.run(doctor_verify.verify_function("create_project"))
+    _code = asyncio.run(doctor_verify.verify_function("create_project"))
     out = capsys.readouterr().out
     # create_project is mutating — no safe runner → pointer to E2E suite
     assert "no safe verify runner" in out.lower() or "e2e" in out.lower()

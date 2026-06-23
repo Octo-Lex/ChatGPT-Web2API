@@ -18,7 +18,7 @@ import json
 
 import pytest
 
-from chatgpt_web2api.cdp_driver import CDPDriver, is_rate_limited_text, RateLimitError
+from chatgpt_web2api.cdp_driver import CDPDriver, RateLimitError, is_rate_limited_text
 from chatgpt_web2api.config import Config
 from chatgpt_web2api.mcp_server import do_chat_completion
 

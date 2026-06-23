@@ -14,10 +14,15 @@ import pytest
 from chatgpt_web2api.cdp_driver import CDPDriver
 from chatgpt_web2api.config import Config
 from chatgpt_web2api.mcp_server import (
-    do_chat_completion, do_chat_with_gpt, do_get_conversation,
-    do_list_conversations, do_archive_conversation, do_create_memory,
-    do_list_memories, do_list_gpts, do_update_project_instructions,
+    do_archive_conversation,
+    do_chat_completion,
+    do_chat_with_gpt,
+    do_create_memory,
+    do_get_conversation,
+    do_list_gpts,
+    do_list_memories,
     do_list_projects,
+    do_update_project_instructions,
 )
 
 pytestmark = pytest.mark.e2e

@@ -9,12 +9,10 @@ Endpoints:
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import time
 import uuid
-from typing import Optional
 
 from aiohttp import web
 
@@ -58,8 +56,8 @@ class APIServer:
         self._cdp_port = config.chrome.cdp_port
         self._request_count = 0
         # Track last conversation for multi-turn continuity
-        self._last_conv_id: Optional[str] = None
-        self._last_project_id: Optional[str] = None
+        self._last_conv_id: str | None = None
+        self._last_project_id: str | None = None
 
         self.app = web.Application(client_max_size=10 * 1024 * 1024)
         self.app.router.add_post("/v1/chat/completions", self._handle_chat)
@@ -71,7 +69,7 @@ class APIServer:
 
     # ── Auth ──────────────────────────────────────────────────
 
-    def _check_auth(self, request: web.Request) -> Optional[web.Response]:
+    def _check_auth(self, request: web.Request) -> web.Response | None:
         """Check API key if configured. Returns error response or None."""
         keys = self._config.server.api_keys
         if not keys:

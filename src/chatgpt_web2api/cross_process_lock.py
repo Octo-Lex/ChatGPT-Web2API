@@ -73,7 +73,7 @@ class CrossProcessLock:
         self._timeout = timeout
         self._fh = None  # file handle, held while locked
 
-    async def __aenter__(self) -> "CrossProcessLock":
+    async def __aenter__(self) -> CrossProcessLock:
         # Ensure the directory exists
         os.makedirs(os.path.dirname(self._lockfile_path), exist_ok=True)
 
@@ -112,7 +112,7 @@ class CrossProcessLock:
                     asyncio.to_thread(_acquire_blocking),
                     timeout=remaining,
                 )
-            except (asyncio.TimeoutError, portalocker.LockException):
+            except (TimeoutError, portalocker.LockException):
                 continue
 
         return self

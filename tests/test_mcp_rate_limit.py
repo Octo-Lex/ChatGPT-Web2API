@@ -12,13 +12,12 @@ limit is retried transparently first; only a persistent limit reaches
 the client.
 """
 
-import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from chatgpt_web2api.cdp_driver import RateLimitError
 import chatgpt_web2api.mcp_server as mod
+from chatgpt_web2api.cdp_driver import RateLimitError
 
 
 def _make_server_with_raising_driver(raises: Exception | None):

@@ -8,13 +8,12 @@ but _fetch_text returns empty.
 
 import json
 import time
-import pytest
 from unittest.mock import AsyncMock, MagicMock
+
+import pytest
 
 from chatgpt_web2api.cdp_driver import (
     CDPDriver,
-    GenerationStuckError,
-    PHASE_STALL_SECONDS,
 )
 
 

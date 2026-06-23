@@ -12,8 +12,8 @@ from __future__ import annotations
 import asyncio
 import sys
 
-from .diagnostics import classify_result
 from .cdp_driver import CDPDriver
+from .diagnostics import classify_result
 
 
 async def _connect_driver() -> CDPDriver:

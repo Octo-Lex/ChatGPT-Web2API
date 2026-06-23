@@ -5,20 +5,18 @@ generation) per the implementation plan. All tests are unit-level with
 mocked CDP — no live Chrome needed.
 """
 
-import asyncio
 import json
 import time
-import pytest
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
 from chatgpt_web2api.cdp_driver import (
+    TOKEN_TTL_SECONDS,
     AuthExpiredError,
     CDPDriver,
     GenerationStuckError,
-    PHASE_STALL_SECONDS,
-    TOKEN_TTL_SECONDS,
 )
-
 
 # ── Helpers ────────────────────────────────────────────────────
 
@@ -541,8 +539,9 @@ async def test_mcp_auth_expired_returns_error_result():
 # ── 9. HTTP mapping ────────────────────────────────────────────
 
 def test_http_error_response_auth_expired_is_401():
-    from chatgpt_web2api.api_server import APIServer
     from unittest.mock import MagicMock
+
+    from chatgpt_web2api.api_server import APIServer
     srv = APIServer.__new__(APIServer)  # bypass __init__
     srv._driver = MagicMock()
     resp = srv._error_response(AuthExpiredError())
@@ -550,8 +549,9 @@ def test_http_error_response_auth_expired_is_401():
 
 
 def test_http_error_response_generation_stuck_is_504():
-    from chatgpt_web2api.api_server import APIServer
     from unittest.mock import MagicMock
+
+    from chatgpt_web2api.api_server import APIServer
     srv = APIServer.__new__(APIServer)
     srv._driver = MagicMock()
     resp = srv._error_response(GenerationStuckError("phase_2_stream", 47.3))

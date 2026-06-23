@@ -7,11 +7,11 @@ progress channel. Also covers the rate-limit backoff notification + its
 load-bearing ordering (must fire BEFORE the sleep).
 """
 
-import pytest
 from unittest.mock import AsyncMock, MagicMock
 
-from chatgpt_web2api.cdp_driver import CDPDriver, StreamChunk, RateLimitError
+import pytest
 
+from chatgpt_web2api.cdp_driver import CDPDriver, RateLimitError, StreamChunk
 
 # ── Helpers ─────────────────────────────────────────────────────
 

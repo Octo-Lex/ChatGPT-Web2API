@@ -11,16 +11,14 @@ Owns the entire system:
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import signal
 import sys
 import time
-from typing import Optional
 
-from .chrome import ChromeProcess
-from .cdp_driver import CDPDriver
 from .api_server import APIServer
+from .cdp_driver import CDPDriver
+from .chrome import ChromeProcess
 from .config import Config
 from .tab_registry import TabRegistry
 
@@ -32,9 +30,9 @@ class Service:
 
     def __init__(self, config: Config) -> None:
         self._config = config
-        self._chrome: Optional[ChromeProcess] = None
-        self._driver: Optional[CDPDriver] = None
-        self._server: Optional[APIServer] = None
+        self._chrome: ChromeProcess | None = None
+        self._driver: CDPDriver | None = None
+        self._server: APIServer | None = None
         self._runner = None
         self._shutdown_event = asyncio.Event()
 
@@ -151,7 +149,7 @@ class Service:
         return runner
 
     @staticmethod
-    def _check_bind_safety(cfg: "Config") -> None:
+    def _check_bind_safety(cfg: Config) -> None:
         """Fail-fast guard against exposing an unauthenticated API remotely.
 
         Behavior matrix (agreed in review):

@@ -9,7 +9,7 @@ live behavior is covered by an E2E test.
 """
 
 import json
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
 

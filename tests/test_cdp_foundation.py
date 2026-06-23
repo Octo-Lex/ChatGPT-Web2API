@@ -7,11 +7,11 @@ concurrent, persistent, multi-process context.
 
 import asyncio
 import json
+from unittest.mock import MagicMock
+
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
 
 from chatgpt_web2api.cdp_driver import CDPDriver
-
 
 # ── Mock websocket that delivers responses (possibly out of order) ──────
 
@@ -193,7 +193,7 @@ async def test_reader_fails_pending_on_socket_close():
     try:
         await asyncio.wait_for(fut, timeout=2)
         assert False, "should have raised"
-    except (ConnectionError, asyncio.TimeoutError):
+    except (TimeoutError, ConnectionError):
         pass  # either the reader failed it, or it timed out
 
     # The future should be done (either resolved or failed)

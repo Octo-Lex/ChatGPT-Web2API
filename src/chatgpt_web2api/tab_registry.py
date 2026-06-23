@@ -31,7 +31,7 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import portalocker
 
@@ -85,7 +85,7 @@ def _pid_alive(pid: int) -> bool:
 def _load_registry(path: Path) -> dict[str, Any]:
     """Read the registry JSON, returning an empty dict on any failure."""
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             data = json.load(f)
         return data if isinstance(data, dict) else {}
     except (FileNotFoundError, json.JSONDecodeError, OSError):
@@ -157,7 +157,7 @@ class TabRegistry:
         # Owner process is gone → entry is reclaimable.
         return True
 
-    def reclaim(self, live_target_ids: set[str]) -> Optional[str]:
+    def reclaim(self, live_target_ids: set[str]) -> str | None:
         """Atomically claim this instance's prior tab if it's still alive.
 
         Holds the file lock across read + validate + write-new-owner so two
@@ -192,7 +192,7 @@ class TabRegistry:
             data[self.instance_id] = self._fresh_entry(target_id, url)
             _save_registry(self.registry_path, data)
 
-    def heartbeat(self, target_id: Optional[str] = None, url: str = "") -> None:
+    def heartbeat(self, target_id: str | None = None, url: str = "") -> None:
         """Refresh this instance's lease. Called periodically + opportunistically.
 
         A no-op if no entry exists yet (e.g. before record()). If target_id is
@@ -219,7 +219,7 @@ class TabRegistry:
                 del data[self.instance_id]
                 _save_registry(self.registry_path, data)
 
-    def clear_if_owner(self, target_id: Optional[str]) -> bool:
+    def clear_if_owner(self, target_id: str | None) -> bool:
         """Remove this instance's entry ONLY if it still points to our tab.
 
         Guard against the crash-reclaim race: if this driver crashed, its lease

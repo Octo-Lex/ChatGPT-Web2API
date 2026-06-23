@@ -1,7 +1,6 @@
 """Tests for the diagnostic detector + capture."""
-import pytest
 
-from chatgpt_web2api.diagnostics import classify_result, EXPECTED_SHAPES
+from chatgpt_web2api.diagnostics import EXPECTED_SHAPES, classify_result
 
 
 def test_classify_healthy_list():
@@ -96,7 +95,8 @@ def test_classify_semantic_ignored_when_asserted_key_absent():
 # ── redaction + capture (Task 2) ──────────────────────────────
 
 import json
-from chatgpt_web2api.diagnostics import redact, DiagnosticsDir
+
+from chatgpt_web2api.diagnostics import DiagnosticsDir, redact
 
 
 def test_redact_strips_auth_tokens_and_emails():
@@ -157,12 +157,13 @@ def test_capture_volume_cap_keeps_newest(tmp_path):
 # ── @diagnose decorator (Task 3) ──────────────────────────────
 
 import asyncio
+
 from chatgpt_web2api.diagnostics import diagnose, set_capture_enabled
 
 
 def test_diagnose_decorator_passes_through_healthy(monkeypatch, tmp_path):
     """A healthy result is returned unchanged; no artifact written."""
-    from chatgpt_web2api.diagnostics import DiagnosticsDir, _DIAG_DIR
+    from chatgpt_web2api.diagnostics import DiagnosticsDir
     monkeypatch.setattr("chatgpt_web2api.diagnostics._DIAG_DIR",
                         DiagnosticsDir(base=tmp_path))
     set_capture_enabled(True)

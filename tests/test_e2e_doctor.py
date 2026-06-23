@@ -80,7 +80,7 @@ async def test_doctor_auto_discovers_and_prints_broken_function(
     monkeypatch.setattr(type(e2e_driver), "_js_with_data_strict", _broken_js_with_data)
     await e2e_driver.get_projects()
 
-    from chatgpt_web2api.doctor import list_broken_functions, latest_artifact_for, print_evidence
+    from chatgpt_web2api.doctor import latest_artifact_for, list_broken_functions, print_evidence
 
     fns = list_broken_functions(tmp_path)
     assert "get_projects" in fns

@@ -11,17 +11,17 @@ All tests are unit-level with mocked CDP — no live Chrome needed.
 
 import json
 import time
-import pytest
 from unittest.mock import AsyncMock, MagicMock
 
-from chatgpt_web2api.cdp_driver import (
-    CDPDriver,
-    COMPOSER_SELECTOR,
-    COMPOSER_FALLBACK_SELECTOR,
-    SEND_BUTTON_SELECTOR,
-    SEND_BUTTON_FALLBACK_SELECTOR,
-)
+import pytest
 
+from chatgpt_web2api.cdp_driver import (
+    COMPOSER_FALLBACK_SELECTOR,
+    COMPOSER_SELECTOR,
+    SEND_BUTTON_FALLBACK_SELECTOR,
+    SEND_BUTTON_SELECTOR,
+    CDPDriver,
+)
 
 # ── Helpers ────────────────────────────────────────────────────
 

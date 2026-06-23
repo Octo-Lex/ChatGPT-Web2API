@@ -23,9 +23,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
-from typing import Awaitable, Callable, TypeVar
+from collections.abc import Awaitable, Callable
+from typing import TypeVar
 
-from .cdp_driver import RateLimitError, RATE_LIMIT_DEFAULT_RETRY_AFTER
+from .cdp_driver import RATE_LIMIT_DEFAULT_RETRY_AFTER, RateLimitError
 
 logger = logging.getLogger(__name__)
 

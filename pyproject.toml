@@ -50,10 +50,32 @@ chatgpt-web2api-mcp = "chatgpt_web2api.mcp_server:main"
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
+    "ruff>=0.6",
 ]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/chatgpt_web2api"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+# Starter set: pycodestyle errors, pyflakes, isort, pyupgrade. Bugbear (B)
+# is a valuable follow-up once the repo is green — it adds judgment-call
+# rules that create churn. E501 (line-length) is ignored: the codebase
+# consistently uses long descriptive strings/asserts and enforcing 100
+# everywhere is cosmetic noise. E402 (module-import-not-at-top) is ignored:
+# several modules deliberately defer imports to break circular dependencies.
+select = ["E", "F", "I", "UP"]
+ignore = ["E501", "E402"]
+
+[tool.ruff.lint.per-file-ignores]
+# ToolName uses str+Enum (pre-StrEnum idiom) — UP042 would force a refactor
+# of the enum's serialization; out of scope for a lint-gate commit.
+"src/chatgpt_web2api/mcp_server.py" = ["UP042"]
+# conftest redefines event_loop for pytest-asyncio — intentional fixture override.
+"tests/conftest.py" = ["F811"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

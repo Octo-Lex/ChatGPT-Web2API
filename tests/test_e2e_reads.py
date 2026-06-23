@@ -7,14 +7,19 @@ mocked unit tests cannot verify (and where the _js_with_data bug hid).
 Run with:  W2A_E2E_RUN=1 pytest tests/test_e2e_reads.py -m e2e -v
 """
 
-import json
 
 import pytest
 
 from chatgpt_web2api.cdp_driver import CDPDriver
-from chatgpt_web2api.mcp_server import do_list_models, do_list_projects, \
-    do_list_conversations, do_get_conversation, do_list_memories, \
-    do_list_gpts, do_list_project_files
+from chatgpt_web2api.mcp_server import (
+    do_get_conversation,
+    do_list_conversations,
+    do_list_gpts,
+    do_list_memories,
+    do_list_models,
+    do_list_project_files,
+    do_list_projects,
+)
 
 pytestmark = pytest.mark.e2e
 

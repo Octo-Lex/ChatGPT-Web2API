@@ -8,8 +8,9 @@ createTarget fails, and reconnect re-finds or re-creates the owned tab.
 import asyncio
 import json
 import time
-import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 from chatgpt_web2api.cdp_driver import CDPDriver
 

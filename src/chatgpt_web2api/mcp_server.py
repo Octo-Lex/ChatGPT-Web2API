@@ -33,24 +33,25 @@ import json
 import logging
 import os
 import sys
+from collections.abc import Awaitable, Callable
 from enum import Enum
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any
 
-from pydantic import BaseModel, Field
 from mcp import types as mcp_types
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
+from pydantic import BaseModel, Field
 
-from .config import Config
-from .tab_registry import TabRegistry
 from .cdp_driver import (
     AuthExpiredError,
     CDPDriver,
     GenerationStuckError,
     RateLimitError,
 )
-from .resilience import retry_on_rate_limit
+from .config import Config
 from .cross_process_lock import CrossProcessLock, LockAcquisitionError
+from .resilience import retry_on_rate_limit
+from .tab_registry import TabRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +74,7 @@ ProgressCallback = Callable[[str], Awaitable[None]]
 class ChatCompletionInput(BaseModel):
     """Input schema for chat_completion tool."""
     message: str = Field(description="The user message to send to ChatGPT")
-    system_prompt: Optional[str] = Field(
+    system_prompt: str | None = Field(
         default=None,
         description=(
             "System instructions prepended to the message. "
@@ -90,7 +91,7 @@ class ChatCompletionInput(BaseModel):
             "Use list_models to see all available slugs."
         ),
     )
-    conversation_id: Optional[str] = Field(
+    conversation_id: str | None = Field(
         default=None,
         description=(
             "UUID of an existing conversation to continue. "
@@ -99,7 +100,7 @@ class ChatCompletionInput(BaseModel):
             "Pass a specific ID to resume a particular conversation."
         ),
     )
-    project_id: Optional[str] = Field(
+    project_id: str | None = Field(
         default=None,
         description=(
             "ChatGPT project gizmo ID (e.g. g-p-abc123) for project-scoped "
@@ -660,7 +661,7 @@ _MUTATING_TOOLS = frozenset({
 # Business Logic — pure functions (official pattern from mcp-server-git)
 # ═══════════════════════════════════════════════════════════════
 
-async def _notify(on_progress: Optional[ProgressCallback], message: str) -> None:
+async def _notify(on_progress: ProgressCallback | None, message: str) -> None:
     """Invoke a progress callback if present, swallowing any error.
 
     Defense-in-depth: even if the caller hands us a raw (non-helper-built)
@@ -678,7 +679,7 @@ async def _notify(on_progress: Optional[ProgressCallback], message: str) -> None
 
 async def do_chat_completion(
     driver: CDPDriver, args: dict, config: Config,
-    on_progress: Optional[ProgressCallback] = None,
+    on_progress: ProgressCallback | None = None,
 ) -> dict:
     """Execute a chat completion through the CDP driver."""
     validated = ChatCompletionInput(**args)
@@ -901,7 +902,7 @@ async def do_list_memories(driver: CDPDriver) -> dict:
 
 async def do_create_memory(
     driver: CDPDriver, args: dict,
-    on_progress: Optional[ProgressCallback] = None,
+    on_progress: ProgressCallback | None = None,
 ) -> dict:
     """Create a new ChatGPT memory.
 
@@ -951,7 +952,7 @@ async def do_list_project_files(driver: CDPDriver, args: dict) -> dict:
 
 async def do_chat_with_gpt(
     driver: CDPDriver, args: dict,
-    on_progress: Optional[ProgressCallback] = None,
+    on_progress: ProgressCallback | None = None,
 ) -> dict:
     """Chat with a specific Custom GPT."""
     validated = ChatWithGptInput(**args)
@@ -1533,13 +1534,13 @@ def create_server() -> Server:
                 )],
                 isError=True,
             )
-        except LockAcquisitionError as e:
+        except LockAcquisitionError:
             # Another process holds the cross-process lock for this Chrome tab
             # and didn't release it within the timeout. The caller should retry.
             return mcp_types.CallToolResult(
                 content=[mcp_types.TextContent(
                     type="text",
-                    text=f"Browser busy — another operation in progress. Retry later. (lock_timeout)",
+                    text="Browser busy — another operation in progress. Retry later. (lock_timeout)",
                 )],
                 isError=True,
             )
@@ -1850,8 +1851,8 @@ async def _run_sse(
     server: Server, init_options, config: Config, port: int
 ) -> None:
     """Run MCP server with SSE transport for remote/web clients."""
-    from mcp.server.sse import SseServerTransport
     from aiohttp import web
+    from mcp.server.sse import SseServerTransport
 
     warn_non_loopback(config.server.host, "SSE")
 

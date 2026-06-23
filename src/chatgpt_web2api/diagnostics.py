@@ -14,8 +14,9 @@ import logging
 import os
 import re
 import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any
 
 # Expected shape per driver method. Each entry is a dict with:
 #   kind: "list" | "dict" | "bool" | "any"
@@ -216,7 +217,7 @@ def apply_env_enablement() -> None:
 def _safe_classify_and_capture(
     function_name: str,
     result: Any,
-    request_provider: Optional[Callable[[], Any]],
+    request_provider: Callable[[], Any] | None,
 ) -> None:
     """Classify result; if broken and capture enabled, write an artifact.
 
@@ -253,7 +254,7 @@ def _safe_classify_and_capture(
         logger.warning("diagnostic capture failed", exc_info=True)
 
 
-def diagnose(function_name: str, capture_js: Optional[Callable[[Any], Any]] = None):
+def diagnose(function_name: str, capture_js: Callable[[Any], Any] | None = None):
     """Decorator: classify a driver method's result + capture on breakage.
 
     Args:

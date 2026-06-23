@@ -12,15 +12,14 @@ Mirrors the hermes-gpt graduated-access model:
 import pytest
 
 from chatgpt_web2api.mcp_server import (
-    ToolName,
-    build_tools,
-    tool_meta,
+    DESTRUCTIVE_ENV,
     NOAUTH_META,
     WRITE_ENV,
-    DESTRUCTIVE_ENV,
+    ToolName,
+    build_tools,
     is_loopback_host,
+    tool_meta,
 )
-
 
 GATE_ENVS = [WRITE_ENV, DESTRUCTIVE_ENV]
 
@@ -158,8 +157,9 @@ async def test_hidden_tool_refuses_to_run(monkeypatch):
 async def test_visible_tool_is_not_blocked(monkeypatch):
     """A safe tool runs through to the driver (no gate refusal)."""
     clear_gate_envs(monkeypatch)
-    import chatgpt_web2api.mcp_server as mod
     from unittest.mock import AsyncMock, MagicMock
+
+    import chatgpt_web2api.mcp_server as mod
 
     driver = MagicMock()
     driver.get_models = AsyncMock(return_value=[{"slug": "auto", "title": "Auto"}])
@@ -211,8 +211,9 @@ def test_is_loopback_host(host, expected):
 
 def test_warn_non_loopback_emits_when_exposed(caplog):
     """Binding a no-auth server off loopback must log a warning."""
-    from chatgpt_web2api.mcp_server import warn_non_loopback
     import logging
+
+    from chatgpt_web2api.mcp_server import warn_non_loopback
 
     with caplog.at_level(logging.WARNING, logger="chatgpt_web2api.mcp_server"):
         warn_non_loopback("0.0.0.0", "sse")
@@ -223,8 +224,9 @@ def test_warn_non_loopback_emits_when_exposed(caplog):
 
 def test_warn_non_loopback_silent_on_loopback(caplog):
     """Loopback binding must not warn."""
-    from chatgpt_web2api.mcp_server import warn_non_loopback
     import logging
+
+    from chatgpt_web2api.mcp_server import warn_non_loopback
 
     with caplog.at_level(logging.WARNING, logger="chatgpt_web2api.mcp_server"):
         warn_non_loopback("127.0.0.1", "sse")
@@ -234,9 +236,10 @@ def test_warn_non_loopback_silent_on_loopback(caplog):
 
 def test_warn_non_loopback_respects_api_keys(caplog, monkeypatch):
     """When api_keys are configured, the no-auth warning is suppressed."""
-    from chatgpt_web2api.mcp_server import warn_non_loopback
-    from chatgpt_web2api.config import Config
     import logging
+
+    from chatgpt_web2api.config import Config
+    from chatgpt_web2api.mcp_server import warn_non_loopback
 
     cfg = Config.load(None)
     cfg.server.api_keys = ["sk-test"]

@@ -8,7 +8,6 @@ import platform
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
 
 
 def _default_chrome_path() -> str:
@@ -70,7 +69,7 @@ class ServerConfig:
 @dataclass
 class ChatGPTConfig:
     default_model: str = "auto"
-    default_project_id: Optional[str] = None
+    default_project_id: str | None = None
     # Tab isolation strategy: "owned" (default) creates a dedicated chatgpt.com
     # tab per driver/process via Target.createTarget so two simultaneous
     # sessions don't contend on the same DOM. "adopt" reuses an existing
@@ -83,7 +82,7 @@ class ChatGPTConfig:
 @dataclass
 class LogConfig:
     level: str = "INFO"
-    file: Optional[str] = None
+    file: str | None = None
 
 
 @dataclass
@@ -94,7 +93,7 @@ class Config:
     log: LogConfig = field(default_factory=LogConfig)
 
     @classmethod
-    def load(cls, path: Optional[str] = None) -> Config:
+    def load(cls, path: str | None = None) -> Config:
         """Load config from file + env overrides.
 
         If *path* is given, load that file. Otherwise auto-discover the

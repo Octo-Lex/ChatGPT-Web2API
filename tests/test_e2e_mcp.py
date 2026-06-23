@@ -13,7 +13,6 @@ Run with:  W2A_E2E_RUN=1 pytest tests/test_e2e_mcp.py -m e2e -v
 import asyncio
 
 import pytest
-
 from mcp.shared.memory import create_connected_server_and_client_session
 
 import chatgpt_web2api.mcp_server as mod

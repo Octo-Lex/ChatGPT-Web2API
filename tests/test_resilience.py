@@ -8,7 +8,6 @@ RateLimitError propagate (so the consumer layer can convert it to 429).
 The wrapper is a pure async utility; tests use fakes, no browser needed.
 """
 
-import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest

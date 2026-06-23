@@ -1,7 +1,5 @@
 """Tests for CDP driver data structures and utilities."""
 
-import pytest
-from dataclasses import FrozenInstanceError
 
 
 def test_stream_chunk_immutability():
@@ -94,8 +92,9 @@ def test_archive_input_boolean():
 
 def test_server_tool_handler_signature():
     """Server has proper request handler callables."""
-    from chatgpt_web2api.mcp_server import create_server
     from mcp import types as t
+
+    from chatgpt_web2api.mcp_server import create_server
 
     server = create_server()
     assert callable(server.request_handlers[t.CallToolRequest])
@@ -104,8 +103,9 @@ def test_server_tool_handler_signature():
 
 def test_resource_templates():
     """Server declares resource templates."""
-    from chatgpt_web2api.mcp_server import create_server
     from mcp import types as t
+
+    from chatgpt_web2api.mcp_server import create_server
 
     server = create_server()
     assert callable(server.request_handlers[t.ListResourceTemplatesRequest])
@@ -113,8 +113,9 @@ def test_resource_templates():
 
 def test_prompts():
     """Server declares prompts."""
-    from chatgpt_web2api.mcp_server import create_server
     from mcp import types as t
+
+    from chatgpt_web2api.mcp_server import create_server
 
     server = create_server()
     assert callable(server.request_handlers[t.ListPromptsRequest])
@@ -123,8 +124,9 @@ def test_prompts():
 
 def test_completion_handler():
     """Server declares completion handler."""
-    from chatgpt_web2api.mcp_server import create_server
     from mcp import types as t
+
+    from chatgpt_web2api.mcp_server import create_server
 
     server = create_server()
     assert callable(server.request_handlers[t.CompleteRequest])

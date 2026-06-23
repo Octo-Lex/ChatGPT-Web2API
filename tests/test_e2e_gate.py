@@ -7,7 +7,6 @@ These are NOT e2e tests — they verify the gating mechanism:
 The mechanism lives in ``tests/conftest.py``.
 """
 
-import os
 
 import pytest
 

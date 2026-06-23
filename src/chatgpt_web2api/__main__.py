@@ -12,22 +12,17 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
+import os
 import sys
 
 from .config import Config
 from .service import run_service
 
-import json
-import os
-import sys
-from pathlib import Path
-
 
 def inject_cookies(args) -> None:
     """Inject cookies from a JSON file into the Chrome profile."""
-    from http.cookiejar import MozillaCookieJar
-    import http.cookiejar
 
     config = Config.load(args.config)
     if args.cdp_port:
@@ -54,8 +49,8 @@ def inject_cookies(args) -> None:
     print(f"Loaded {len(cookies)} cookies from {cookie_file}")
 
     # Inject via CDP if Chrome is running
-    import urllib.request
     import asyncio
+    import urllib.request
 
     try:
         req = urllib.request.Request(f"http://127.0.0.1:{config.chrome.cdp_port}/json/list")
@@ -63,7 +58,7 @@ def inject_cookies(args) -> None:
             targets = json.loads(resp.read())
     except Exception:
         print(f"Error: Chrome not running on CDP port {config.chrome.cdp_port}")
-        print(f"Start Chrome first: chatgpt-web2api")
+        print("Start Chrome first: chatgpt-web2api")
         sys.exit(1)
 
     async def _inject():

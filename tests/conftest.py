@@ -63,10 +63,9 @@ import time
 
 import pytest_asyncio  # noqa: E402
 
-from chatgpt_web2api.chrome import ChromeProcess  # noqa: E402
 from chatgpt_web2api.cdp_driver import CDPDriver  # noqa: E402
+from chatgpt_web2api.chrome import ChromeProcess  # noqa: E402
 from chatgpt_web2api.config import Config  # noqa: E402
-
 
 E2E_LOGIN_TIMEOUT = 600  # seconds to wait for interactive login
 

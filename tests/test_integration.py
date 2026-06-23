@@ -14,19 +14,18 @@ No real Chrome / ChatGPT connection is required: the CDPDriver is mocked,
 so we verify the *server's* behavior, not the upstream account.
 """
 
-import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-
 from mcp.shared.memory import create_connected_server_and_client_session
 
 import chatgpt_web2api.mcp_server as mod
-from chatgpt_web2api.mcp_server import (
-    ToolName, WRITE_ENV, DESTRUCTIVE_ENV,
-)
 from chatgpt_web2api.cdp_driver import StreamChunk
-
+from chatgpt_web2api.mcp_server import (
+    DESTRUCTIVE_ENV,
+    WRITE_ENV,
+    ToolName,
+)
 
 GATE_ENVS = [WRITE_ENV, DESTRUCTIVE_ENV]
 

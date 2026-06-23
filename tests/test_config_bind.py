@@ -1,15 +1,11 @@
 """Tests for A1 (config auto-load) and A2 (safe bind defaults)."""
 
 import json
-import os
-from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
 from chatgpt_web2api.config import Config
 from chatgpt_web2api.service import Service
-
 
 # ── A1: config auto-discovery ─────────────────────────────────────────
 

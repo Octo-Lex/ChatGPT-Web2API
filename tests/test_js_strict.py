@@ -4,9 +4,9 @@ Verifies that _js_strict raises CDPJSError on the three failure modes that
 _js silently collapses to "", and returns the value normally on success.
 """
 
-import json
+from unittest.mock import AsyncMock
+
 import pytest
-from unittest.mock import AsyncMock, MagicMock
 
 from chatgpt_web2api.cdp_driver import CDPDriver, CDPJSError
 

@@ -1,14 +1,10 @@
 """Unit tests — can run without Chrome/ChatGPT running."""
 
-import json
 import pytest
 
 
 def test_imports():
     """All modules import cleanly."""
-    from chatgpt_web2api.config import Config
-    from chatgpt_web2api.cdp_driver import CDPDriver, StreamChunk
-    from chatgpt_web2api.mcp_server import create_server, _build_tools, ToolName
 
 
 def test_tool_count():
@@ -20,7 +16,7 @@ def test_tool_count():
 
 def test_tool_names_match_enum():
     """Every enum value has a corresponding tool."""
-    from chatgpt_web2api.mcp_server import _build_tools, ToolName
+    from chatgpt_web2api.mcp_server import ToolName, _build_tools
     tools = _build_tools()
     tool_names = {t.name for t in tools}
     for member in ToolName:
@@ -58,21 +54,21 @@ def test_all_tools_have_rich_descriptions():
 def test_pydantic_schemas_valid():
     """Pydantic input schemas produce valid JSON Schema."""
     from chatgpt_web2api.mcp_server import (
+        ArchiveConversationInput,
         ChatCompletionInput,
-        ListModelsInput,
-        ListProjectsInput,
+        ChatWithGptInput,
+        CreateMemoryInput,
+        CreateProjectInput,
+        DeleteConversationInput,
+        DeleteMemoryInput,
         GetConversationInput,
         ListConversationsInput,
-        DeleteConversationInput,
-        CreateProjectInput,
-        UpdateProjectInstructionsInput,
-        ArchiveConversationInput,
-        ListMemoriesInput,
-        CreateMemoryInput,
-        DeleteMemoryInput,
         ListGptsInput,
+        ListMemoriesInput,
+        ListModelsInput,
         ListProjectFilesInput,
-        ChatWithGptInput,
+        ListProjectsInput,
+        UpdateProjectInstructionsInput,
     )
     schemas = [
         ChatCompletionInput, ListModelsInput, ListProjectsInput,
@@ -110,8 +106,9 @@ def test_chat_completion_validation():
 
 def test_server_creates():
     """Server instance is created with all handlers."""
-    from chatgpt_web2api.mcp_server import create_server
     from mcp import types as t
+
+    from chatgpt_web2api.mcp_server import create_server
 
     server = create_server()
     required_handlers = [
@@ -151,7 +148,7 @@ def test_config_loads():
 
 def test_delete_has_destructive_annotation():
     """Delete tools are marked destructive."""
-    from chatgpt_web2api.mcp_server import _build_tools, ToolName
+    from chatgpt_web2api.mcp_server import ToolName, _build_tools
     tools = {t.name: t for t in _build_tools()}
 
     assert tools[ToolName.DELETE_CONVERSATION.value].annotations.destructiveHint is True
@@ -160,7 +157,7 @@ def test_delete_has_destructive_annotation():
 
 def test_read_tools_are_readonly():
     """Read-only tools are marked as such."""
-    from chatgpt_web2api.mcp_server import _build_tools, ToolName
+    from chatgpt_web2api.mcp_server import ToolName, _build_tools
     tools = {t.name: t for t in _build_tools()}
 
     read_tools = [ToolName.LIST_MODELS, ToolName.LIST_PROJECTS, ToolName.LIST_CONVERSATIONS,

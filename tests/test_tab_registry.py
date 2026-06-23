@@ -10,13 +10,10 @@ import json
 import os
 import time
 from pathlib import Path
-from unittest.mock import patch
-
-import pytest
 
 from chatgpt_web2api.tab_registry import (
-    TabRegistry,
     LEASE_TTL_SECONDS,
+    TabRegistry,
     _pid_alive,
 )
 
