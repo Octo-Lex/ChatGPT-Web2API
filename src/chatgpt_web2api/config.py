@@ -71,6 +71,13 @@ class ServerConfig:
 class ChatGPTConfig:
     default_model: str = "auto"
     default_project_id: Optional[str] = None
+    # Tab isolation strategy: "owned" (default) creates a dedicated chatgpt.com
+    # tab per driver/process via Target.createTarget so two simultaneous
+    # sessions don't contend on the same DOM. "adopt" reuses an existing
+    # chatgpt.com tab (the pre-multi-session behavior) for single-process
+    # compatibility. Owned tabs are the safe default because adoption lets one
+    # session navigate another's tab out from under it.
+    tab_mode: str = "owned"
 
 
 @dataclass
@@ -125,6 +132,9 @@ class Config:
         c = data.get("default_project_id")
         if c:
             self.chatgpt.default_project_id = c
+        c = data.get("tab_mode")
+        if c in ("owned", "adopt"):
+            self.chatgpt.tab_mode = c
         c = data.get("request_timeout")
         if c is not None:
             self.server.request_timeout = int(c)
@@ -151,6 +161,9 @@ class Config:
             self.server.api_keys = [k.strip() for k in v.split(",") if k.strip()]
         if v := _env("W2A_DEFAULT_MODEL"):
             self.chatgpt.default_model = v
+        if v := _env("W2A_TAB_MODE"):
+            if v in ("owned", "adopt"):
+                self.chatgpt.tab_mode = v
         if v := _env("W2A_HEADLESS"):
             self.chrome.headless = v.lower() in ("true", "1", "yes")
         if v := _env("W2A_LOG_LEVEL"):
@@ -167,6 +180,7 @@ class Config:
             "api_keys": self.server.api_keys,
             "default_model": self.chatgpt.default_model,
             "default_project_id": self.chatgpt.default_project_id,
+            "tab_mode": self.chatgpt.tab_mode,
             "request_timeout": self.server.request_timeout,
             "log_level": self.log.level,
         }

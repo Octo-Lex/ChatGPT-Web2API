@@ -341,10 +341,15 @@ async def test_refresh_token_fails_after_max_retries():
 # each restart added another tab; adoption keeps the count stable.
 
 @pytest.mark.asyncio
-async def test_connect_adopts_existing_chatgpt_tab():
-    """connect() reuses an existing chatgpt.com tab and does NOT call
-    Target.createTarget — no new tab is opened."""
+async def test_connect_adopts_existing_chatgpt_tab_in_adopt_mode():
+    """In tab_mode='adopt', connect() reuses an existing chatgpt.com tab and
+    does NOT call Target.createTarget — no new tab is opened.
+
+    Adoption is opt-in (the pre-multi-session behavior): the default mode is
+    'owned', which always creates a dedicated tab. This test pins that the
+    adopt path still works for single-process compatibility."""
     d = _make_driver()
+    d.tab_mode = "adopt"
 
     # /json/list shows an existing chatgpt.com page tab (e.g. Chrome's launch
     # tab, or a leftover from a previous service run).
@@ -415,4 +420,108 @@ def test_fresh_driver_does_not_own_target():
     d = CDPDriver(cdp_port=9222)
     assert d._target_id is None
     assert d._owns_target is False
+
+
+# ── 13. owned mode (default) creates a tab even when one exists ─────────
+#
+# This is the multi-session isolation guarantee: the DEFAULT behavior is to
+# create a dedicated tab per driver, NOT reuse an existing chatgpt.com tab.
+# Reusing would let two simultaneous drivers contend on the same DOM.
+
+@pytest.mark.asyncio
+async def test_default_owned_mode_creates_tab_even_when_chatgpt_tab_exists():
+    """In the default tab_mode='owned', connect() must call Target.createTarget
+    even if a chatgpt.com page tab already exists. This is what makes the
+    bridge safe for multiple simultaneous sessions: each driver gets its own
+    DOM instead of fighting over a shared tab."""
+    d = _make_driver()  # default tab_mode='owned'
+    assert d.tab_mode == "owned"
+
+    # /json/list shows an existing chatgpt.com page tab — the OLD default
+    # would have adopted it. The new default must ignore it and create.
+    fake_targets = [{
+        "id": "existing-tab-to-ignore",
+        "type": "page",
+        "url": "https://chatgpt.com/",
+        "title": "ChatGPT",
+        "webSocketDebuggerUrl": "ws://fake/existing",
+    }]
+    create_called = []
+
+    async def fake_browser_cdp(method, params=None, timeout=10):
+        if method == "Target.createTarget":
+            create_called.append(method)
+            return {"result": {"targetId": "new-owned-tab"}}
+        return {"result": {}}
+    d._browser_cdp = fake_browser_cdp
+
+    with patch("urllib.request.urlopen") as mock_urlopen:
+        mock_resp = MagicMock()
+        # _create_owned_tab polls /json/list for the new tab's WS URL.
+        new_targets = fake_targets + [{
+            "id": "new-owned-tab", "webSocketDebuggerUrl": "ws://fake/new"
+        }]
+        mock_resp.read.return_value = json.dumps(new_targets).encode()
+        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_urlopen.return_value = mock_resp
+
+        d._wait_for_chatgpt_ready = AsyncMock()
+        d._refresh_token = AsyncMock()
+        mock_connect, _ = _mock_ws_connect()
+        with patch("chatgpt_web2api.cdp_driver.websockets.connect", mock_connect):
+            await d.connect()
+
+    assert create_called == ["Target.createTarget"], \
+        "owned mode must create a tab, not adopt the existing one"
+    assert d._target_id == "new-owned-tab"
+    assert d._owns_target is True  # we created it → close() will tear it down
+
+
+# ── 14. two drivers in owned mode get distinct target ids ───────────────
+#
+# The concrete multi-session payoff: two CDPDriver instances (e.g. the REST
+# process and the MCP process) each create their own tab, so neither can
+# navigate the other's DOM. This is the regression guard for the interference
+# bug — if someone reverts to adoption-by-default, this fails.
+
+@pytest.mark.asyncio
+async def test_two_owned_drivers_get_distinct_target_ids():
+    """Two drivers in default owned mode create distinct tabs — the DOM
+    isolation that prevents cross-session conversation corruption."""
+    # Each driver's _browser_cdp hands out a different targetId, simulating
+    # Chrome creating two real tabs.
+    def make_driver_with_create(target_id):
+        d = _make_driver()
+        async def fake_browser_cdp(method, params=None, timeout=10):
+            if method == "Target.createTarget":
+                return {"result": {"targetId": target_id}}
+            return {"result": {}}
+        d._browser_cdp = fake_browser_cdp
+        return d
+
+    d1 = make_driver_with_create("tab-for-driver-1")
+    d2 = make_driver_with_create("tab-for-driver-2")
+
+    def fake_urlopen(targets):
+        m = MagicMock()
+        m.read.return_value = json.dumps(targets).encode()
+        m.__enter__ = MagicMock(return_value=m)
+        m.__exit__ = MagicMock(return_value=False)
+        return m
+
+    for d, tid in [(d1, "tab-for-driver-1"), (d2, "tab-for-driver-2")]:
+        with patch("urllib.request.urlopen",
+                   return_value=fake_urlopen(
+                       [{"id": tid, "webSocketDebuggerUrl": f"ws://fake/{tid}"}]
+                   )):
+            d._wait_for_chatgpt_ready = AsyncMock()
+            d._refresh_token = AsyncMock()
+            mock_connect, _ = _mock_ws_connect()
+            with patch("chatgpt_web2api.cdp_driver.websockets.connect", mock_connect):
+                await d.connect()
+
+    assert d1._target_id != d2._target_id, \
+        "two owned drivers must hold distinct tabs — shared id means shared DOM"
+    assert d1._owns_target and d2._owns_target
 

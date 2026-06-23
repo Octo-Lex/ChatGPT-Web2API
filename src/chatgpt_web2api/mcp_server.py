@@ -1811,7 +1811,9 @@ async def run_mcp(
     _config = config
     _lock_cdp_port = config.chrome.cdp_port
 
-    _driver = CDPDriver(cdp_port=config.chrome.cdp_port)
+    _driver = CDPDriver(
+        cdp_port=config.chrome.cdp_port, tab_mode=config.chatgpt.tab_mode
+    )
     try:
         await _driver.connect()
         logger.info("Connected to Chrome on CDP port %d", config.chrome.cdp_port)

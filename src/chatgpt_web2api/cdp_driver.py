@@ -249,8 +249,14 @@ def parse_retry_after(text: str, default: int = RATE_LIMIT_DEFAULT_RETRY_AFTER) 
 class CDPDriver:
     """Chrome DevTools Protocol driver for ChatGPT automation."""
 
-    def __init__(self, cdp_port: int = 9222) -> None:
+    def __init__(self, cdp_port: int = 9222, tab_mode: str = "owned") -> None:
         self.port = cdp_port
+        # Tab isolation strategy: "owned" creates a dedicated chatgpt.com tab
+        # per driver (multi-session safe — two drivers get two DOMs). "adopt"
+        # reuses an existing chatgpt.com tab (single-process compat). The
+        # default is "owned" because adoption lets one session navigate
+        # another's shared tab out from under it. See connect().
+        self.tab_mode = tab_mode if tab_mode in ("owned", "adopt") else "owned"
         self._ws = None
         self._msg_id = 0
         self._access_token = ""
@@ -294,28 +300,36 @@ class CDPDriver:
                 pass
             self._reader_task = None
 
-        # Resolve which tab to attach to, in priority order. The goal is to
-        # never open a redundant tab when a usable chatgpt.com tab already
-        # exists (Chrome's launch tab, a leftover from a prior run, or our
-        # own previously-owned tab). Ownership (_owns_target) only affects
-        # whether close() will tear the tab down — it does not affect reuse.
+        # Resolve which tab to attach to, in priority order. The strategy is
+        # governed by self.tab_mode:
         #
-        #   1. Re-attach to a tab we already know about (_target_id set from
-        #      a prior connect), whether we created it or merely adopted it.
-        #   2. Otherwise adopt an existing chatgpt.com tab (no new tab).
-        #   3. Otherwise create a new owned tab via Target.createTarget.
-        #   4. Fallback: attach to any available page tab (shared mode).
+        #   "owned" (default, multi-session safe): each driver creates its own
+        #     chatgpt.com tab via Target.createTarget. Two simultaneous drivers
+        #     get two DOMs and cannot navigate each other's tab. Adoption is
+        #     skipped unless _target_id is already set (reconnect/restart).
+        #
+        #   "adopt" (single-process compat): reuse an existing chatgpt.com tab
+        #     when present (the pre-multi-session behavior). Cheaper on tab
+        #     count, but two drivers adopting the same tab will contend on the
+        #     shared DOM — only safe when you know there's a single driver.
+        #
+        #   1. Re-attach to a tab we already know about (_target_id set from a
+        #      prior connect), whether we created it or adopted it. Both modes.
+        #   2. owned mode → create a new owned tab.
+        #      adopt mode → adopt an existing chatgpt.com tab, else create.
+        #   3. Fallback (both modes): attach to any available page tab.
         ws_url = None
         if self._target_id:
             # Reuse the tab we already attached to on a prior connect attempt.
             ws_url = self._find_owned_tab_ws()
             if ws_url:
                 logger.info("Reusing tab: %s", self._target_id)
-        if not ws_url:
-            # Try to adopt an existing chatgpt.com tab (no new tab created).
+        if not ws_url and self.tab_mode == "adopt":
+            # Single-process compat: try to adopt an existing chatgpt.com tab.
             ws_url = self._adopt_existing_chatgpt_tab()
         if not ws_url:
-            # No reusable tab — create a new one.
+            # Default path (owned mode) and adopt-mode fallback: create a new
+            # dedicated tab so this driver owns its own DOM.
             try:
                 ws_url = await self._create_owned_tab()
                 logger.info("Connected via owned tab: %s", self._target_id)
@@ -374,13 +388,14 @@ class CDPDriver:
         for attempt, delay in enumerate([2, 5, 10], 1):
             try:
                 ws_url = None
-                # Reuse priority mirrors connect() — never create a redundant
-                # tab when a usable chatgpt.com tab already exists.
+                # Reuse priority mirrors connect(): re-attach to a known
+                # _target_id (both modes), then honor tab_mode for the
+                # create-vs-adopt decision.
                 if self._target_id:
                     ws_url = self._find_owned_tab_ws()
                     if ws_url:
                         logger.info("Re-finding tab: %s", self._target_id)
-                if not ws_url:
+                if not ws_url and self.tab_mode == "adopt":
                     ws_url = self._adopt_existing_chatgpt_tab()
                 if not ws_url:
                     logger.info("No reusable tab — creating new one")

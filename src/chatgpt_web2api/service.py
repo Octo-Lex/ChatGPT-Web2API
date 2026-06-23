@@ -54,7 +54,9 @@ class Service:
 
         # 2. CDP driver (with login detection)
         logger.info("Connecting CDP driver...")
-        self._driver = CDPDriver(cdp_port=cfg.chrome.cdp_port)
+        self._driver = CDPDriver(
+            cdp_port=cfg.chrome.cdp_port, tab_mode=cfg.chatgpt.tab_mode
+        )
 
         try:
             await self._driver.connect()
