@@ -330,6 +330,19 @@ async def test_verify_composer_text_tolerates_trailing_newline():
 
 
 @pytest.mark.asyncio
+async def test_verify_composer_text_preserves_intended_trailing_newline():
+    """Regression (caught in review): a prompt that LEGITIMATELY ends in \\n
+    must verify against actual ending in \\n. The old unconditional strip
+    turned 'foo\\n' into 'foo' and failed a valid prompt. New logic accepts
+    exact match OR actual == expected + one editor newline."""
+    d = _make_driver()
+    async def _fake_strict(expr, timeout=15):
+        return "foo\n"  # actual matches expected exactly
+    d._js_strict = _fake_strict
+    assert await d._verify_composer_text(COMPOSER_SELECTOR, "foo\n") is True
+
+
+@pytest.mark.asyncio
 async def test_verify_composer_text_does_not_collapse_internal_whitespace():
     """Broad whitespace collapse would hide corruption of code/Markdown
     indentation. Double spaces in the input must be preserved EXACTLY."""

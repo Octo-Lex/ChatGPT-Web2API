@@ -1146,11 +1146,17 @@ class CDPDriver:
             await self._js_strict(
                 "(function(){"
                 f"  var el = document.querySelector('{verify_selector}');"
-                "  if (el) { el.focus();"
-                "    var sel = window.getSelection(); sel.removeAllRanges();"
-                "    var range = document.createRange(); range.selectNodeContents(el);"
-                "    sel.addRange(range);"
-                "    try { document.execCommand('delete'); } catch(e) {}"
+                "  if (el) {"
+                "    if (el.tagName === 'TEXTAREA') {"
+                "      el.focus(); el.select();"
+                "      try { document.execCommand('delete'); } catch(e) {}"
+                "    } else {"
+                "      el.focus();"
+                "      var sel = window.getSelection(); sel.removeAllRanges();"
+                "      var range = document.createRange(); range.selectNodeContents(el);"
+                "      sel.addRange(range);"
+                "      try { document.execCommand('delete'); } catch(e) {}"
+                "    }"
                 "  }"
                 "  return true;"
                 "})()"
@@ -1210,10 +1216,11 @@ class CDPDriver:
         canon_actual = actual.replace("\r\n", "\n").replace("\r", "\n").replace("\u00a0", " ")
         canon_expected = expected.replace("\r\n", "\n").replace("\r", "\n").replace("\u00a0", " ")
         # ProseMirror wraps input in a <p> and may append a trailing block
-        # newline; tolerate it by stripping a single trailing newline.
-        if canon_actual.endswith("\n"):
-            canon_actual = canon_actual[:-1]
-        return canon_actual == canon_expected
+        # newline. Tolerate AT MOST ONE editor-added trailing newline — but
+        # never strip a user-intended trailing newline. So accept an exact
+        # match, OR actual == expected + one editor newline. (Stripping
+        # unconditionally would corrupt prompts that legitimately end in \n.)
+        return canon_actual == canon_expected or canon_actual == canon_expected + "\n"
 
     async def click_send(self) -> None:
         """Click the send button via JS MouseEvent sequence.
