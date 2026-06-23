@@ -419,19 +419,22 @@ class CDPDriver:
         """Refresh this instance's tab lease every HEARTBEAT_INTERVAL_SECONDS.
 
         Runs for the driver's lifetime so a 90s generation can't expire the
-        60s TTL. Swallows errors — a heartbeat failure must not crash the
-        driver. Best-effort: if the lease silently lapses, the worst case is
-        a concurrent process reclaims our tab, which the next operation's
-        ensure_current_conversation guard catches.
+        60s TTL. Self-healing: a single heartbeat exception is logged and the
+        loop continues — if the task died, the lease would expire and another
+        process could reclaim our tab mid-session (ensure_current_conversation
+        guards wrong-conversation sends, but not the tab being closed/reused).
+        Only CancelledError (close/shutdown) stops the loop.
         """
         from .tab_registry import HEARTBEAT_INTERVAL_SECONDS
         try:
             while True:
-                await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
                 try:
+                    await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
                     self._tab_registry.heartbeat(self._target_id)
+                except asyncio.CancelledError:
+                    raise  # shutdown — let it propagate
                 except Exception as e:
-                    logger.debug("Heartbeat failed: %s", e)
+                    logger.warning("Heartbeat failed (will retry): %s", e)
         except asyncio.CancelledError:
             pass
 
@@ -2569,7 +2572,10 @@ class CDPDriver:
         self._heartbeat_task = None
         if self._tab_registry:
             try:
-                self._tab_registry.clear()
+                # Only clear if the entry still belongs to us. If we crashed
+                # earlier, went stale, and another process reclaimed our
+                # instance's entry, unconditional clear would delete THEIR lease.
+                self._tab_registry.clear_if_owner(self._target_id)
             except Exception as e:
                 logger.debug("Tab registry clear failed: %s", e)
         # Fail any pending futures so callers don't hang

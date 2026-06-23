@@ -179,6 +179,36 @@ def test_clear_removes_only_this_instance(tmp_path):
     assert "inst-B" in data  # untouched
 
 
+def test_clear_if_owner_clears_when_our_tab(tmp_path):
+    """Clean shutdown: entry still points to our tab + our pid → cleared."""
+    r = _make_registry(tmp_path)
+    _write_entry(r, "my-tab", owner_pid=os.getpid())
+    assert r.clear_if_owner("my-tab") is True
+    data = json.load(open(r.registry_path))
+    assert "inst-A" not in data
+
+
+def test_clear_if_owner_preserves_reclaimed_entry(tmp_path):
+    """Crash-reclaim race guard: if another process reclaimed our instance's
+    entry (overwrote target_id + owner_pid), clear_if_owner must NOT delete
+    their lease. This prevents a late-shutting-down process from wiping a
+    new owner's tab record."""
+    r = _make_registry(tmp_path)
+    # Simulate: our instance's entry was reclaimed by pid 88888 pointing at a
+    # DIFFERENT tab (we crashed, went stale, they took over).
+    _write_entry(r, "their-new-tab", owner_pid=88888)
+    # We try to clear on shutdown, but our target_id was "my-old-tab".
+    assert r.clear_if_owner("my-old-tab") is False
+    data = json.load(open(r.registry_path))
+    assert "inst-A" in data  # their entry preserved
+    assert data["inst-A"]["target_id"] == "their-new-tab"
+
+
+def test_clear_if_owner_noop_when_no_entry(tmp_path):
+    r = _make_registry(tmp_path)
+    assert r.clear_if_owner("any") is False
+
+
 # ── 5. R6 observability ───────────────────────────────────────────────
 
 def test_status_returns_snapshot(tmp_path):

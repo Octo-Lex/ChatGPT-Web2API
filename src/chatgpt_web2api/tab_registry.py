@@ -219,6 +219,31 @@ class TabRegistry:
                 del data[self.instance_id]
                 _save_registry(self.registry_path, data)
 
+    def clear_if_owner(self, target_id: Optional[str]) -> bool:
+        """Remove this instance's entry ONLY if it still points to our tab.
+
+        Guard against the crash-reclaim race: if this driver crashed, its lease
+        went stale, and another process reclaimed the entry (overwriting the
+        owner_pid + target_id), clearing unconditionally would delete the NEW
+        owner's entry. This checks the recorded target_id still matches ours
+        before deleting. Returns True if cleared, False if left intact.
+        """
+        with portalocker.Lock(str(self.lock_path), timeout=10):
+            data = _load_registry(self.registry_path)
+            entry = data.get(self.instance_id)
+            if not entry:
+                return False
+            # Only clear if the entry still belongs to us (same target, or
+            # same owner pid). If another process reclaimed it, leave it.
+            if (
+                entry.get("target_id") == target_id
+                and entry.get("owner_pid") == self._owner_pid
+            ):
+                del data[self.instance_id]
+                _save_registry(self.registry_path, data)
+                return True
+            return False
+
     def status(self) -> dict[str, Any]:
         """Snapshot of this instance's registry entry (for observability/R6)."""
         data = _load_registry(self.registry_path)
