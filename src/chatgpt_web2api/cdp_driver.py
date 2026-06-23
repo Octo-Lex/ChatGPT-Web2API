@@ -249,7 +249,12 @@ def parse_retry_after(text: str, default: int = RATE_LIMIT_DEFAULT_RETRY_AFTER) 
 class CDPDriver:
     """Chrome DevTools Protocol driver for ChatGPT automation."""
 
-    def __init__(self, cdp_port: int = 9222, tab_mode: str = "owned") -> None:
+    def __init__(
+        self,
+        cdp_port: int = 9222,
+        tab_mode: str = "owned",
+        instance_id: Optional[str] = None,
+    ) -> None:
         self.port = cdp_port
         # Tab isolation strategy: "owned" creates a dedicated chatgpt.com tab
         # per driver (multi-session safe — two drivers get two DOMs). "adopt"
@@ -257,6 +262,19 @@ class CDPDriver:
         # default is "owned" because adoption lets one session navigate
         # another's shared tab out from under it. See connect().
         self.tab_mode = tab_mode if tab_mode in ("owned", "adopt") else "owned"
+        # Owned-tab registry (R3): persists this instance's owned tab so a
+        # restarted process reclaims its OWN prior tab instead of orphaning it
+        # and creating a new one. Reclaim is instance-scoped (never cross-
+        # session adoption) and lease-protected (never steals a live owner's
+        # tab). None disables the registry (e.g. adopt mode, tests).
+        from .tab_registry import TabRegistry
+        self.instance_id = instance_id or TabRegistry.derive_instance_id(cdp_port=cdp_port)
+        self._tab_registry = (
+            TabRegistry(self.instance_id)
+            if tab_mode == "owned"
+            else None
+        )
+        self._heartbeat_task: Optional[asyncio.Task] = None
         self._ws = None
         self._msg_id = 0
         self._access_token = ""
@@ -334,11 +352,37 @@ class CDPDriver:
             # Single-process compat: try to adopt an existing chatgpt.com tab.
             ws_url = self._adopt_existing_chatgpt_tab()
         if not ws_url:
+            # Registry reclaim (R3): before creating a new tab, check if THIS
+            # instance owned a tab in a prior run that's still alive. Reclaim
+            # is instance-scoped and lease-protected — never cross-session
+            # adoption, never steals a live owner's tab. Skipped in adopt mode.
+            if self._tab_registry:
+                try:
+                    live_ids = await self._live_target_ids()
+                    reclaimed = self._tab_registry.reclaim(live_ids)
+                    if reclaimed:
+                        self._target_id = reclaimed
+                        self._owns_target = True
+                        ws_url = self._find_owned_tab_ws()
+                        if ws_url:
+                            logger.info(
+                                "Reclaimed owned tab from registry: %s (instance %s)",
+                                reclaimed, self.instance_id,
+                            )
+                except Exception as e:
+                    logger.debug("Tab registry reclaim failed (will create new): %s", e)
+        if not ws_url:
             # Default path (owned mode) and adopt-mode fallback: create a new
             # dedicated tab so this driver owns its own DOM.
             try:
                 ws_url = await self._create_owned_tab()
                 logger.info("Connected via owned tab: %s", self._target_id)
+                # Record the new tab in the registry so a restart can reclaim it.
+                if self._tab_registry and self._target_id:
+                    try:
+                        self._tab_registry.record(self._target_id)
+                    except Exception as e:
+                        logger.debug("Tab registry record failed: %s", e)
             except Exception as e:
                 logger.warning("Tab isolation failed (%s) — falling back to shared tab", e)
                 self._target_id = None
@@ -357,6 +401,74 @@ class CDPDriver:
         # to _refresh_token, which has its own retry loop as a safety net.
         await self._wait_for_chatgpt_ready()
         await self._refresh_token()
+        # Start the heartbeat lease for our owned tab (R3), so a long
+        # generation (60-90s) doesn't let the lease expire and let another
+        # process reclaim our tab mid-stream. Background task, cancelled in
+        # close(). Also opportunistically heartbeats on send/connect.
+        self._start_heartbeat()
+
+    def _start_heartbeat(self) -> None:
+        """Start the background heartbeat task for the owned-tab lease."""
+        if self._heartbeat_task and not self._heartbeat_task.done():
+            return
+        if not self._tab_registry:
+            return
+        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+
+    async def _heartbeat_loop(self) -> None:
+        """Refresh this instance's tab lease every HEARTBEAT_INTERVAL_SECONDS.
+
+        Runs for the driver's lifetime so a 90s generation can't expire the
+        60s TTL. Swallows errors — a heartbeat failure must not crash the
+        driver. Best-effort: if the lease silently lapses, the worst case is
+        a concurrent process reclaims our tab, which the next operation's
+        ensure_current_conversation guard catches.
+        """
+        from .tab_registry import HEARTBEAT_INTERVAL_SECONDS
+        try:
+            while True:
+                await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
+                try:
+                    self._tab_registry.heartbeat(self._target_id)
+                except Exception as e:
+                    logger.debug("Heartbeat failed: %s", e)
+        except asyncio.CancelledError:
+            pass
+
+    async def _live_target_ids(self) -> set[str]:
+        """Return the set of currently-live page target IDs from /json/list."""
+        import urllib.request
+        try:
+            loop = asyncio.get_event_loop()
+            def _fetch():
+                with urllib.request.urlopen(
+                    f"http://localhost:{self.port}/json", timeout=5
+                ) as resp:
+                    import json as _json
+                    targets = _json.loads(resp.read())
+                return {t.get("id") for t in targets if t.get("type") == "page"}
+            return await loop.run_in_executor(None, _fetch)
+        except Exception:
+            return set()
+
+    def tab_status(self) -> dict:
+        """Snapshot of this driver's tab/session state (R6 observability).
+
+        Surfaced for logging at connect() and available for /health or
+        debugging. Includes the registry entry (instance_id, target_id,
+        heartbeat age) plus the live driver state (tab_mode, owns_target,
+        current conversation).
+        """
+        status = {
+            "tab_mode": self.tab_mode,
+            "target_id": self._target_id,
+            "owns_target": self._owns_target,
+            "instance_id": self.instance_id,
+            "conv_id": self._current_conv_id,
+        }
+        if self._tab_registry:
+            status["registry"] = self._tab_registry.status()
+        return status
 
     async def reconnect(self) -> None:
         """Reconnect after a socket drop (#4).
@@ -2445,6 +2557,21 @@ class CDPDriver:
             except (asyncio.TimeoutError, asyncio.CancelledError):
                 pass
         self._reader_task = None
+        # Stop the heartbeat lease task and clear our registry entry so a
+        # future restart of THIS instance creates fresh rather than reclaiming
+        # a tab we just closed.
+        if self._heartbeat_task and not self._heartbeat_task.done():
+            self._heartbeat_task.cancel()
+            try:
+                await asyncio.wait_for(self._heartbeat_task, timeout=2)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                pass
+        self._heartbeat_task = None
+        if self._tab_registry:
+            try:
+                self._tab_registry.clear()
+            except Exception as e:
+                logger.debug("Tab registry clear failed: %s", e)
         # Fail any pending futures so callers don't hang
         for mid, fut in list(self._pending.items()):
             if not fut.done():

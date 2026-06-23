@@ -22,6 +22,7 @@ from .chrome import ChromeProcess
 from .cdp_driver import CDPDriver
 from .api_server import APIServer
 from .config import Config
+from .tab_registry import TabRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +56,12 @@ class Service:
         # 2. CDP driver (with login detection)
         logger.info("Connecting CDP driver...")
         self._driver = CDPDriver(
-            cdp_port=cfg.chrome.cdp_port, tab_mode=cfg.chatgpt.tab_mode
+            cdp_port=cfg.chrome.cdp_port,
+            tab_mode=cfg.chatgpt.tab_mode,
+            instance_id=TabRegistry.derive_instance_id(
+                cdp_port=cfg.chrome.cdp_port,
+                server_identity=f"rest:{cfg.server.port}",
+            ),
         )
 
         try:

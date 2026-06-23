@@ -42,6 +42,7 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 
 from .config import Config
+from .tab_registry import TabRegistry
 from .cdp_driver import (
     AuthExpiredError,
     CDPDriver,
@@ -1812,7 +1813,11 @@ async def run_mcp(
     _lock_cdp_port = config.chrome.cdp_port
 
     _driver = CDPDriver(
-        cdp_port=config.chrome.cdp_port, tab_mode=config.chatgpt.tab_mode
+        cdp_port=config.chrome.cdp_port,
+        tab_mode=config.chatgpt.tab_mode,
+        instance_id=TabRegistry.derive_instance_id(
+            cdp_port=config.chrome.cdp_port, server_identity="mcp",
+        ),
     )
     try:
         await _driver.connect()
