@@ -95,12 +95,35 @@ class Config:
 
     @classmethod
     def load(cls, path: Optional[str] = None) -> Config:
-        """Load config from file + env overrides."""
+        """Load config from file + env overrides.
+
+        If *path* is given, load that file. Otherwise auto-discover the
+        documented default at ``~/.chatgpt-web2api/config.json`` — the
+        deployment docs tell users to create it, and silently ignoring it
+        (the old behavior) was a footgun where following the docs yielded
+        defaults with no error. Auto-discovery is logged so it's never silent.
+        """
+        import logging
+        log = logging.getLogger("chatgpt_web2api.config")
         cfg = cls()
         if path and Path(path).exists():
             with open(path) as f:
                 data = json.load(f)
             cfg._apply_dict(data)
+            log.info("Loaded config from %s", path)
+        elif path is None:
+            # Auto-discover the documented default config location.
+            default_path = Path.home() / ".chatgpt_web2api" / "config.json"
+            if default_path.exists():
+                try:
+                    with open(default_path) as f:
+                        data = json.load(f)
+                    cfg._apply_dict(data)
+                    log.info("Loaded config from %s (auto-discovered)", default_path)
+                except (json.JSONDecodeError, OSError) as e:
+                    log.warning("Could not load default config %s: %s", default_path, e)
+            else:
+                log.debug("No default config at %s; using built-in defaults", default_path)
         cfg._apply_env()
         return cfg
 
