@@ -468,3 +468,106 @@ async def test_connect_survives_send_readiness_failure(monkeypatch):
 # error forever, nothing triggered recovery. _cdp() now reconnects-once on a
 # dead socket and retries the call (guarded against recursion by _retry).
 
+def test_should_reconnect_recognizes_dead_socket_errors():
+    """_should_reconnect returns True ONLY for socket-death signatures, never
+    for timeouts or application errors (those must surface, not reconnect)."""
+    assert CDPDriver._should_reconnect(Exception("no close frame received or sent")) is True
+    assert CDPDriver._should_reconnect(Exception("Connection closed")) is True
+    # Name-based check (websockets.ConnectionClosedError) without importing it
+    class FakeConnectionClosedError(Exception):
+        pass
+    FakeConnectionClosedError.__name__ = "ConnectionClosedError"
+    assert CDPDriver._should_reconnect(FakeConnectionClosedError("x")) is True
+    # NOT reconnect triggers:
+    assert CDPDriver._should_reconnect(TimeoutError("CDP timeout")) is False
+    assert CDPDriver._should_reconnect(ValueError("bad param")) is False
+
+
+@pytest.mark.asyncio
+async def test_cdp_reconnects_and_retries_on_dead_socket():
+    """When the WebSocket dies mid-call, _cdp must reconnect once and retry,
+    succeeding on the second attempt. This is the exact path that bricked the
+    live bridge before the fix (reconnect() existed but was never called)."""
+    d = CDPDriver(cdp_port=9222)
+    dead_ws = MagicMock()
+    # First send raises the dead-socket signature; the retry (post-reconnect)
+    # uses a fresh ws whose reader resolves the pending future.
+    fresh_ws = MagicMock()
+
+    call_count = {"send": 0}
+
+    async def fake_send(payload):
+        call_count["send"] += 1
+        if call_count["send"] == 1:
+            raise Exception("no close frame received or sent")
+        # Second send on fresh_ws: simulate the reader resolving the future.
+        import json as _json
+        msg = _json.loads(payload)
+        mid = msg["id"]
+        # Resolve the pending future for this id with a canned response.
+        fut = d._pending.get(mid)
+        if fut and not fut.done():
+            fut.set_result({"result": {"ok": True}})
+
+    dead_ws.send = fake_send
+    fresh_ws.send = fake_send
+
+    d._ws = dead_ws
+    reconnect_calls = {"n": 0}
+
+    async def fake_reconnect():
+        reconnect_calls["n"] += 1
+        d._ws = fresh_ws  # reconnect swaps to the fresh socket
+
+    d.reconnect = fake_reconnect
+
+    result = await d._cdp("Runtime.evaluate", {"expression": "1+1"})
+    assert reconnect_calls["n"] == 1, "must reconnect exactly once"
+    assert result == {"result": {"ok": True}}, "must return the retried result"
+    assert call_count["send"] == 2, "must have sent twice (first died, retry ok)"
+
+
+@pytest.mark.asyncio
+async def test_cdp_does_not_reconnect_on_non_socket_errors():
+    """A non-dead-socket error (e.g. ValueError) must propagate immediately —
+    never trigger a reconnect. Reconnect is ONLY for socket death."""
+    d = CDPDriver(cdp_port=9222)
+    d._ws = MagicMock()
+
+    async def bad_send(payload):
+        raise ValueError("not a socket error")
+
+    d._ws.send = bad_send
+    d.reconnect = AsyncMock()
+
+    with pytest.raises(ValueError, match="not a socket error"):
+        await d._cdp("Runtime.evaluate")
+
+    d.reconnect.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cdp_does_not_loop_if_reconnect_also_fails():
+    """If reconnect succeeds but the retry STILL hits a dead socket, the call
+    must propagate — not reconnect again (infinite loop). The _retry=False
+    guard on the recursive call enforces one-and-done."""
+    d = CDPDriver(cdp_port=9222)
+    d._ws = MagicMock()
+    reconnect_calls = {"n": 0}
+
+    async def always_dead(payload):
+        raise Exception("no close frame received or sent")
+
+    d._ws.send = always_dead
+
+    async def fake_reconnect():
+        reconnect_calls["n"] += 1
+        # reconnect "succeeds" but the socket is still dead on retry
+
+    d.reconnect = fake_reconnect
+
+    with pytest.raises(Exception, match="no close frame"):
+        await d._cdp("Runtime.evaluate")
+
+    assert reconnect_calls["n"] == 1, "must reconnect at most ONCE, never loop"
+

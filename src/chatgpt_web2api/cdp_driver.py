@@ -876,12 +876,20 @@ class CDPDriver:
                 if not fut.done():
                     fut.set_exception(e)
 
-    async def _cdp(self, method: str, params: dict = None, timeout: float = 15) -> dict:
+    async def _cdp(self, method: str, params: dict = None, timeout: float = 15, _retry: bool = True) -> dict:
         """Send a CDP command and await its response.
 
         Uses the background reader + id-keyed Future table (#7 fix) so
         concurrent _cdp calls each receive their own response without
         cross-eating each other's frames.
+
+        Auto-reconnect: if the underlying WebSocket is dead (ConnectionClosed
+        on send — the ``no close frame`` case), attempt ONE ``reconnect()``
+        then retry the call. Without this, a single mid-session socket drop
+        permanently bricks a long-running bridge: ``reconnect()`` exists but
+        nothing wired it in, so every subsequent call re-raised the dead
+        socket error forever. ``_retry`` guards against recursion: a call that
+        fails again after reconnect propagates instead of looping.
         """
         self._msg_id += 1
         mid = self._msg_id
@@ -889,14 +897,36 @@ class CDPDriver:
         self._pending[mid] = fut
         try:
             await self._ws.send(json.dumps({"id": mid, "method": method, "params": params or {}}))
-        except Exception:
+        except Exception as e:
             self._pending.pop(mid, None)
+            if _retry and self._should_reconnect(e):
+                logger.warning("CDP send failed (%s); reconnecting and retrying once", e)
+                await self.reconnect()
+                return await self._cdp(method, params, timeout, _retry=False)
             raise
         try:
             return await asyncio.wait_for(fut, timeout)
         except TimeoutError:
             self._pending.pop(mid, None)
             raise TimeoutError(f"CDP timeout: {method}")
+
+    @staticmethod
+    def _should_reconnect(exc: Exception) -> bool:
+        """True for errors that mean the WebSocket is dead/tearing down.
+
+        ConnectionClosed (and its subclasses) and the ``no close frame``
+        InvalidState are the socket-death signatures; everything else
+        (TimeoutError, application errors) must NOT trigger a reconnect.
+        """
+        # websockets.ConnectionClosed + subclasses (ConnectionClosedError,
+        # ConnectionClosedOK). Imported lazily so a missing/renamed class in
+        # other websockets versions degrades to a name check instead of ImportError.
+        name = type(exc).__name__
+        if name in {"ConnectionClosed", "ConnectionClosedError", "ConnectionClosedOK"}:
+            return True
+        msg = str(exc).lower()
+        return "no close frame" in msg or "connection closed" in msg
+
 
     async def _js(self, expr: str, timeout: float = 15) -> str:
         resp = await self._cdp("Runtime.evaluate", {
