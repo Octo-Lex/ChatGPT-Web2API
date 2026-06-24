@@ -466,5 +466,11 @@ async def test_refresh_token_commits_only_on_non_empty(monkeypatch):
 
     assert d._access_token == "FRESH_TOKEN"
     assert d._user_name == "New"
+    # Both timestamps advance on a successful fetch, but they are set by two
+    # separate time.time() calls. Asserting exact equality is a platform flake:
+    # Windows' clock tick (~15ms) makes them coincide, while Linux/macOS
+    # clock_gettime resolves them ~tens of µs apart. Verify the intent — both
+    # advanced and reflect this fetch — not byte-identical floats.
     assert d._token_fetched_at > 0.0
-    assert d._last_refresh_attempt_at == d._token_fetched_at
+    assert d._last_refresh_attempt_at > 0.0
+    assert abs(d._last_refresh_attempt_at - d._token_fetched_at) < 1.0

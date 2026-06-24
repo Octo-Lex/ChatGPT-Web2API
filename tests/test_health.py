@@ -9,9 +9,8 @@ A zombie (Chrome alive, driver dead) MUST report ``"degraded"``, never
 ``"ok"`` or ``"waiting"``.
 """
 
-import asyncio
 import json
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 

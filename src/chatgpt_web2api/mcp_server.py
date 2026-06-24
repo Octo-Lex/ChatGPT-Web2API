@@ -1862,11 +1862,11 @@ async def _run_sse(
 
     The stdio transport is unaffected — it stays on its existing path.
     """
+    import uvicorn
     from mcp.server.sse import SseServerTransport
     from starlette.applications import Starlette
-    from starlette.routing import Mount, Route
     from starlette.responses import Response
-    import uvicorn
+    from starlette.routing import Mount, Route
 
     warn_non_loopback(config.server.host, "SSE")
 
