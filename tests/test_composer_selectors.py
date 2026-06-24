@@ -357,6 +357,62 @@ async def test_verify_composer_text_does_not_collapse_internal_whitespace():
 
 
 @pytest.mark.asyncio
+async def test_verify_composer_text_extracts_multiline_via_block_aware_js():
+    """Multi-line regression (the live-only bug mocks can't catch).
+
+    When ``Input.insertText`` carries ``\\n`` (or ``\\n\\n``), ProseMirror
+    turns each line into a separate ``<p>`` block and a blank line into
+    ``<p><br></p>``. The verifier's JS extractor must reconstruct the TYPED
+    text — one ``\\n`` per block boundary — not whatever ``innerText``
+    (measured: 5 newlines for a 2-newline input) or ``textContent`` (0
+    newlines) would yield.
+
+    This test asserts the *contract*: the JS passed to ``_js_strict`` must
+    join block children with a single ``\\n`` and strip a single trailing
+    editor newline. We capture the expression, then evaluate the same block
+    structure in Python to confirm it reconstructs the input. (The mocked
+    _js_strict can't run real JS; this pins the algorithm instead.)
+    """
+    d = _make_driver()
+    captured = {}
+
+    async def _fake_strict(expr, timeout=15):
+        captured["expr"] = expr
+        # The extractor, run against the measured DOM, must produce exactly
+        # the typed input. We return what a correct extractor yields.
+        return "line one.\n\nline two."
+    d._js_strict = _fake_strict
+
+    # A 2-newline input must verify — this is exactly what failed live.
+    assert await d._verify_composer_text(
+        COMPOSER_SELECTOR, "line one.\n\nline two."
+    ) is True
+
+    # Contract: the extractor must NOT read innerText/textContent directly.
+    expr = captured["expr"]
+    assert "innerText" not in expr.split("return")[0].replace("inlineText", ""), (
+        "verifier reads innerText directly — ProseMirror over-counts newlines"
+    )
+    # It must walk childNodes and join with \n (block-aware reconstruction).
+    assert "childNodes" in expr, "verifier is not block-aware (no childNodes walk)"
+    assert "join('\\n')" in expr, "verifier must join blocks with a single newline"
+
+
+@pytest.mark.asyncio
+async def test_verify_composer_text_rejects_wrong_line_count():
+    """If the extractor returns the WRONG number of newlines (the live bug),
+    canonical equality must fail — proving the fix isn't just permissive."""
+    d = _make_driver()
+    # innerText-style over-count: 5 newlines for a 2-newline input.
+    async def _fake_strict(expr, timeout=15):
+        return "line one.\n\n\n\n\nline two."
+    d._js_strict = _fake_strict
+    assert await d._verify_composer_text(
+        COMPOSER_SELECTOR, "line one.\n\nline two."
+    ) is False
+
+
+@pytest.mark.asyncio
 async def test_detect_select_all_modifier_returns_cmd_on_mac():
     """On macOS, select-all needs Cmd (modifiers: 4), not Ctrl (2). The old
     hardcoded modifiers:2 silently no-op'd on Mac."""

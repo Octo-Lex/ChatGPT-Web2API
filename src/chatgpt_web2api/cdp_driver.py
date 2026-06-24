@@ -1432,17 +1432,50 @@ class CDPDriver:
         Compares editor-visible text with canonical normalization (CRLF→LF,
         NBSP→space, tolerate a trailing block newline ProseMirror adds) — but
         does NOT broadly collapse internal whitespace, since that would hide
-        real corruption of code/YAML/Markdown indentation. Reads .value for a
-        legacy textarea, .innerText for a contenteditable div (textContent
-        joins block nodes differently than what the user sees).
+        real corruption of code/YAML/Markdown indentation.
+
+        For a contenteditable ProseMirror div, neither ``innerText`` nor
+        ``textContent`` reconstructs what the user typed across line breaks:
+        ``\n`` in the input becomes a new ``<p>`` block, and ProseMirror
+        renders blank-line paragraphs as ``<p><br></p>``. ``innerText`` then
+        emits *several* newlines per block boundary (measured: a 2-newline
+        input read back as 5), while ``textContent`` joins blocks with
+        *nothing* (0 newlines). Both fail canonical equality for any
+        multi-line prompt. The fix is a block-aware extractor: join each
+        top-level block child's text with a single ``\n``, and treat an
+        empty block (the ``<br>``-only paragraph from a blank line) as one
+        newline. This reconstructs the typed text faithfully for both
+        single-line and multi-line input. Legacy ``<textarea>`` still reads
+        ``.value``, which is already exact.
         """
         try:
             actual = await self._js_strict(
                 "(function(){"
                 f"  var el = document.querySelector('{selector}');"
                 "  if (!el) return '';"
-                "  var t = el.tagName === 'TEXTAREA' ? el.value : (el.innerText || '');"
-                "  return t;"
+                "  if (el.tagName === 'TEXTAREA') return el.value;"
+                # Block-aware read for contenteditable. Walk the immediate
+                # child nodes; each element block contributes its text plus
+                # one trailing newline, each text node contributes itself.
+                # An empty block (the <br>-only paragraph from a blank line)
+                # collapses to a single blank line, matching a typed "\n\n".
+                # This yields exactly the number of newlines the user typed.
+                "  var parts = [];"
+                "  function blockText(node) {"
+                "    return (node.textContent || '').replace(/\\u00a0/g, ' ');"
+                "  }"
+                "  for (var i = 0; i < el.childNodes.length; i++) {"
+                "    var child = el.childNodes[i];"
+                "    if (child.nodeType === 3) { parts.push(child.nodeValue || ''); }"
+                "    else if (child.nodeType === 1) {"
+                "      parts.push(blockText(child));"
+                "    }"
+                "  }"
+                "  var joined = parts.join('\\n');"
+                # ProseMirror may append a trailing empty <p>/<br> block that
+                # adds a stray trailing newline; strip at most one to mirror
+                # the single-trailing-newline tolerance below.
+                "  return joined.replace(/\\n$/, '');"
                 "})()"
             )
         except CDPJSError:
