@@ -400,6 +400,22 @@ class CDPDriver:
         # to _refresh_token, which has its own retry loop as a safety net.
         await self._wait_for_chatgpt_ready()
         await self._refresh_token()
+        # Establish the send-readiness invariant before connect() returns: a
+        # connected driver must be able to type a message. connect() may have
+        # attached to a chatgpt.com/ home/landing tab (or adopted an arbitrary
+        # existing tab) that is auth-valid but lacks the composer — without
+        # this, the next type_message raises "No composer found" and surfaces
+        # as an opaque 500. Done AFTER auth so we never navigate on an
+        # unauthenticated page. Best-effort: a failure logs and falls through
+        # (send_and_stream has its own defensive check); it does not abort
+        # startup, since reads (list_models etc.) work without a composer.
+        try:
+            await self._ensure_send_ready()
+        except Exception as e:
+            logger.warning(
+                "connect(): send-readiness not established (%s) — reads still "
+                "work; sends will fail until the tab reaches a chat page", e
+            )
         # Start the heartbeat lease for our owned tab (R3), so a long
         # generation (60-90s) doesn't let the lease expire and let another
         # process reclaim our tab mid-stream. Background task, cancelled in
@@ -1062,7 +1078,17 @@ class CDPDriver:
 
     async def navigate_new_chat(self, gizmo_id: str = None) -> None:
         """Navigate to a fresh chat. Optionally scope to a project gizmo."""
-        url = f"https://chatgpt.com/g/{gizmo_id}/project" if gizmo_id else "https://chatgpt.com/"
+        if gizmo_id:
+            url = f"https://chatgpt.com/g/{gizmo_id}/project"
+        else:
+            # The bare ``chatgpt.com/`` home shell renders only the hidden
+            # fallback textarea (``name=prompt-textarea``, no id, not visible),
+            # so neither COMPOSER_SELECTOR nor COMPOSER_FALLBACK_SELECTOR matches
+            # and type_message fails with "No composer found". The
+            # ``?model=auto`` query triggers the SPA to render the real
+            # ProseMirror composer reliably. Verified live: bare home → no
+            # composer after 20s; ``?model=auto`` → composer present.
+            url = "https://chatgpt.com/?model=auto"
         logger.info("Navigate: %s", url)
         await self._cdp("Page.navigate", {"url": url})
         await asyncio.sleep(2)
@@ -1099,6 +1125,72 @@ class CDPDriver:
         # Settle time for sentinel init
         await asyncio.sleep(2)
         self._current_conv_id = None
+
+    async def _has_composer(self) -> bool:
+        """Is a send-capable composer present on the live tab?
+
+        True only when one of the known composer selectors matches. The home/
+        landing page is auth-valid but NOT send-valid: it has a different,
+        unnamed textarea that none of these selectors match, so a tab on
+        ``chatgpt.com/`` (or any non-chat page) returns False. Authentication
+        and send-readiness are separate invariants — this one is send-readiness.
+        """
+        try:
+            result = await self._js(
+                "(function(){"
+                f"  return JSON.stringify({{"
+                f"    ready: !!document.querySelector('{COMPOSER_SELECTOR}')"
+                f"         || !!document.querySelector('{COMPOSER_FALLBACK_SELECTOR}')"
+                "  });"  # {{ opens the object literal; a single } closes it
+                "})()"
+            )
+            return json.loads(result).get("ready") is True
+        except (json.JSONDecodeError, TypeError, CDPJSError):
+            return False
+
+    async def _ensure_send_ready(self) -> None:
+        """Guarantee the live tab can accept a typed message.
+
+        ``connect()`` may attach to a ``chatgpt.com/`` home/landing tab (or
+        adopt an arbitrary existing ChatGPT tab). Such a tab is auth-valid but
+        not send-valid: it lacks the real composer, so the very next
+        ``type_message`` would raise "No composer found" and — through the REST
+        layer — surface as an opaque "no close frame received or sent" 500.
+        This normalizes the tab into a usable chat page before ``connect()``
+        returns, establishing the invariant the rest of the driver assumes:
+        a connected driver is a send-capable driver.
+
+        The composer renders lazily on the home shell (the sidebar hydrates
+        first, the composer seconds later), so a single ``_has_composer``
+        probe races the render. We poll briefly first; only if that window
+        passes without a composer do we navigate (to ``?model=auto``, which
+        renders the real composer — see ``navigate_new_chat``) and re-check.
+        """
+        if await self._wait_for_composer(timeout=8):
+            return
+        logger.info(
+            "Attached tab has no composer after waiting; navigating to a new chat "
+            "to become send-ready"
+        )
+        await self.navigate_new_chat()  # navigates to ?model=auto + polls composer
+        if not await self._wait_for_composer(timeout=5):
+            await self._capture_selector_diagnostic("composer (connect send-ready)")
+            raise RuntimeError("No composer found after navigating to a new chat")
+
+    async def _wait_for_composer(self, timeout: float = 8) -> bool:
+        """Poll until a composer appears, or *timeout* seconds elapse.
+
+        Returns True if a composer is present within the window, False on
+        timeout. Never raises — callers decide fail-closed behavior. The
+        composer on the home shell hydrates a few seconds after the sidebar,
+        so a single probe races it; this wait absorbs that render delay.
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if await self._has_composer():
+                return True
+            await asyncio.sleep(0.5)
+        return False
 
     async def navigate_conversation(self, conversation_id: str) -> None:
         """Navigate to an existing conversation for multi-turn.

@@ -321,3 +321,150 @@ async def test_mcp_auto_continue_invokes_ensure_current():
         )
 
     driver.ensure_current_conversation.assert_awaited_once_with("conv-mcp-1")
+
+
+# ── 7. Connect-time send-readiness invariant ──────────────────────────
+#
+# Live-found bug (not caught by 292 mocked tests): connect() may attach to a
+# chatgpt.com/ home/landing tab. The home page is auth-valid but lacks the
+# composer (its textarea is unnamed and matches neither selector), so the next
+# type_message raises "No composer found" and surfaces as an opaque
+# "no close frame received or sent" 500 through REST. _ensure_send_ready
+# normalizes the tab into a chat page before connect() returns: a connected
+# driver is a send-capable driver.
+
+@pytest.mark.asyncio
+async def test_ensure_send_ready_noop_when_composer_present():
+    """If the tab already has a composer, _ensure_send_ready is a no-op:
+    no navigation. The common case (driver attaches to a real chat tab)."""
+    d = CDPDriver(cdp_port=9222)
+    # First _wait_for_composer (the pre-navigation poll) finds a composer.
+    d._wait_for_composer = AsyncMock(side_effect=[True])
+    d.navigate_new_chat = AsyncMock()
+
+    await d._ensure_send_ready()
+
+    d.navigate_new_chat.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_ensure_send_ready_navigates_when_home_tab_has_no_composer():
+    """The bug case: attached tab is a home/landing page (no composer on the
+    first poll). _ensure_send_ready must navigate to a new chat (?model=auto,
+    which renders the real composer) and then succeed on the re-poll."""
+    d = CDPDriver(cdp_port=9222)
+    # First _wait_for_composer (no composer) → navigate_new_chat → composer now.
+    d._wait_for_composer = AsyncMock(side_effect=[False, True])
+    d.navigate_new_chat = AsyncMock()
+    d._capture_selector_diagnostic = AsyncMock()
+
+    await d._ensure_send_ready()  # must not raise
+
+    d.navigate_new_chat.assert_awaited_once()
+    d._capture_selector_diagnostic.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_ensure_send_ready_fail_closed_when_composer_still_absent():
+    """Fail-closed: if navigating to a new chat still yields no composer, raise
+    (and capture a diagnostic so the drift is diagnosable). Never silently
+    admit an unsendable tab as send-ready."""
+    d = CDPDriver(cdp_port=9222)
+    # Both polls fail — composer absent before AND after navigation.
+    d._wait_for_composer = AsyncMock(return_value=False)
+    d.navigate_new_chat = AsyncMock()
+    d._capture_selector_diagnostic = AsyncMock()
+
+    with pytest.raises(RuntimeError, match="No composer found after navigating"):
+        await d._ensure_send_ready()
+
+    d.navigate_new_chat.assert_awaited_once()
+    d._capture_selector_diagnostic.assert_awaited_once_with(
+        "composer (connect send-ready)"
+    )
+
+
+def test_has_composer_parses_ready_flag_from_js():
+    """_has_composer reads a {ready: bool} JSON payload from _js and returns
+    a real bool (the home page, which returns ready:false, must be False)."""
+    d = CDPDriver(cdp_port=9222)
+    d._js = AsyncMock(return_value=json.dumps({"ready": True}))
+    import asyncio
+    assert asyncio.get_event_loop().run_until_complete(d._has_composer()) is True
+
+    d._js = AsyncMock(return_value=json.dumps({"ready": False}))
+    assert asyncio.get_event_loop().run_until_complete(d._has_composer()) is False
+
+
+@pytest.mark.asyncio
+async def test_connect_calls_ensure_send_ready_after_auth(monkeypatch):
+    """connect() must invoke _ensure_send_ready AFTER _refresh_token (so we
+    never navigate on an unauthenticated page). Auth first, send-readiness
+    second. Pins the ordering invariant and that connect establishes it."""
+    d = CDPDriver(cdp_port=9222)
+    order = []
+
+    async def _noop_ws(*a, **kw):
+        return MagicMock()
+    # Stub the CDP plumbing so connect runs its body without a real Chrome.
+    monkeypatch.setattr("chatgpt_web2api.cdp_driver.websockets.connect", _noop_ws)
+    d._find_page_ws = lambda: "ws://fake"
+    d._find_owned_tab_ws = lambda: None
+    d._adopt_existing_chatgpt_tab = lambda: None
+    d._create_owned_tab = AsyncMock(return_value="ws://fake")
+    d._reader_loop = AsyncMock()
+    d._live_target_ids = AsyncMock(return_value=[])
+    d._wait_for_chatgpt_ready = AsyncMock()
+    d._refresh_token = AsyncMock(
+        side_effect=lambda: order.append("auth")
+    )
+    d._has_composer = AsyncMock(return_value=True)
+    d._ensure_send_ready = AsyncMock(
+        side_effect=lambda: order.append("send_ready")
+    )
+    d._start_heartbeat = lambda: order.append("heartbeat")
+
+    await d.connect()
+
+    assert order == ["auth", "send_ready", "heartbeat"], (
+        "send-readiness must run AFTER auth, before heartbeat"
+    )
+    d._ensure_send_ready.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_connect_survives_send_readiness_failure(monkeypatch):
+    """If _ensure_send_ready raises, connect() must NOT abort — reads
+    (list_models etc.) work without a composer, and the failure is logged.
+    A broken composer shouldn't take down server startup."""
+    d = CDPDriver(cdp_port=9222)
+
+    async def _noop_ws(*a, **kw):
+        return MagicMock()
+    monkeypatch.setattr("chatgpt_web2api.cdp_driver.websockets.connect", _noop_ws)
+    d._find_page_ws = lambda: "ws://fake"
+    d._find_owned_tab_ws = lambda: None
+    d._adopt_existing_chatgpt_tab = lambda: None
+    d._create_owned_tab = AsyncMock(return_value="ws://fake")
+    d._reader_loop = AsyncMock()
+    d._live_target_ids = AsyncMock(return_value=[])
+    d._wait_for_chatgpt_ready = AsyncMock()
+    d._refresh_token = AsyncMock()
+    d._ensure_send_ready = AsyncMock(
+        side_effect=RuntimeError("No composer found after navigating to a new chat")
+    )
+    d._start_heartbeat = lambda: None
+
+    await d.connect()  # must not raise
+    d._ensure_send_ready.assert_awaited_once()
+
+
+# ── 8. CDP auto-reconnect on dead socket ──────────────────────────────
+#
+# Found while restoring a bricked live bridge this session: reconnect() exists
+# (cdp_driver.py:491) but had ZERO callers — it was dead code. So a single
+# mid-session WebSocket drop (the "no close frame" case) permanently bricked a
+# long-running bridge: every subsequent _cdp call re-raised the dead-socket
+# error forever, nothing triggered recovery. _cdp() now reconnects-once on a
+# dead socket and retries the call (guarded against recursion by _retry).
+
