@@ -115,3 +115,23 @@ async def test_health_exposes_last_error():
     server._last_error = "RateLimitError: too many requests"
     body = await _health_body(server, chrome_running=True)
     assert body["last_error"] == "RateLimitError: too many requests"
+
+
+@pytest.mark.asyncio
+async def test_health_includes_breakers_snapshot():
+    """Phase 4 PR1: /health carries a 'breakers' snapshot. On a fresh server
+    every breaker is closed — PR1 records no failure signals, so this is the
+    only state a real deployment will see until PR2 wires trips."""
+    from chatgpt_web2api.breakers import BreakerKind
+
+    server = _make_server(driver_connected=True)
+    body = await _health_body(server, chrome_running=True)
+
+    assert "breakers" in body
+    breakers = body["breakers"]
+    # All four kinds present (stable shape for consumers like ensure.py)
+    assert set(breakers.keys()) == {k.value for k in BreakerKind}
+    # PR1: nothing is wired, so all are closed
+    for entry in breakers.values():
+        assert entry["open"] is False
+        assert entry["failures_in_window"] == 0

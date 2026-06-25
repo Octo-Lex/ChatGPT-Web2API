@@ -17,6 +17,7 @@ import uuid
 
 from aiohttp import web
 
+from .breakers import BreakerRegistry
 from .cdp_driver import (
     AuthExpiredError,
     CDPDriver,
@@ -65,6 +66,10 @@ class APIServer:
         self._started_at = time.time()
         self._last_error: str | None = None
         self._last_successful_send_at: float | None = None
+        # Non-rate-limit breaker registry (Phase 4, PR1). Snapshotted into
+        # /health below; no failure signals are recorded yet, so it always
+        # reports all breakers closed. PR2 wires the real trip signals.
+        self._breakers = BreakerRegistry()
         # Track last conversation for multi-turn continuity
         self._last_conv_id: str | None = None
         self._last_project_id: str | None = None
@@ -158,6 +163,7 @@ class APIServer:
             "started_at": self._started_at,
             "last_successful_send_at": self._last_successful_send_at,
             "last_error": self._last_error,
+            "breakers": self._breakers.snapshot(),
         })
 
     async def _handle_models(self, request: web.Request) -> web.Response:

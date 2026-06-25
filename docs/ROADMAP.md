@@ -263,6 +263,35 @@ logs
 **Keep this before the big refactor (Phase 5).** Stabilize behavior first, then
 move code.
 
+### Sequencing — two PRs
+
+Phase 4 is split to keep review tight: ship the infrastructure with no behavior
+change first, then wire the real failure signals in a second PR.
+
+- **PR1 — breaker registry + `/health` exposure.** Ships
+  `src/chatgpt_web2api/breakers.py`: a `BreakerRegistry` keyed by `BreakerKind`
+  (auth_required, composer_send_readiness, cdp_reconnect, chrome_crash_loop)
+  with `record_failure` / `record_success` / `trip` / `is_open` / `snapshot`.
+  `/health` gains a `breakers` snapshot field. **Nothing records failures or
+  trips a breaker yet** — the registry only counts, and `trip()` is the explicit
+  caller-driven path (threshold auto-trip is deferred). Zero behavior change:
+  `/health` always reports all breakers closed. This proves the plumbing
+  risk-free.
+- **PR2 — wire failure signals + fail-fast.** Adds the typed exceptions the
+  composer/CDP paths need (they currently raise bare `RuntimeError`, so a
+  type-keyed breaker can't distinguish them), calls `record_failure`/`trip` at
+  the detection sites (`AuthExpiredError` at `cdp_driver.py:2046`/`:2207`,
+  composer at `_ensure_send_ready`/`type_message`/`click_send`, CDP reconnect at
+  `reconnect()`, Chrome at `chrome.py:restart()`), enforces the thresholds
+  above, adds REST fail-fast (`_error_response` 503 `circuit_open`) + MCP
+  `(circuit_open)` result, decides whether an open breaker forces `/health`
+  `status` to `degraded`, and wires config tunables (`W2A_BREAKER_*`).
+
+```
+PR1  →  registry + snapshot (no behavior change)
+PR2  →  signals + typed exceptions + fail-fast + status policy + config
+```
+
 ---
 
 ## Phase 5 — Split `cdp_driver.py`
