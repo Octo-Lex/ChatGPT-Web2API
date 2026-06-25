@@ -69,7 +69,7 @@ def test_record_failure_counts_in_window():
 def test_record_failure_prunes_old_entries(monkeypatch):
     """Failures older than the rolling window are dropped on the next record."""
     advance = _install_clock(monkeypatch)
-    reg = BreakerRegistry(_fail_window_s=120.0)
+    reg = BreakerRegistry()
 
     reg.record_failure(BreakerKind.CDP_RECONNECT)  # at t=1000
     advance(200.0)  # t=1200 — first failure is now outside the 120s window
@@ -77,6 +77,37 @@ def test_record_failure_prunes_old_entries(monkeypatch):
 
     snap = reg.snapshot()["cdp_reconnect"]
     assert snap["failures_in_window"] == 1  # only the recent one survives
+
+
+def test_chrome_crash_loop_uses_300s_window(monkeypatch):
+    """CHROME_CRASH_LOOP is 3 restarts in **5 min** (ROADMAP Phase 4), not the
+    2 min window the other three classes use. The window is per-kind, so:
+
+      - failures at t=0, t=150, t=250 all count (3) for chrome_crash_loop
+        (300s window), because t=250 − t=0 = 250s ≤ 300s;
+      - the same spacing must NOT count as 3 for a 120s-window breaker
+        (CDP_RECONNECT here), because t=250 − t=0 = 250s > 120s.
+
+    This pins the policy mismatch the single global window used to hide."""
+    advance = _install_clock(monkeypatch)
+    reg = BreakerRegistry()
+
+    # t=1000
+    reg.record_failure(BreakerKind.CHROME_CRASH_LOOP)
+    reg.record_failure(BreakerKind.CDP_RECONNECT)
+    advance(150.0)  # t=1150 — +150s from the first failure
+    reg.record_failure(BreakerKind.CHROME_CRASH_LOOP)
+    reg.record_failure(BreakerKind.CDP_RECONNECT)
+    advance(100.0)  # t=1250 — +250s total from the first failure
+    reg.record_failure(BreakerKind.CHROME_CRASH_LOOP)
+    reg.record_failure(BreakerKind.CDP_RECONNECT)
+
+    snap = reg.snapshot()
+    # 300s window: all three (0s, 150s, 250s) survive → 3
+    assert snap["chrome_crash_loop"]["failures_in_window"] == 3
+    # 120s window: only the two at +150s and +250s survive (the t=1000 one is
+    # 250s old by snapshot time) → 2
+    assert snap["cdp_reconnect"]["failures_in_window"] == 2
 
 
 def test_record_failure_does_not_auto_trip():

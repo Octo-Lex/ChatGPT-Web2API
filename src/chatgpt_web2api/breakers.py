@@ -58,13 +58,30 @@ class BreakerState:
     recent_failures: deque[float] = field(default_factory=deque)
 
 
-# ROADMAP Phase 4 thresholds (failures within ``_fail_window_s`` to qualify).
+# ROADMAP Phase 4 policies per kind. The window differs by class — notably
+# ``CHROME_CRASH_LOOP`` is 3 restarts in **5 min** (300s), not the 2 min window
+# the other three classes use — so the window must be per-kind, not global.
 # PR1 records these but does not auto-trip on them — PR2 enforces them.
-_DEFAULT_THRESHOLDS: dict[BreakerKind, int] = {
-    BreakerKind.AUTH_EXPIRED: 1,  # trip immediately (human login required)
-    BreakerKind.COMPOSER_SEND_READINESS: 3,  # 3 in 2 min
-    BreakerKind.CDP_RECONNECT: 5,  # 5 in 2 min
-    BreakerKind.CHROME_CRASH_LOOP: 3,  # 3 in 5 min (separate window)
+@dataclass(frozen=True)
+class BreakerPolicy:
+    """Per-kind failure policy: how many failures, in what window, trip a
+    breaker, and how long that breaker then cools down.
+
+    ``cooldown_s`` of ``None`` means "indefinite until external reset" and is
+    used only for the auth case; the snapshot represents it as
+    ``cooldown_until=None`` after a trip.
+    """
+
+    threshold: int
+    window_s: float
+    cooldown_s: float | None
+
+
+_DEFAULT_POLICIES: dict[BreakerKind, BreakerPolicy] = {
+    BreakerKind.AUTH_EXPIRED: BreakerPolicy(1, 120.0, None),
+    BreakerKind.COMPOSER_SEND_READINESS: BreakerPolicy(3, 120.0, 300.0),
+    BreakerKind.CDP_RECONNECT: BreakerPolicy(5, 120.0, 120.0),
+    BreakerKind.CHROME_CRASH_LOOP: BreakerPolicy(3, 300.0, 300.0),
 }
 
 
@@ -77,11 +94,10 @@ class BreakerRegistry:
     will decide when to trip based on the thresholds below.
     """
 
-    _fail_window_s: float = 120.0  # 2 min rolling window
-    _max_recent: int = 50  # cap deque depth (bound memory under a storm)
-    _thresholds: dict[BreakerKind, int] = field(
-        default_factory=lambda: dict(_DEFAULT_THRESHOLDS)
+    _policies: dict[BreakerKind, BreakerPolicy] = field(
+        default_factory=lambda: dict(_DEFAULT_POLICIES)
     )
+    _max_recent: int = 50  # cap deque depth (bound memory under a storm)
     _states: dict[BreakerKind, BreakerState] = field(
         default_factory=lambda: {k: BreakerState() for k in BreakerKind}
     )
@@ -93,7 +109,7 @@ class BreakerRegistry:
         auto-trip in PR1 — threshold enforcement is a PR2 policy decision."""
         state = self._states[kind]
         state.recent_failures.append(time.monotonic())
-        self._prune(state)
+        self._prune(kind, state)
 
     def record_success(self, kind: BreakerKind) -> None:
         """Record a success. In PR1 this is a no-op beyond clearing the failure
@@ -102,9 +118,7 @@ class BreakerRegistry:
         state = self._states[kind]
         state.recent_failures.clear()
 
-    def trip(
-        self, kind: BreakerKind, reason: str, *, cooldown_s: float = 0.0
-    ) -> None:
+    def trip(self, kind: BreakerKind, reason: str, *, cooldown_s: float = 0.0) -> None:
         """Explicitly open a breaker.
 
         ``cooldown_s=0`` (the auth case) means the breaker stays open
@@ -148,7 +162,7 @@ class BreakerRegistry:
         out: dict[str, dict] = {}
         for kind in BreakerKind:
             state = self._states[kind]
-            self._prune(state)
+            self._prune(kind, state)
             out[kind.value] = {
                 "open": self.is_open(kind),
                 "reason": state.reason,
@@ -160,10 +174,11 @@ class BreakerRegistry:
 
     # ── internal ─────────────────────────────────────────────────────────
 
-    def _prune(self, state: BreakerState) -> None:
-        """Drop failure timestamps older than the rolling window and cap the
-        deque depth as a memory guard under a sustained storm."""
-        cutoff = time.monotonic() - self._fail_window_s
+    def _prune(self, kind: BreakerKind, state: BreakerState) -> None:
+        """Drop failure timestamps older than the kind's rolling window and cap
+        the deque depth as a memory guard under a sustained storm. The window is
+        per-kind: ``CHROME_CRASH_LOOP`` uses 300s, the others 120s."""
+        cutoff = time.monotonic() - self._policies[kind].window_s
         failures = state.recent_failures
         while failures and failures[0] < cutoff:
             failures.popleft()
