@@ -34,6 +34,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class StreamChunk:
     """A single streaming chunk."""
+
     delta: str
     finish_reason: str | None = None
 
@@ -121,10 +122,7 @@ class RateLimitError(RuntimeError):
         retry_after: int = RATE_LIMIT_DEFAULT_RETRY_AFTER,
     ) -> None:
         if message is None:
-            message = (
-                f"ChatGPT rate limit reached (Too many requests). "
-                f"Retry in {retry_after}s."
-            )
+            message = f"ChatGPT rate limit reached (Too many requests). Retry in {retry_after}s."
         super().__init__(message)
         self.retry_after = int(retry_after)
 
@@ -219,8 +217,16 @@ def parse_retry_after(text: str, default: int = RATE_LIMIT_DEFAULT_RETRY_AFTER) 
     # Look for "<n> minute(s)" or "<n> min", "<n> second(s)" / "<n> sec(s)".
     # Match digits or number words.
     _NUM_WORDS = {
-        "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
-        "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+        "one": 1,
+        "two": 2,
+        "three": 3,
+        "four": 4,
+        "five": 5,
+        "six": 6,
+        "seven": 7,
+        "eight": 8,
+        "nine": 9,
+        "ten": 10,
     }
 
     def _to_num(token: str) -> int | None:
@@ -229,14 +235,18 @@ def parse_retry_after(text: str, default: int = RATE_LIMIT_DEFAULT_RETRY_AFTER) 
         return _NUM_WORDS.get(token)
 
     # "<n> minute(s)" → seconds = n * 60
-    m = re.search(r"(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s*(?:minutes?|mins?)", lowered)
+    m = re.search(
+        r"(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s*(?:minutes?|mins?)", lowered
+    )
     if m:
         n = _to_num(m.group(1))
         if n is not None:
             return n * 60
 
     # "<n> second(s)" / "<n> sec(s)"
-    m = re.search(r"(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s*(?:seconds?|secs?)", lowered)
+    m = re.search(
+        r"(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s*(?:seconds?|secs?)", lowered
+    )
     if m:
         n = _to_num(m.group(1))
         if n is not None:
@@ -267,12 +277,9 @@ class CDPDriver:
         # session adoption) and lease-protected (never steals a live owner's
         # tab). None disables the registry (e.g. adopt mode, tests).
         from .tab_registry import TabRegistry
+
         self.instance_id = instance_id or TabRegistry.derive_instance_id(cdp_port=cdp_port)
-        self._tab_registry = (
-            TabRegistry(self.instance_id)
-            if tab_mode == "owned"
-            else None
-        )
+        self._tab_registry = TabRegistry(self.instance_id) if tab_mode == "owned" else None
         self._heartbeat_task: asyncio.Task | None = None
         self._ws = None
         self._msg_id = 0
@@ -366,7 +373,8 @@ class CDPDriver:
                         if ws_url:
                             logger.info(
                                 "Reclaimed owned tab from registry: %s (instance %s)",
-                                reclaimed, self.instance_id,
+                                reclaimed,
+                                self.instance_id,
                             )
                 except Exception as e:
                     logger.debug("Tab registry reclaim failed (will create new): %s", e)
@@ -388,8 +396,10 @@ class CDPDriver:
                 self._owns_target = False
                 ws_url = await self._find_page_ws()
         self._ws = await websockets.connect(
-            ws_url, max_size=100 * 1024 * 1024,
-            ping_interval=20, ping_timeout=10,
+            ws_url,
+            max_size=100 * 1024 * 1024,
+            ping_interval=20,
+            ping_timeout=10,
         )
         self._reader_task = asyncio.create_task(self._reader_loop())
         logger.info("CDP connected to Chrome")
@@ -414,7 +424,8 @@ class CDPDriver:
         except Exception as e:
             logger.warning(
                 "connect(): send-readiness not established (%s) — reads still "
-                "work; sends will fail until the tab reaches a chat page", e
+                "work; sends will fail until the tab reaches a chat page",
+                e,
             )
         # Start the heartbeat lease for our owned tab (R3), so a long
         # generation (60-90s) doesn't let the lease expire and let another
@@ -441,6 +452,7 @@ class CDPDriver:
         Only CancelledError (close/shutdown) stops the loop.
         """
         from .tab_registry import HEARTBEAT_INTERVAL_SECONDS
+
         try:
             while True:
                 try:
@@ -456,15 +468,19 @@ class CDPDriver:
     async def _live_target_ids(self) -> set[str]:
         """Return the set of currently-live page target IDs from /json/list."""
         import urllib.request
+
         try:
             loop = asyncio.get_event_loop()
+
             def _fetch():
                 with urllib.request.urlopen(
                     f"http://localhost:{self.port}/json", timeout=5
                 ) as resp:
                     import json as _json
+
                     targets = _json.loads(resp.read())
                 return {t.get("id") for t in targets if t.get("type") == "page"}
+
             return await loop.run_in_executor(None, _fetch)
         except Exception:
             return set()
@@ -539,8 +555,10 @@ class CDPDriver:
                 if not ws_url:
                     ws_url = await self._find_page_ws()
                 self._ws = await websockets.connect(
-                    ws_url, max_size=100 * 1024 * 1024,
-                    ping_interval=20, ping_timeout=10,
+                    ws_url,
+                    max_size=100 * 1024 * 1024,
+                    ping_interval=20,
+                    ping_timeout=10,
                 )
                 self._reader_task = asyncio.create_task(self._reader_loop())
                 # Same settle wait as connect() — the reconnected tab (re-found
@@ -557,9 +575,7 @@ class CDPDriver:
 
     async def _find_page_ws(self) -> str:
         """Find a suitable page's websocket URL."""
-        req = urllib.request.Request(
-            f"http://127.0.0.1:{self.port}/json/list"
-        )
+        req = urllib.request.Request(f"http://127.0.0.1:{self.port}/json/list")
         with urllib.request.urlopen(req, timeout=5) as resp:
             targets = json.loads(resp.read())
 
@@ -568,7 +584,11 @@ class CDPDriver:
             raise RuntimeError("No browser pages found — is Chrome running with chatgpt.com?")
 
         # Prefer chatgpt.com page
-        chatgpt = [t for t in pages if "chatgpt.com" in t.get("url", "") or "chatgpt.com" in t.get("title", "")]
+        chatgpt = [
+            t
+            for t in pages
+            if "chatgpt.com" in t.get("url", "") or "chatgpt.com" in t.get("title", "")
+        ]
         candidates = chatgpt if chatgpt else pages
 
         # #16: liveness check — skip targets whose WS URL is unreachable
@@ -616,7 +636,9 @@ class CDPDriver:
             await bws.send(json.dumps({"id": mid, "method": method, "params": params or {}}))
             deadline = time.monotonic() + timeout
             while time.monotonic() < deadline:
-                raw = await asyncio.wait_for(bws.recv(), timeout=max(1, deadline - time.monotonic()))
+                raw = await asyncio.wait_for(
+                    bws.recv(), timeout=max(1, deadline - time.monotonic())
+                )
                 resp = json.loads(raw)
                 if resp.get("id") == mid:
                     return resp
@@ -761,10 +783,7 @@ class CDPDriver:
                     "})()"
                 )
                 state = json.loads(raw) if raw else {}
-                if (
-                    "chatgpt.com" in (state.get("href") or "")
-                    and state.get("ready") != "loading"
-                ):
+                if "chatgpt.com" in (state.get("href") or "") and state.get("ready") != "loading":
                     return True
             except (ValueError, TypeError):
                 pass
@@ -822,20 +841,20 @@ class CDPDriver:
                     self._token_fetched_at = time.time()
                     logger.info(
                         "Auth: %d chars, user: %s (attempt %d)",
-                        len(self._access_token), self._user_name, attempt,
+                        len(self._access_token),
+                        self._user_name,
+                        attempt,
                     )
                     return
-                last_error = RuntimeError(
-                    "No access token — not logged into ChatGPT"
-                )
+                last_error = RuntimeError("No access token — not logged into ChatGPT")
             except Exception as e:
                 # JSON parse error, CDP blip, etc. — record and retry. Don't
                 # clobber a partial _access_token from a prior good fetch.
                 last_error = e
             if attempt < 3:
                 await asyncio.sleep(0.5)
-        raise last_error if last_error else RuntimeError(
-            "No access token — not logged into ChatGPT"
+        raise (
+            last_error if last_error else RuntimeError("No access token — not logged into ChatGPT")
         )
 
     # ── CDP primitives ────────────────────────────────────────
@@ -876,7 +895,9 @@ class CDPDriver:
                 if not fut.done():
                     fut.set_exception(e)
 
-    async def _cdp(self, method: str, params: dict = None, timeout: float = 15, _retry: bool = True) -> dict:
+    async def _cdp(
+        self, method: str, params: dict = None, timeout: float = 15, _retry: bool = True
+    ) -> dict:
         """Send a CDP command and await its response.
 
         Uses the background reader + id-keyed Future table (#7 fix) so
@@ -927,14 +948,17 @@ class CDPDriver:
         msg = str(exc).lower()
         return "no close frame" in msg or "connection closed" in msg
 
-
     async def _js(self, expr: str, timeout: float = 15) -> str:
-        resp = await self._cdp("Runtime.evaluate", {
-            "expression": expr,
-            "awaitPromise": True,
-            "returnByValue": True,
-            "timeout": int(timeout * 1000),
-        }, timeout=timeout)
+        resp = await self._cdp(
+            "Runtime.evaluate",
+            {
+                "expression": expr,
+                "awaitPromise": True,
+                "returnByValue": True,
+                "timeout": int(timeout * 1000),
+            },
+            timeout=timeout,
+        )
         return resp.get("result", {}).get("result", {}).get("value", "")
 
     async def _js_with_data(self, expr_template: str, data: dict, timeout: float = 15) -> str:
@@ -961,9 +985,7 @@ class CDPDriver:
         """
         # Pass __D as an argument. Using `void ` makes `__D=>(...)` an
         # arrow expression body, so the template's value is returned.
-        wrapped = (
-            f"( (__D) => ({expr_template}) )({json.dumps(data)})"
-        )
+        wrapped = f"( (__D) => ({expr_template}) )({json.dumps(data)})"
         return await self._js(wrapped, timeout=timeout)
 
     async def _js_strict(self, expr: str, timeout: float = 15) -> str:
@@ -980,12 +1002,16 @@ class CDPDriver:
         Callers that already handle exceptions benefit immediately. Callers
         that depend on the ""-on-error contract must wrap in try/except.
         """
-        resp = await self._cdp("Runtime.evaluate", {
-            "expression": expr,
-            "awaitPromise": True,
-            "returnByValue": True,
-            "timeout": int(timeout * 1000),
-        }, timeout=timeout)
+        resp = await self._cdp(
+            "Runtime.evaluate",
+            {
+                "expression": expr,
+                "awaitPromise": True,
+                "returnByValue": True,
+                "timeout": int(timeout * 1000),
+            },
+            timeout=timeout,
+        )
         # CDP-level error (e.g. "Execution context was destroyed")
         if "error" in resp:
             err = resp["error"]
@@ -1011,11 +1037,11 @@ class CDPDriver:
             )
         return inner.get("value", "")
 
-    async def _js_with_data_strict(self, expr_template: str, data: dict, timeout: float = 15) -> str:
+    async def _js_with_data_strict(
+        self, expr_template: str, data: dict, timeout: float = 15
+    ) -> str:
         """Strict variant of _js_with_data — raises CDPJSError on failure."""
-        wrapped = (
-            f"( (__D) => ({expr_template}) )({json.dumps(data)})"
-        )
+        wrapped = f"( (__D) => ({expr_template}) )({json.dumps(data)})"
         return await self._js_strict(wrapped, timeout=timeout)
 
     # ── Model Selection ───────────────────────────────────────
@@ -1049,7 +1075,9 @@ class CDPDriver:
             "})()"
         )
         if picker_clicked != "clicked":
-            logger.warning("Model picker not found: %s — proceeding with active model", picker_clicked)
+            logger.warning(
+                "Model picker not found: %s — proceeding with active model", picker_clicked
+            )
             return False
 
         # Wait for dropdown to appear
@@ -1060,10 +1088,10 @@ class CDPDriver:
         result = await self._js_with_data(
             "(function() {"
             "  var items = document.querySelectorAll("
-            "    'button[data-testid*=\"model\"], "
-            "    '[class*=\"model-item\"], "
-            "    '[class*=\"modelOption\"], "
-            "    'li[class*=\"model\"], "
+            '    \'button[data-testid*="model"], '
+            '    \'[class*="model-item"], '
+            '    \'[class*="modelOption"], '
+            '    \'li[class*="model"], '
             "    'div[class*=\"model\"] button'"
             "  );"
             "  for (var i = 0; i < items.length; i++) {"
@@ -1101,7 +1129,9 @@ class CDPDriver:
                 await self._js_strict("document.body.click()")  # dismiss dropdown
             except Exception:
                 pass  # best-effort
-        logger.warning("Model '%s' not found in picker: %s — proceeding with active model", slug, result)
+        logger.warning(
+            "Model '%s' not found in picker: %s — proceeding with active model", slug, result
+        )
         return False
 
     # ── Navigation ────────────────────────────────────────────
@@ -1143,9 +1173,7 @@ class CDPDriver:
                     # #14: verify we actually landed on chatgpt.com, not an
                     # error/recovery page that happens to have a textarea.
                     if "chatgpt.com" not in actual_url:
-                        raise RuntimeError(
-                            f"Navigation landed on unexpected URL: {actual_url}"
-                        )
+                        raise RuntimeError(f"Navigation landed on unexpected URL: {actual_url}")
                     logger.info("Page ready: %s", actual_url)
                     break
             except (json.JSONDecodeError, TypeError):
@@ -1268,8 +1296,7 @@ class CDPDriver:
             if self._current_conv_id == conversation_id:
                 self._current_conv_id = None
             raise RuntimeError(
-                f"Navigation to {conversation_id} did not reach a ready "
-                f"composer within the timeout"
+                f"Navigation to {conversation_id} did not reach a ready composer within the timeout"
             )
 
         await asyncio.sleep(1)
@@ -1326,9 +1353,7 @@ class CDPDriver:
         if not await self._is_live_conversation_url(conversation_id):
             if self._current_conv_id == conversation_id:
                 self._current_conv_id = None
-            raise RuntimeError(
-                f"Failed to restore conversation context: {conversation_id}"
-            )
+            raise RuntimeError(f"Failed to restore conversation context: {conversation_id}")
 
     # ── Message Input ─────────────────────────────────────────
 
@@ -1364,8 +1389,26 @@ class CDPDriver:
         # macOS — detected at runtime so select-all doesn't silently no-op on
         # Mac). Insert via CDP, dispatched to the focused composer.
         select_all_mods = await self._detect_select_all_modifier()
-        await self._cdp("Input.dispatchKeyEvent", {"type": "rawKeyDown", "key": "a", "code": "KeyA", "windowsVirtualKeyCode": 65, "modifiers": select_all_mods})
-        await self._cdp("Input.dispatchKeyEvent", {"type": "keyUp", "key": "a", "code": "KeyA", "windowsVirtualKeyCode": 65, "modifiers": select_all_mods})
+        await self._cdp(
+            "Input.dispatchKeyEvent",
+            {
+                "type": "rawKeyDown",
+                "key": "a",
+                "code": "KeyA",
+                "windowsVirtualKeyCode": 65,
+                "modifiers": select_all_mods,
+            },
+        )
+        await self._cdp(
+            "Input.dispatchKeyEvent",
+            {
+                "type": "keyUp",
+                "key": "a",
+                "code": "KeyA",
+                "windowsVirtualKeyCode": 65,
+                "modifiers": select_all_mods,
+            },
+        )
         await asyncio.sleep(0.1)
         await self._cdp("Input.insertText", {"text": text})
         await asyncio.sleep(0.5)
@@ -1376,9 +1419,13 @@ class CDPDriver:
         # the prompt — so we compare canonical editor-visible text. On mismatch,
         # retry once: clear via execCommand('selectAll') + delete (ProseMirror
         # sees editor-like input events), re-insert, re-verify. Only then raise.
-        verify_selector = COMPOSER_SELECTOR if focused_target == "composer" else COMPOSER_FALLBACK_SELECTOR
+        verify_selector = (
+            COMPOSER_SELECTOR if focused_target == "composer" else COMPOSER_FALLBACK_SELECTOR
+        )
         if not await self._verify_composer_text(verify_selector, text):
-            logger.warning("Composer text mismatch on first insert; retrying with execCommand clear")
+            logger.warning(
+                "Composer text mismatch on first insert; retrying with execCommand clear"
+            )
             await self._js_strict(
                 "(function(){"
                 f"  var el = document.querySelector('{verify_selector}');"
@@ -1402,8 +1449,7 @@ class CDPDriver:
             await asyncio.sleep(0.5)
             if not await self._verify_composer_text(verify_selector, text):
                 raise RuntimeError(
-                    f"Composer text verification failed after retry; "
-                    f"expected {text[:60]!r}"
+                    f"Composer text verification failed after retry; expected {text[:60]!r}"
                 )
         logger.info("Typed: %s", text[:80])
 
@@ -1607,14 +1653,10 @@ class CDPDriver:
             if current_count > initial_count:
                 break
             if time.monotonic() - last_progress > PHASE_STALL_SECONDS:
-                raise GenerationStuckError(
-                    "phase_1_appear", time.monotonic() - last_progress
-                )
+                raise GenerationStuckError("phase_1_appear", time.monotonic() - last_progress)
             await asyncio.sleep(0.5)
         else:
-            raise GenerationStuckError(
-                "phase_1_appear", timeout
-            )
+            raise GenerationStuckError("phase_1_appear", timeout)
 
         logger.info("Assistant message appeared, waiting for completion...")
 
@@ -1673,6 +1715,15 @@ class CDPDriver:
         # (so it never races the primary DOM signal). Never the sole signal.
         last_backend_check = 0.0
         conv_id_for_check = self._current_conv_id or ""
+        # Mid-loop conv_id probe throttle. On a NEW chat (REST /health path or
+        # the SSE/MCP path) _current_conv_id is None here and conv_id_for_check
+        # is "" — which silently disables the backend end_turn fallback below
+        # (its guard is ``conv_id_for_check and ...``). That fallback is the
+        # stable completion signal when the DOM action-button selector drifts.
+        # ChatGPT navigates to /c/{id} within ~1s of send, so we probe the live
+        # URL (cheap) until a conv_id is available, then the existing backend
+        # check can fire. See _get_live_conversation_id_best_effort.
+        last_conv_id_probe = 0.0
         while time.monotonic() < deadline:
             try:
                 result = await self._js_strict(
@@ -1693,45 +1744,45 @@ class CDPDriver:
                     # Strip a leading "Thinking..." / "Thought for …" reasoning
                     # label so the innerText fallback can't leak it as a delta.
                     "  var text = mdText || rawText.replace(/^Think(ing|\\s+for)[^\\n]*\\n?/i, '');"
-                "  var html_len = last.innerHTML.length;"
-                "  var child_count = last.children.length;"
-                # has_action: the per-turn copy/feedback action row appears
-                # only on a COMPLETED message. ChatGPT's DOM layout puts these
-                # buttons in a SIBLING/UNCLE container, NOT as descendants of
-                # the assistant message node — so a plain
-                # ``last.querySelector(...)`` finds nothing and completion is
-                # never detected (every send stalled at the 90s ceiling). The
-                # fix: walk up to 4 ancestors, querying down at each scope,
-                # and require the button to be GEOMETRICALLY NEAR the message
-                # (below it, within ~240px) so an older turn's action row
-                # can't falsely complete a brand-new answer. New testid scheme
-                # is ``*-turn-action-button`` (copy/good-response/bad-response);
-                # the legacy ``response-turn`` selector is retained for older
-                # deployments but no longer matches anything on current ChatGPT.
-                "  var ACT = '[data-testid=\"copy-turn-action-button\"],"
-                "            [data-testid=\"good-response-turn-action-button\"],"
-                "            [data-testid=\"bad-response-turn-action-button\"],"
-                "            [data-testid*=\"turn-action-button\"],"
-                "            [data-testid*=\"copy\"],"
-                "            [data-testid*=\"response-turn\"]';"
-                "  var has_action = (function() {"
-                "    var lastRect = last.getBoundingClientRect();"
-                "    var scope = last;"
-                "    for (var d = 0; scope && d <= 4; d++, scope = scope.parentElement) {"
-                "      var btns = Array.prototype.filter.call("
-                "        scope.querySelectorAll(ACT),"
-                "        function(el){ return el.offsetParent !== null || el.getClientRects().length > 0; }"
-                "      );"
-                "      if (!btns.length) continue;"
-                "      for (var i = 0; i < btns.length; i++) {"
-                "        var r = btns[i].getBoundingClientRect();"
-                "        if (r.top >= lastRect.top - 8 && r.top <= lastRect.bottom + 240) {"
-                "          return true;"
-                "        }"
-                "      }"
-                "    }"
-                "    return false;"
-                "  })();"
+                    "  var html_len = last.innerHTML.length;"
+                    "  var child_count = last.children.length;"
+                    # has_action: the per-turn copy/feedback action row appears
+                    # only on a COMPLETED message. ChatGPT's DOM layout puts these
+                    # buttons in a SIBLING/UNCLE container, NOT as descendants of
+                    # the assistant message node — so a plain
+                    # ``last.querySelector(...)`` finds nothing and completion is
+                    # never detected (every send stalled at the 90s ceiling). The
+                    # fix: walk up to 4 ancestors, querying down at each scope,
+                    # and require the button to be GEOMETRICALLY NEAR the message
+                    # (below it, within ~240px) so an older turn's action row
+                    # can't falsely complete a brand-new answer. New testid scheme
+                    # is ``*-turn-action-button`` (copy/good-response/bad-response);
+                    # the legacy ``response-turn`` selector is retained for older
+                    # deployments but no longer matches anything on current ChatGPT.
+                    '  var ACT = \'[data-testid="copy-turn-action-button"],'
+                    '            [data-testid="good-response-turn-action-button"],'
+                    '            [data-testid="bad-response-turn-action-button"],'
+                    '            [data-testid*="turn-action-button"],'
+                    '            [data-testid*="copy"],'
+                    '            [data-testid*="response-turn"]\';'
+                    "  var has_action = (function() {"
+                    "    var lastRect = last.getBoundingClientRect();"
+                    "    var scope = last;"
+                    "    for (var d = 0; scope && d <= 4; d++, scope = scope.parentElement) {"
+                    "      var btns = Array.prototype.filter.call("
+                    "        scope.querySelectorAll(ACT),"
+                    "        function(el){ return el.offsetParent !== null || el.getClientRects().length > 0; }"
+                    "      );"
+                    "      if (!btns.length) continue;"
+                    "      for (var i = 0; i < btns.length; i++) {"
+                    "        var r = btns[i].getBoundingClientRect();"
+                    "        if (r.top >= lastRect.top - 8 && r.top <= lastRect.bottom + 240) {"
+                    "          return true;"
+                    "        }"
+                    "      }"
+                    "    }"
+                    "    return false;"
+                    "  })();"
                     # is_thinking: the active-reasoning indicator. Narrowed to
                     # ``.result-thinking`` AND ``!has_action`` — the action
                     # button marks a finished turn, and ``.result-thinking``
@@ -1774,22 +1825,27 @@ class CDPDriver:
 
             # is_thinking means the model is actively reasoning — the DOM is
             # legitimately static for tens of seconds, which is NOT a stall.
-            # It MUST reset the stall clock. But — critically — it must NOT
-            # block delta emission: after reasoning ends there's a gap where
-            # is_thinking is still true (.result-thinking lingers as a
-            # collapsed "Thought process" section) yet the answer is actively
-            # streaming. The old ``if is_thinking / elif text-changed``
-            # structure made the two mutually exclusive, so is_thinking=true
-            # suppressed all deltas, freezing last_dom_text="" and yielding an
-            # empty response whenever _fetch_text lagged. The reset and the
-            # stream are independent concerns — handle them independently.
+            # It MUST reset the stall clock so a genuine reasoning phase isn't
+            # killed early. But a STALE thinking state (.result-thinking lingers
+            # as a collapsed section after the answer finishes) must not freeze
+            # the stall detector forever — that's how a drift in the DOM
+            # action-button selector produced the 120s completion hang (issue
+            # #10): is_thinking pinned last_change_time every poll so the 90s
+            # stall guard never fired. Compromise: let thinking reset the stall
+            # clock ONLY while we have no stable backend completion signal
+            # available. Once conv_id_for_check is resolved, the backend
+            # end_turn fallback can detect completion even under stale thinking,
+            # so we stop granting the indefinite thinking stall reset — the
+            # normal stall clock applies and bounds the worst case. (Resetting
+            # saw_thinking is independent of this and always happens.)
             if is_thinking:
-                last_change_time = time.monotonic()
                 saw_thinking = True
+                if not conv_id_for_check:
+                    last_change_time = time.monotonic()
             if current != last_dom_text:
                 last_change_time = time.monotonic()
                 if len(current) > len(last_dom_text):
-                    delta = current[len(last_dom_text):]
+                    delta = current[len(last_dom_text) :]
                     yield StreamChunk(delta=delta)
                 last_dom_text = current
 
@@ -1807,6 +1863,27 @@ class CDPDriver:
             # quirk that broke the earlier heuristics.
             if has_action:
                 break
+
+            # Resolve the in-flight conversation id for new chats (SSE/MCP path
+            # and the first send on a fresh REST session). conv_id_for_check is
+            # "" here when _current_conv_id is None — without this probe the
+            # backend end_turn fallback below never runs for new conversations,
+            # leaving only the (brittle, drift-prone) DOM action-button as a
+            # completion signal. Throttled to one URL probe per second; stops
+            # probing once a conv_id is found. See issue #10.
+            if not conv_id_for_check:
+                now = time.monotonic()
+                if now - last_conv_id_probe >= 1.0:
+                    last_conv_id_probe = now
+                    try:
+                        conv_id_for_check = await self._get_live_conversation_id_best_effort()
+                        if conv_id_for_check:
+                            logger.info(
+                                "Resolved conversation id mid-loop: %s",
+                                conv_id_for_check,
+                            )
+                    except Exception as e:
+                        logger.debug("conv_id probe failed (ignored): %s", e)
 
             # Backend end_turn fallback (R4): when the DOM action-button
             # selector drifts (it has, twice — composer redesign + the
@@ -1847,9 +1924,7 @@ class CDPDriver:
                     logger.debug("end_turn fallback fetch failed (ignored): %s", e)
 
             if time.monotonic() - last_change_time > PHASE_STALL_SECONDS:
-                raise GenerationStuckError(
-                    "phase_2_stream", time.monotonic() - last_change_time
-                )
+                raise GenerationStuckError("phase_2_stream", time.monotonic() - last_change_time)
 
             await asyncio.sleep(0.5)
 
@@ -1873,7 +1948,7 @@ class CDPDriver:
             for _ in range(60):
                 api_text = await self._fetch_text(conv_id)
                 if api_text and len(api_text) > len(last_dom_text):
-                    yield StreamChunk(delta=api_text[len(last_dom_text):])
+                    yield StreamChunk(delta=api_text[len(last_dom_text) :])
                     last_dom_text = api_text
                     break
                 if api_text:
@@ -1938,7 +2013,7 @@ class CDPDriver:
                 "})()",
                 {"conv_id": conversation_id, "token": self._access_token},
                 timeout=15,
-        )
+            )
         except CDPJSError as e:
             logger.debug("_fetch_text JS failed (will retry): %s", e)
             return ""
@@ -1946,7 +2021,7 @@ class CDPDriver:
             return ""
         # Detect the status-blob shape (non-OK response) and raise appropriately.
         # Cheap pre-check before json.loads to avoid parsing every valid text body.
-        if raw.startswith('{"__status"') or raw.startswith("{ \"__status\""):
+        if raw.startswith('{"__status"') or raw.startswith('{ "__status"'):
             try:
                 payload = json.loads(raw)
                 status = payload.get("__status")
@@ -1957,6 +2032,41 @@ class CDPDriver:
             if status is not None:
                 raise RuntimeError(f"_fetch_text HTTP {status} for {conversation_id}")
         return raw
+
+    async def _conversation_id_from_url(self) -> str:
+        """Parse the conversation id from the live tab's ``location.href``.
+
+        Returns ``""`` when the URL is not yet a conversation URL (e.g. still
+        on the composer/new-chat page before the first send resolves) or when
+        the JS evaluation fails. Best-effort — callers retry on empty.
+        """
+        try:
+            url = await self._js_strict("window.location.href")
+        except (CDPJSError, TypeError):
+            return ""
+        if not url or "/c/" not in url:
+            return ""
+        return url.split("/c/")[1].split("/")[0].split("?")[0]
+
+    async def _get_live_conversation_id_best_effort(self) -> str:
+        """Resolve the in-flight conversation id by cheapest available source.
+
+        Ordered for a new-chat poll loop where ``_current_conv_id`` is still
+        None (it is only set AFTER the loop, from the URL — see
+        ``send_and_stream``):
+
+        1. ``self._current_conv_id`` — populated on continued conversations
+           (REST path) and after the first completed send.
+        2. ``location.href`` ``/c/{id}`` — available within ~1s of send, once
+           ChatGPT navigates to the new conversation.
+
+        Deliberately does NOT consult the conversation backend API: that is an
+        expensive fetch, and this helper is called every ~1s during polling.
+        Returns ``""`` if no source has a usable id yet.
+        """
+        if self._current_conv_id:
+            return self._current_conv_id
+        return await self._conversation_id_from_url()
 
     async def _fetch_end_turn(self, conversation_id: str) -> bool:
         """Backend secondary completion signal: is the latest assistant TEXT
@@ -2079,9 +2189,7 @@ class CDPDriver:
         # Login pages contain these markers
         lower = raw[:500].lower()
         if "sign in" in lower and "chatgpt" in lower and "<html" in lower:
-            raise AuthExpiredError(
-                "Session expired — read returned login page instead of data"
-            )
+            raise AuthExpiredError("Session expired — read returned login page instead of data")
 
     async def _capture_selector_diagnostic(self, selector_name: str) -> None:
         """#5: Capture DOM state when a selector fails to match.
@@ -2104,9 +2212,7 @@ class CDPDriver:
                 "})()",
                 timeout=5,
             )
-            logger.warning(
-                "Selector drift diagnostic (%s): %s", selector_name, snapshot
-            )
+            logger.warning("Selector drift diagnostic (%s): %s", selector_name, snapshot)
         except Exception:
             logger.warning("Selector drift diagnostic (%s): capture failed", selector_name)
 
@@ -2192,7 +2298,12 @@ class CDPDriver:
                 "      is_archived: !!c.is_archived, gizmo_id: c.gizmo_id || null};"
                 "  }));"
                 "})()",
-                {"token": self._access_token, "offset": str(offset), "limit": str(limit), "order": order},
+                {
+                    "token": self._access_token,
+                    "offset": str(offset),
+                    "limit": str(limit),
+                    "order": order,
+                },
             )
             self._check_auth_in_raw(raw)
             return json.loads(raw)
@@ -2250,9 +2361,7 @@ class CDPDriver:
         logger.warning("Failed to delete conversation %s: %s", conversation_id, result)
         return False
 
-    async def rename_conversation(
-        self, conversation_id: str, title: str
-    ) -> bool:
+    async def rename_conversation(self, conversation_id: str, title: str) -> bool:
         """Rename a conversation. Returns True on success."""
         await self.ensure_token()
         try:
@@ -2401,7 +2510,11 @@ class CDPDriver:
                 "    return r.ok ? 'true' : 'false';"
                 "  } catch(e) { return 'error:' + e.message; }"
                 "})()",
-                {"token": self._access_token, "project_id": project_id, "instructions": instructions},
+                {
+                    "token": self._access_token,
+                    "project_id": project_id,
+                    "instructions": instructions,
+                },
                 timeout=20,
             )
         except CDPJSError as e:
@@ -2440,9 +2553,7 @@ class CDPDriver:
             {"archive": "<arg>"},
         ),
     )
-    async def archive_conversation(
-        self, conversation_id: str, archive: bool = True
-    ) -> bool:
+    async def archive_conversation(self, conversation_id: str, archive: bool = True) -> bool:
         """Archive or unarchive a conversation. Returns True on success."""
         await self.ensure_token()
         try:
@@ -2463,7 +2574,9 @@ class CDPDriver:
             logger.warning("archive_conversation JS failed: %s", e)
             result = "false"
         if result == "true":
-            logger.info("%s conversation: %s", 'Archived' if archive else 'Unarchived', conversation_id)
+            logger.info(
+                "%s conversation: %s", "Archived" if archive else "Unarchived", conversation_id
+            )
             return True
         logger.warning("Failed to archive conversation: %s", result)
         return False
@@ -2513,9 +2626,7 @@ class CDPDriver:
         asking ChatGPT to remember the content, which triggers the memory
         system automatically.
         """
-        memory_prompt = (
-            f"Please remember this for all future conversations: {content}"
-        )
+        memory_prompt = f"Please remember this for all future conversations: {content}"
 
         # Navigate to a fresh chat for memory creation
         await self.navigate_new_chat()
@@ -2537,8 +2648,7 @@ class CDPDriver:
         try:
             memories = await self.get_memories()
             memory_created = any(
-                content[:30].lower() in (m.get("content", "")[:50].lower())
-                for m in memories
+                content[:30].lower() in (m.get("content", "")[:50].lower()) for m in memories
             )
         except Exception:
             pass  # best-effort verification
@@ -2719,10 +2829,7 @@ class CDPDriver:
         any /backend-api/* fetch so a stale session surfaces as
         AuthExpiredError (via _fetch_text) rather than silent empty data.
         """
-        stale = (
-            not self._access_token
-            or time.time() - self._token_fetched_at > TOKEN_TTL_SECONDS
-        )
+        stale = not self._access_token or time.time() - self._token_fetched_at > TOKEN_TTL_SECONDS
         if stale:
             await self._refresh_token()
         return self._access_token
@@ -2770,9 +2877,7 @@ class CDPDriver:
         # side-effects (killing a tab the user expects to stay open).
         if self._target_id and self._owns_target:
             try:
-                await self._browser_cdp(
-                    "Target.closeTarget", {"targetId": self._target_id}
-                )
+                await self._browser_cdp("Target.closeTarget", {"targetId": self._target_id})
                 logger.info("Closed owned tab: %s", self._target_id)
             except Exception as e:
                 logger.debug("Could not close owned tab %s: %s", self._target_id, e)
