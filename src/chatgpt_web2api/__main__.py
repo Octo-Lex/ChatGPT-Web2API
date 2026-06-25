@@ -63,16 +63,22 @@ def inject_cookies(args) -> None:
 
     async def _inject():
         import websockets
+
         pages = [t for t in targets if t.get("type") == "page"]
         if not pages:
             print("Error: No pages found")
             return
         ws_url = pages[0]["webSocketDebuggerUrl"]
-        ws = await websockets.connect(ws_url, max_size=50*1024*1024)
+        ws = await websockets.connect(ws_url, max_size=50 * 1024 * 1024)
 
         # Navigate to chatgpt.com first
-        await ws.send(json.dumps({"id": 1, "method": "Page.navigate", "params": {"url": "https://chatgpt.com/"}}))
+        await ws.send(
+            json.dumps(
+                {"id": 1, "method": "Page.navigate", "params": {"url": "https://chatgpt.com/"}}
+            )
+        )
         import asyncio as aio
+
         await aio.sleep(3)
 
         # Set cookies via CDP
@@ -90,17 +96,29 @@ def inject_cookies(args) -> None:
             if cookie.get("expirationDate") or cookie.get("expiry"):
                 cdp_cookie["expires"] = cookie.get("expirationDate") or cookie.get("expiry")
 
-            await ws.send(json.dumps({"id": i+10, "method": "Network.setCookie", "params": cdp_cookie}))
+            await ws.send(
+                json.dumps({"id": i + 10, "method": "Network.setCookie", "params": cdp_cookie})
+            )
             await aio.sleep(0.01)
 
         print(f"Injected {len(cookies)} cookies")
 
         # Verify by trying to get auth
         await aio.sleep(2)
-        await ws.send(json.dumps({"id": 999, "method": "Runtime.evaluate", "params": {
-            "expression": "(async () => { var r = await fetch('/api/auth/session', {credentials:'include'}); var d = await r.json(); return d.accessToken ? 'OK:' + d.user?.name : 'FAIL'; })()",
-            "awaitPromise": True, "returnByValue": True, "timeout": 10000
-        }}))
+        await ws.send(
+            json.dumps(
+                {
+                    "id": 999,
+                    "method": "Runtime.evaluate",
+                    "params": {
+                        "expression": "(async () => { var r = await fetch('/api/auth/session', {credentials:'include'}); var d = await r.json(); return d.accessToken ? 'OK:' + d.user?.name : 'FAIL'; })()",
+                        "awaitPromise": True,
+                        "returnByValue": True,
+                        "timeout": 10000,
+                    },
+                }
+            )
+        )
         while True:
             r = await aio.wait_for(ws.recv(), timeout=15)
             resp = json.loads(r)
@@ -117,10 +135,9 @@ def inject_cookies(args) -> None:
     asyncio.run(_inject())
 
 
-
 def main() -> None:
     # Check if first arg looks like a subcommand
-    subcommands = {"start", "inject-cookies", "doctor"}
+    subcommands = {"start", "inject-cookies", "doctor", "ensure"}
     has_subcommand = len(sys.argv) > 1 and sys.argv[1] in subcommands
 
     parser = argparse.ArgumentParser(
@@ -132,12 +149,45 @@ def main() -> None:
         subparsers = parser.add_subparsers(dest="command")
         start_parser = subparsers.add_parser("start", help="Start the proxy (default)")
         _add_common_args(start_parser)
-        cookie_parser = subparsers.add_parser("inject-cookies", help="Inject browser cookies for auth")
+        cookie_parser = subparsers.add_parser(
+            "inject-cookies", help="Inject browser cookies for auth"
+        )
         cookie_parser.add_argument("cookies", help="Path to cookies JSON file")
         _add_common_args(cookie_parser)
-        doctor_parser = subparsers.add_parser("doctor", help="Diagnose a broken function from captured evidence")
-        doctor_parser.add_argument("function", nargs="?", help="Function to diagnose (omit to auto-discover)")
-        doctor_parser.add_argument("--verify", metavar="FUNCTION", help="Re-run a function live to verify a fix")
+        doctor_parser = subparsers.add_parser(
+            "doctor", help="Diagnose a broken function from captured evidence"
+        )
+        doctor_parser.add_argument(
+            "function", nargs="?", help="Function to diagnose (omit to auto-discover)"
+        )
+        doctor_parser.add_argument(
+            "--verify", metavar="FUNCTION", help="Re-run a function live to verify a fix"
+        )
+        ensure_parser = subparsers.add_parser(
+            "ensure",
+            help="Point-in-time reconcile: make REST + SSE healthy, then exit (for ZCode hooks)",
+        )
+        ensure_parser.add_argument(
+            "--rest-port", type=int, default=8080, help="REST API port to reconcile (default: 8080)"
+        )
+        ensure_parser.add_argument(
+            "--mcp-sse-port",
+            type=int,
+            default=8090,
+            help="MCP/SSE port to reconcile (default: 8090)",
+        )
+        ensure_parser.add_argument("--config", "-c", help="Config file path (JSON)")
+        ensure_parser.add_argument(
+            "--cdp-port", type=int, default=9222, help="Chrome CDP port (default: 9222)"
+        )
+        # default=None so we can distinguish "caller provided --log-level" from
+        # the default — only propagated to child subprocesses when explicit.
+        ensure_parser.add_argument(
+            "--log-level",
+            default=None,
+            choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+            help="Log level for child processes (default: child's own default)",
+        )
     else:
         # No subcommand — parse as start with all args
         _add_common_args(parser)
@@ -151,7 +201,21 @@ def main() -> None:
         inject_cookies(args)
     elif command == "doctor":
         from .doctor import run_doctor
+
         run_doctor(args)
+    elif command == "ensure":
+        from .ensure import run_ensure
+
+        code = asyncio.run(
+            run_ensure(
+                rest_port=args.rest_port,
+                sse_port=args.mcp_sse_port,
+                cdp_port=args.cdp_port,
+                config_path=args.config,
+                log_level=args.log_level,
+            )
+        )
+        sys.exit(code)
 
 
 def _add_common_args(parser: argparse.ArgumentParser) -> None:
@@ -162,8 +226,9 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--chrome-path", help="Path to Chrome binary")
     parser.add_argument("--user-data-dir", help="Chrome user data directory")
     parser.add_argument("--headless", action="store_true", help="Run Chrome headless")
-    parser.add_argument("--log-level", default="INFO",
-                        choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    parser.add_argument(
+        "--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"]
+    )
 
 
 def _parse_as_start(parser: argparse.ArgumentParser) -> argparse.Namespace:
@@ -178,22 +243,22 @@ def _parse_as_start(parser: argparse.ArgumentParser) -> argparse.Namespace:
 
 def _run_start(args: argparse.Namespace) -> None:
     # Load config
-    config = Config.load(getattr(args, 'config', None))
+    config = Config.load(getattr(args, "config", None))
 
     # CLI overrides
-    if getattr(args, 'port', None):
+    if getattr(args, "port", None):
         config.server.port = args.port
-    if getattr(args, 'host', None):
+    if getattr(args, "host", None):
         config.server.host = args.host
-    if getattr(args, 'cdp_port', None):
+    if getattr(args, "cdp_port", None):
         config.chrome.cdp_port = args.cdp_port
-    if getattr(args, 'chrome_path', None):
+    if getattr(args, "chrome_path", None):
         config.chrome.chrome_path = args.chrome_path
-    if getattr(args, 'user_data_dir', None):
+    if getattr(args, "user_data_dir", None):
         config.chrome.user_data_dir = args.user_data_dir
-    if getattr(args, 'headless', False):
+    if getattr(args, "headless", False):
         config.chrome.headless = True
-    if getattr(args, 'log_level', None):
+    if getattr(args, "log_level", None):
         config.log.level = args.log_level
 
     # Logging

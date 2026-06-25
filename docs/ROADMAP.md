@@ -129,9 +129,16 @@ Remaining follow-up: the DOM `has_action` selector is still dead — tracked in 
 
 ---
 
-## Phase 3 — Add `chatgpt-web2api ensure`
+## Phase 3 — Add `chatgpt-web2api ensure`  ✅ DONE
 
 **Goal:** let ZCode hooks bootstrap the full stack with a thin one-liner.
+
+Shipped as `chatgpt-web2api ensure` in `src/chatgpt_web2api/ensure.py`, wired
+into the `__main__.py` subcommand dispatch. Point-in-time reconcile: checks
+REST + SSE, starts whichever is missing, verifies SSE via real MCP handshake,
+exits 0 when ready. Lock-protected (SSE-port-keyed startup lock, bounded
+contention). Degraded-REST policy honored (20s poll before restart). No
+watchdog loop. 15 unit tests in `tests/test_ensure.py`.
 
 ### Command
 

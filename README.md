@@ -273,6 +273,33 @@ W2A_ENABLE_WRITE=1 W2A_ENABLE_DESTRUCTIVE=1 chatgpt-web2api-mcp
 
 Gated tools are **hidden** from `list_tools` *and* **refused at call time** — a client that calls a gated tool by name gets an error result rather than silent execution. Binding the SSE transport to a non-loopback address with no `api_keys` configured logs a prominent warning.
 
+### 🔌 ZCode Hook: One-Line Bootstrap with `ensure`
+
+Instead of manually starting REST and SSE in separate terminals, run a single
+command that reconciles both and exits — ideal for a ZCode session-start hook:
+
+```bash
+chatgpt-web2api ensure
+```
+
+`ensure` is **point-in-time reconciliation**, not a supervisor: it checks REST
+(`/health`) and SSE, starts whichever is missing, verifies SSE with a real MCP
+handshake, and exits `0` when both are ready (nonzero with a diagnostic if not).
+If a service dies later, re-run `ensure` from the next hook/session.
+
+```bash
+# Reconcile REST on 8080 + SSE on 8090 (defaults)
+chatgpt-web2api ensure
+
+# Custom ports / config (propagated to the child processes)
+chatgpt-web2api ensure --rest-port 8081 --mcp-sse-port 8091 --config ~/.my-config.json
+```
+
+Degraded-REST policy: `ensure` does **not** restart REST immediately on
+`degraded` (Chrome alive, driver disconnected) — it polls for up to 20s first,
+since that may be a transient CDP reconnect. Only `missing` or `broken` trigger
+an immediate (re)start. This avoids a destructive Chrome bounce on transients.
+
 ### 🔧 Three Interfaces, One Chrome Session
 
 ```bash

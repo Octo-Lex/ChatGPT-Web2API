@@ -1,0 +1,319 @@
+"""Point-in-time reconciliation of the REST + SSE stack.
+
+``chatgpt-web2api ensure`` is a thin one-liner for ZCode hooks: it makes REST
+and SSE healthy NOW, then exits. It is NOT a continuous supervisor — if SSE
+dies later, the next hook/session re-runs ``ensure``.
+
+Pinned design (ROADMAP Phase 3):
+  - point-in-time, not a watchdog (no Python loop after exit)
+  - REST owns Chrome; SSE attaches and never launches Chrome
+  - degraded-REST is NOT restarted immediately (may be a transient CDP
+    reconnect — give it 20s of polling before bouncing the browser)
+  - lock-protected so concurrent ``ensure`` runs don't double-launch
+
+Exit codes: 0 when both REST and SSE are ready, nonzero with a diagnostic
+otherwise.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import socket
+import subprocess
+import sys
+import time
+import urllib.request
+from pathlib import Path
+
+from mcp import ClientSession
+from mcp.client.sse import sse_client
+
+from chatgpt_web2api.cross_process_lock import LockAcquisitionError
+
+logger = logging.getLogger(__name__)
+
+# Bounded wait for REST to resolve starting/degraded before we act.
+_REST_HEALTHY_TIMEOUT = 30.0
+# Degraded-REST grace window: poll every 2s for up to 20s before restarting.
+_DEGRADED_POLL_INTERVAL = 2.0
+_DEGRADED_POLL_BUDGET = 20.0
+# Startup lock: bounded contention wait.
+_LOCK_TIMEOUT = 10.0
+_LOCK_CONTENTION_RECHECK_INTERVAL = 3.0
+_LOCK_CONTENTION_RECHECK_TRIES = 3
+# SSE readiness: TCP preflight then real MCP handshake.
+_SSE_VERIFY_TIMEOUT = 15.0
+
+
+class _StartupLock:
+    """A bounded, SSE-port-keyed startup lock.
+
+    Distinct from the CDP-keyed CrossProcessLock (which serializes request-
+    level DOM mutations). This one prevents two concurrent ``ensure`` runs
+    from double-launching REST/SSE. Uses portalocker under the hood so it is
+    cross-process safe.
+    """
+
+    import portalocker
+
+    def __init__(self, sse_port: int, timeout: float = _LOCK_TIMEOUT) -> None:
+        self._path = str(Path.home() / ".chatgpt_web2api" / f"sse-startup-{sse_port}.lock")
+        self._timeout = timeout
+        self._fh = None
+
+    async def __aenter__(self):
+        Path(self._path).parent.mkdir(parents=True, exist_ok=True)
+        deadline = time.monotonic() + self._timeout
+        while True:
+            try:
+                # Non-blocking attempt in a thread (portalocker is blocking)
+                self._fh = await asyncio.to_thread(self._try_acquire)
+                return self
+            except _LockBusy:
+                if time.monotonic() >= deadline:
+                    raise LockAcquisitionError(
+                        f"startup lock held after {self._timeout}s — another ensure is running"
+                    )
+                await asyncio.sleep(0.3)
+
+    def _try_acquire(self):
+        try:
+            self.portalocker.lock(
+                open(self._path, "w"),
+                self.portalocker.LOCK_EX | self.portalocker.LOCK_NB,
+            )
+            # If we get here, the lock was acquired. Keep the fh.
+            self._fh = open(self._path, "w")
+        except self.portalocker.LockException:
+            raise _LockBusy()
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        if self._fh:
+            try:
+                await asyncio.to_thread(self.portalocker.unlock, self._fh)
+                self._fh.close()
+            except Exception:
+                pass
+
+
+class _LockBusy(Exception):
+    """Internal: lock is currently held by another process."""
+
+
+def _rest_health(rest_port: int, timeout: float = 3.0) -> dict | None:
+    """GET /health. Returns the parsed JSON dict, or None if unreachable
+    (connection refused = ``missing``)."""
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{rest_port}/health", timeout=timeout) as r:
+            return json.loads(r.read())
+    except Exception:
+        return None
+
+
+def _sse_tcp_up(sse_port: int, timeout: float = 1.0) -> bool:
+    """TCP preflight: is anything listening on the SSE port? Not a readiness
+    guarantee — the real check is the MCP handshake below."""
+    try:
+        with socket.socket() as s:
+            s.settimeout(timeout)
+            s.connect(("127.0.0.1", sse_port))
+            return True
+    except OSError:
+        return False
+
+
+async def _sse_verify(sse_port: int) -> bool:
+    """Real SSE readiness: connect a client, initialize, list tools. TCP-up
+    but handshake failure = NOT ready."""
+    url = f"http://127.0.0.1:{sse_port}/sse"
+    try:
+        async with asyncio.timeout(_SSE_VERIFY_TIMEOUT):
+            async with sse_client(url) as (read, write):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    await session.list_tools()
+        return True
+    except Exception as e:
+        logger.debug("SSE verify failed: %s", e)
+        return False
+
+
+def _build_rest_cmd(
+    rest_port: int, cdp_port: int, config_path: str | None, log_level: str | None
+) -> list[str]:
+    """Construct the REST launch command. --port and --cdp-port are always
+    passed (explicit ensure params). --config/--log-level only when the caller
+    provided them (sentinel None = not provided)."""
+    cmd = [
+        sys.executable,
+        "-m",
+        "chatgpt_web2api",
+        "start",
+        "--port",
+        str(rest_port),
+        "--cdp-port",
+        str(cdp_port),
+    ]
+    if config_path:
+        cmd += ["--config", config_path]
+    if log_level:
+        cmd += ["--log-level", log_level]
+    return cmd
+
+
+def _build_sse_cmd(
+    sse_port: int, cdp_port: int, config_path: str | None, log_level: str | None
+) -> list[str]:
+    """Construct the SSE/MCP launch command."""
+    cmd = [
+        sys.executable,
+        "-m",
+        "chatgpt_web2api.mcp_server",
+        "--transport",
+        "sse",
+        "--port",
+        str(sse_port),
+        "--cdp-port",
+        str(cdp_port),
+    ]
+    if config_path:
+        cmd += ["--config", config_path]
+    if log_level:
+        cmd += ["--log-level", log_level]
+    return cmd
+
+
+def _launch_detached(cmd: list[str]) -> subprocess.Popen:
+    """Launch a detached subprocess that survives this process's exit."""
+    kwargs: dict = {
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "stdin": subprocess.DEVNULL,
+    }
+    if sys.platform == "win32":
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS
+    else:
+        kwargs["start_new_session"] = True
+    return subprocess.Popen(cmd, **kwargs)
+
+
+async def _wait_rest_healthy(rest_port: int, timeout: float) -> bool:
+    """Poll /health until status is healthy. Returns True if healthy within
+    the timeout, False otherwise."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        h = _rest_health(rest_port)
+        if h and h.get("status") == "healthy":
+            return True
+        await asyncio.sleep(1.0)
+    return False
+
+
+async def _reconcile_rest(
+    rest_port: int, cdp_port: int, config_path: str | None, log_level: str | None
+) -> bool:
+    """Apply the degraded-REST policy and wait for healthy. Returns True when
+    REST is healthy, False if it can't be made healthy."""
+    h = _rest_health(rest_port)
+    if h is None:
+        logger.info("REST missing — starting")
+        _launch_detached(_build_rest_cmd(rest_port, cdp_port, config_path, log_level))
+        return await _wait_rest_healthy(rest_port, _REST_HEALTHY_TIMEOUT)
+
+    status = h.get("status", "broken")
+    if status == "healthy":
+        logger.info("REST healthy")
+        return True
+
+    if status == "broken":
+        logger.info("REST broken (Chrome down) — restarting")
+        _launch_detached(_build_rest_cmd(rest_port, cdp_port, config_path, log_level))
+        return await _wait_rest_healthy(rest_port, _REST_HEALTHY_TIMEOUT)
+
+    if status == "degraded":
+        # PINNED: degraded may be a transient CDP reconnect. Wait before bouncing.
+        logger.info("REST degraded — waiting up to %.0fs before restart", _DEGRADED_POLL_BUDGET)
+        deadline = time.monotonic() + _DEGRADED_POLL_BUDGET
+        while time.monotonic() < deadline:
+            await asyncio.sleep(_DEGRADED_POLL_INTERVAL)
+            h = _rest_health(rest_port)
+            if h and h.get("status") == "healthy":
+                logger.info("REST recovered from degraded")
+                return True
+            if h and h.get("status") == "broken":
+                break  # fall through to restart
+        logger.info("REST still degraded after %.0fs — restarting", _DEGRADED_POLL_BUDGET)
+        _launch_detached(_build_rest_cmd(rest_port, cdp_port, config_path, log_level))
+        return await _wait_rest_healthy(rest_port, _REST_HEALTHY_TIMEOUT)
+
+    # starting — just wait
+    logger.info("REST starting — waiting")
+    return await _wait_rest_healthy(rest_port, _REST_HEALTHY_TIMEOUT)
+
+
+async def _reconcile_sse(
+    sse_port: int, cdp_port: int, config_path: str | None, log_level: str | None
+) -> bool:
+    """Start SSE if missing, then verify via real MCP handshake."""
+    if _sse_tcp_up(sse_port):
+        ready = await _sse_verify(sse_port)
+        if ready:
+            logger.info("SSE ready on :%d", sse_port)
+            return True
+        logger.info("SSE port up but handshake failed — treating as not ready")
+
+    logger.info("SSE missing — starting")
+    _launch_detached(_build_sse_cmd(sse_port, cdp_port, config_path, log_level))
+
+    # Wait for TCP, then verify handshake.
+    deadline = time.monotonic() + _REST_HEALTHY_TIMEOUT
+    while time.monotonic() < deadline:
+        if _sse_tcp_up(sse_port):
+            if await _sse_verify(sse_port):
+                logger.info("SSE ready on :%d", sse_port)
+                return True
+        await asyncio.sleep(1.0)
+    return False
+
+
+async def run_ensure(
+    rest_port: int = 8080,
+    sse_port: int = 8090,
+    cdp_port: int = 9222,
+    config_path: str | None = None,
+    log_level: str | None = None,
+) -> int:
+    """Point-in-time reconcile of REST + SSE. Returns 0 on ready, nonzero on failure."""
+    lock = _StartupLock(sse_port)
+    try:
+        await lock.__aenter__()
+    except LockAcquisitionError:
+        # Bounded contention: another ensure owns the lock. Re-check health a
+        # few times and exit on observed state — never block indefinitely.
+        logger.info("Startup lock held — waiting for another ensure to finish")
+        for _ in range(_LOCK_CONTENTION_RECHECK_TRIES):
+            await asyncio.sleep(_LOCK_CONTENTION_RECHECK_INTERVAL)
+            rest_ok = _rest_health(rest_port)
+            sse_ok = _sse_tcp_up(sse_port) and await _sse_verify(sse_port)
+            if rest_ok and rest_ok.get("status") == "healthy" and sse_ok:
+                print("REST + SSE ready (another ensure succeeded)")
+                return 0
+        print(
+            "ERROR: another ensure is running and services are still not ready.",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        if not await _reconcile_rest(rest_port, cdp_port, config_path, log_level):
+            print("ERROR: REST did not become healthy.", file=sys.stderr)
+            return 1
+        if not await _reconcile_sse(sse_port, cdp_port, config_path, log_level):
+            print("ERROR: SSE did not become ready.", file=sys.stderr)
+            return 1
+        print("REST + SSE ready")
+        return 0
+    finally:
+        await lock.__aexit__(None, None, None)
