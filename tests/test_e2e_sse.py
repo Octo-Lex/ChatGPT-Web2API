@@ -23,13 +23,14 @@ from mcp.client.sse import sse_client
 pytestmark = pytest.mark.e2e
 
 
-def _chatgpt_target_count(cdp_port: int = 9222) -> int:
+def _chatgpt_target_count(cdp_port: int) -> int:
     """Count open Chrome CDP targets whose URL is on chatgpt.com.
 
     Used by the no-growth test: the SSE invariant is that repeated client
     connections do NOT spawn a new Chrome tab per connection. We count CDP
     targets (not OS processes) because that is the resource we actually care
-    about.
+    about. The CDP port is passed in (not hard-coded) so non-default-port
+    e2e runs query the correct Chrome instance.
     """
     try:
         with urllib.request.urlopen(f"http://127.0.0.1:{cdp_port}/json/list", timeout=5) as r:
@@ -114,7 +115,7 @@ async def test_sse_chat_completion(e2e_sse_server: str, e2e_created: dict):
 # ── 5. repeated connections do not grow Chrome tabs ────────────────────
 
 
-async def test_sse_repeated_connections_no_growth(e2e_sse_server: str):
+async def test_sse_repeated_connections_no_growth(e2e_sse_server: str, e2e_config):
     """The core SSE selling point: N client sessions share one MCP server
     with no per-connection Chrome tab growth.
 
@@ -123,13 +124,14 @@ async def test_sse_repeated_connections_no_growth(e2e_sse_server: str):
     start or send-readiness path may create/reclaim one owned tab, so we
     allow ``after <= before + 1``.
     """
-    before = _chatgpt_target_count()
+    cdp_port = e2e_config.chrome.cdp_port
+    before = _chatgpt_target_count(cdp_port)
     for _ in range(3):
         async with sse_client(e2e_sse_server) as (read, write):
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 await session.list_tools()
-    after = _chatgpt_target_count()
+    after = _chatgpt_target_count(cdp_port)
     if before < 0 or after < 0:
         pytest.skip("CDP /json/list unreachable; cannot assert target count")
     assert after <= before + 1, (
