@@ -1752,13 +1752,21 @@ class CDPDriver:
                     # the assistant message node — so a plain
                     # ``last.querySelector(...)`` finds nothing and completion is
                     # never detected (every send stalled at the 90s ceiling). The
-                    # fix: walk up to 4 ancestors, querying down at each scope,
-                    # and require the button to be GEOMETRICALLY NEAR the message
-                    # (below it, within ~240px) so an older turn's action row
-                    # can't falsely complete a brand-new answer. New testid scheme
-                    # is ``*-turn-action-button`` (copy/good-response/bad-response);
-                    # the legacy ``response-turn`` selector is retained for older
-                    # deployments but no longer matches anything on current ChatGPT.
+                    # fix: walk up ancestors, querying down at each scope, and
+                    # require the button to be GEOMETRICALLY NEAR the message so
+                    # an older turn's action row can't falsely complete a brand-new
+                    # answer. New testid scheme is ``*-turn-action-button``
+                    # (copy/good-response/bad-response); the legacy
+                    # ``response-turn`` selector is retained for older deployments
+                    # but no longer matches anything on current ChatGPT.
+                    #
+                    # Depth was 4; raised to 8 after issue #12 found the action
+                    # row at ancestor depth 6. The geometry window is widened to
+                    # accept buttons rendered ABOVE the message (top - 180) —
+                    # short answers place the action row in the spacing above the
+                    # message node, which the old top-8 gate rejected. This is a
+                    # FALLBACK signal now (backend end_turn is primary); kept as an
+                    # escape hatch for when conv_id is unavailable or backend fails.
                     '  var ACT = \'[data-testid="copy-turn-action-button"],'
                     '            [data-testid="good-response-turn-action-button"],'
                     '            [data-testid="bad-response-turn-action-button"],'
@@ -1768,7 +1776,7 @@ class CDPDriver:
                     "  var has_action = (function() {"
                     "    var lastRect = last.getBoundingClientRect();"
                     "    var scope = last;"
-                    "    for (var d = 0; scope && d <= 4; d++, scope = scope.parentElement) {"
+                    "    for (var d = 0; scope && d <= 8; d++, scope = scope.parentElement) {"
                     "      var btns = Array.prototype.filter.call("
                     "        scope.querySelectorAll(ACT),"
                     "        function(el){ return el.offsetParent !== null || el.getClientRects().length > 0; }"
@@ -1776,7 +1784,7 @@ class CDPDriver:
                     "      if (!btns.length) continue;"
                     "      for (var i = 0; i < btns.length; i++) {"
                     "        var r = btns[i].getBoundingClientRect();"
-                    "        if (r.top >= lastRect.top - 8 && r.top <= lastRect.bottom + 240) {"
+                    "        if (r.top >= lastRect.top - 180 && r.top <= lastRect.bottom + 240) {"
                     "          return true;"
                     "        }"
                     "      }"
@@ -1857,20 +1865,14 @@ class CDPDriver:
             last_html_len = html_len
             last_child_count = child_count
 
-            # Done: the new message has its action button (copy/feedback),
-            # which ChatGPT renders only on a finished turn. This is immune to
-            # the Stop-button flicker and the empty-.markdown-during-streaming
-            # quirk that broke the earlier heuristics.
-            if has_action:
-                break
-
-            # Resolve the in-flight conversation id for new chats (SSE/MCP path
-            # and the first send on a fresh REST session). conv_id_for_check is
-            # "" here when _current_conv_id is None — without this probe the
-            # backend end_turn fallback below never runs for new conversations,
-            # leaving only the (brittle, drift-prone) DOM action-button as a
-            # completion signal. Throttled to one URL probe per second; stops
-            # probing once a conv_id is found. See issue #10.
+            # ── Completion detection ─────────────────────────────────────
+            # Two signals, ordered by stability. Backend end_turn is PRIMARY
+            # (issue #12): it survived three DOM action-button drifts where the
+            # DOM selector failed. The DOM has_action is a FALLBACK for the
+            # window where conv_id is unavailable (before the URL resolves, ~1s
+            # into a new chat) or when the backend fetch fails transiently.
+            #
+            # Resolve conv_id first (needed for the primary signal on new chats).
             if not conv_id_for_check:
                 now = time.monotonic()
                 if now - last_conv_id_probe >= 1.0:
@@ -1885,17 +1887,13 @@ class CDPDriver:
                     except Exception as e:
                         logger.debug("conv_id probe failed (ignored): %s", e)
 
-            # Backend end_turn fallback (R4): when the DOM action-button
-            # selector drifts (it has, twice — composer redesign + the
-            # sibling-container layout), has_action stays false and the loop
-            # would stall. The conversation API's end_turn flag on the latest
-            # assistant text node is a stable secondary signal. Throttled to
-            # one fetch per 3s, only when has_action is false. Eligible when
-            # we have streamed text OR have seen a thinking phase — a long
-            # reasoning response has empty last_dom_text during thinking, but
-            # the backend can still report end_turn once the model finishes.
-            # Completion stays strict (end_turn AND usable content), so this
-            # unlock can't complete an empty answer. Fetch failures ignored.
+            # PRIMARY: backend end_turn. Throttled to one fetch per 3s to respect
+            # the shared account rate budget. Eligible when we have streamed text
+            # OR have seen a thinking phase — a long reasoning response has empty
+            # last_dom_text during thinking, but the backend reports end_turn once
+            # the model finishes. Completion stays strict (end_turn AND usable
+            # content) so this can't complete an empty answer. Fetch failures
+            # fall through to the DOM fallback below.
             if (
                 conv_id_for_check
                 and (last_dom_text or saw_thinking or is_thinking)
@@ -1904,14 +1902,12 @@ class CDPDriver:
                 last_backend_check = time.monotonic()
                 try:
                     if await self._fetch_end_turn(conv_id_for_check):
-                        # Completion stays STRICT: end_turn AND usable content.
-                        # The unlock (saw_thinking) lets us CONSULT the backend
-                        # during thinking, but we must not finish on a bare
-                        # end_turn with no answer text/non-text content — that
-                        # would complete an empty response.
+                        # STRICT: end_turn AND usable content. The saw_thinking
+                        # unlock lets us CONSULT the backend during thinking, but
+                        # we must not finish on a bare end_turn with no answer.
                         if last_dom_text or had_non_text_content:
                             logger.info(
-                                "Backend end_turn=true (completion fallback) for %s",
+                                "Backend end_turn=true (primary completion) for %s",
                                 conv_id_for_check,
                             )
                             break
@@ -1921,7 +1917,14 @@ class CDPDriver:
                             conv_id_for_check,
                         )
                 except Exception as e:
-                    logger.debug("end_turn fallback fetch failed (ignored): %s", e)
+                    logger.debug("end_turn fetch failed (ignored): %s", e)
+
+            # FALLBACK: DOM action button (has_action). Used when conv_id is
+            # unavailable or the backend fetch failed. ChatGPT renders the
+            # copy/feedback row only on a finished turn. See the JS block above
+            # for the depth-8 / widened-geometry selector rationale.
+            if has_action:
+                break
 
             if time.monotonic() - last_change_time > PHASE_STALL_SECONDS:
                 raise GenerationStuckError("phase_2_stream", time.monotonic() - last_change_time)
