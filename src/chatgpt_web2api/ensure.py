@@ -21,6 +21,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -247,6 +248,9 @@ def _find_listener_pid_netstat(port: int) -> int | None:
         )
         for line in out.splitlines():
             parts = line.split()
+            # parts[1] is "HOST:PORT" (e.g. "127.0.0.1:8080"). endswith is
+            # already exact here (":80" won't match ":8080" — the string ends in
+            # "0", not "80"); kept explicit for clarity.
             if len(parts) >= 5 and "LISTENING" in line and parts[1].endswith(f":{port}"):
                 return int(parts[-1])
     except Exception:
@@ -268,19 +272,30 @@ def _find_listener_pid_lsof(port: int) -> int | None:
 
 def _find_listener_pid_ss(port: int) -> int | None:
     """``ss -tlnp`` — standard on modern Linux (iproute2). Parse the pid= from
-    the users: column."""
+    the users: column.
+
+    The Local Address column is matched EXACTLY (host:port split on the last
+    ':'), never by substring — the previous ``f":{port}" in line`` check treated
+    port 80 as matching ':8080' and returned the wrong PID. See issue #16.
+    """
+    port_str = str(port)
     try:
         out = subprocess.check_output(
             ["ss", "-tlnp"], text=True, stderr=subprocess.DEVNULL, timeout=5
         )
         for line in out.splitlines():
-            if f":{port}" in line and "pid=" in line:
-                # Extract pid=NNN from the users:(("proc",pid=NNN,...)) column
-                import re as _re
-
-                m = _re.search(r"pid=(\d+)", line)
-                if m:
-                    return int(m.group(1))
+            if "pid=" not in line:
+                continue
+            # Columns run together when empty; "pid=" only appears on bound
+            # sockets, and the Local Address precedes Peer Address. Extract the
+            # port from the "<addr>:<port>" token (whitespace-delimited) and
+            # require an exact match.
+            tokens = line.split()
+            if not any(t.rsplit(":", 1)[-1] == port_str for t in tokens):
+                continue
+            m = re.search(r"pid=(\d+)", line)
+            if m:
+                return int(m.group(1))
     except Exception:
         pass
     return None

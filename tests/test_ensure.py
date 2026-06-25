@@ -666,3 +666,62 @@ async def test_sse_broken_handshake_stops_listener_before_relaunch(monkeypatch):
     assert any(p == 8090 and lbl == "SSE" for p, lbl in stop_calls), (
         f"SSE broken-handshake must call _stop_listener: {stop_calls}"
     )
+
+
+# ── 18. Exact-port matching — no prefix-port false positive (#16 review) ──
+
+
+def test_find_listener_pid_ss_does_not_match_prefix_port(monkeypatch):
+    """The reviewer's exact scenario: querying port 80 must NOT match an ss
+    line for :8080. The old substring check ``f":{port}" in line`` matched
+    ``:8080`` when port==80 and returned pid=123, so _stop_listener could
+    terminate an unrelated process. Exact address parsing fixes it."""
+    from unittest.mock import patch
+
+    ss_output = (
+        "LISTEN 0      4096   127.0.0.1:8080   0.0.0.0:*   "
+        "users:((\"python\",pid=123,fd=5))\n"
+    )
+    with patch.object(ensure_mod.subprocess, "check_output", return_value=ss_output):
+        assert ensure_mod._find_listener_pid_ss(80) is None
+
+
+def test_find_listener_pid_ss_matches_exact_port(monkeypatch):
+    """The exact-port fix still returns the PID when the queried port IS the
+    listening port."""
+    from unittest.mock import patch
+
+    ss_output = (
+        "LISTEN 0      4096   127.0.0.1:8080   0.0.0.0:*   "
+        "users:((\"python\",pid=123,fd=5))\n"
+    )
+    with patch.object(ensure_mod.subprocess, "check_output", return_value=ss_output):
+        assert ensure_mod._find_listener_pid_ss(8080) == 123
+
+
+def test_find_listener_pid_ss_ignores_neighbor_port(monkeypatch):
+    """A listener on 8080 must not satisfy a query for 8090 (and vice versa)."""
+    from unittest.mock import patch
+
+    ss_output = (
+        "LISTEN 0      4096   127.0.0.1:8080   0.0.0.0:*   "
+        "users:((\"python\",pid=123,fd=5))\n"
+    )
+    with patch.object(ensure_mod.subprocess, "check_output", return_value=ss_output):
+        assert ensure_mod._find_listener_pid_ss(8090) is None
+
+
+def test_find_listener_pid_ss_picks_correct_pid_among_many(monkeypatch):
+    """When several listeners are present, the exact port returns its own PID,
+    not a neighbor's."""
+    from unittest.mock import patch
+
+    ss_output = (
+        "LISTEN 0      4096   127.0.0.1:80    0.0.0.0:*   "
+        "users:((\"nginx\",pid=7,fd=6))\n"
+        "LISTEN 0      4096   127.0.0.1:8080  0.0.0.0:*   "
+        "users:((\"python\",pid=123,fd=5))\n"
+    )
+    with patch.object(ensure_mod.subprocess, "check_output", return_value=ss_output):
+        assert ensure_mod._find_listener_pid_ss(80) == 7
+        assert ensure_mod._find_listener_pid_ss(8080) == 123
