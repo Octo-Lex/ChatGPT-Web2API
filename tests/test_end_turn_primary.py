@@ -214,3 +214,58 @@ def test_has_action_js_geometry_accepts_above_message():
     assert "lastRect.top - 180" in src, (
         "geometry gate must accept buttons 180px above message (was top - 8)"
     )
+
+
+# ── 6. has_action must NOT override a live backend that says "not done" ─
+
+
+@pytest.mark.asyncio
+async def test_has_action_does_not_complete_when_backend_says_not_done(monkeypatch):
+    """Regression for the review finding on PR #14: with conv_id available and
+    backend end_turn=False, a widened has_action match (e.g. a prior turn's
+    action row caught by depth-8 / top-180) must NOT complete early. The
+    backend is authoritative when available; DOM is fallback only.
+
+    Setup: conv_id resolves after ~1s (the real new-chat timing), text is
+    present (usable content), has_action goes True on poll 3+ (simulating the
+    widened false-match appearing once the DOM settles), but end_turn stays
+    False. The loop must keep polling until the stall guard raises
+    GenerationStuckError — proving it did NOT break on the stale has_action.
+    """
+    d = _make_driver()
+    _install_virtual_clock(monkeypatch)
+    state = {"phase1": 0, "phase2": 0}
+
+    def phase2(n):
+        text = "Streaming answer."  # usable content present from the start
+        # has_action False early (conv_id window), True from poll 3+ —
+        # simulates a prior turn's button caught by the widened selector once
+        # the DOM settles. By poll 3 the virtual clock has advanced past 1s so
+        # conv_id has resolved and the backend is authoritative.
+        return {
+            "text": text,
+            "md_text": text,
+            "html_len": 60,
+            "child_count": 1,
+            "has_action": n >= 3,
+            "is_thinking": False,
+        }
+
+    d._js_strict = _phase1_then_phase2_js(state, phase2_factory=phase2)
+    d.type_message = AsyncMock()
+    d.click_send = AsyncMock()
+    d._fetch_text = AsyncMock(return_value="")
+    # Backend is reachable but says NOT done — authoritative
+    d._fetch_end_turn = AsyncMock(return_value=False)
+
+    from chatgpt_web2api.cdp_driver import GenerationStuckError
+
+    chunks = []
+    with pytest.raises(GenerationStuckError):
+        async for chunk in d.send_and_stream("hello", timeout=10000):
+            chunks.append(chunk)
+
+    # The loop polled the backend (conv_id resolved after ~1s) and did NOT
+    # break on has_action — it ran until the stall guard fired. Proves the DOM
+    # signal cannot override a live backend.
+    assert d._fetch_end_turn.await_count >= 1, "backend must be consulted once conv_id is available"

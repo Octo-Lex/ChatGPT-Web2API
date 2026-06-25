@@ -20,6 +20,7 @@ from chatgpt_web2api.cdp_driver import (
 
 # ── Helpers ────────────────────────────────────────────────────
 
+
 def _make_driver():
     """A CDPDriver with a mocked websocket (no real connect)."""
     d = CDPDriver(cdp_port=9222)
@@ -32,13 +33,16 @@ def _make_driver():
 def _mock_js_with_payload(d, payload_map):
     """Make d._js_with_data return values based on a lookup of (conv_id/token)
     → response string. For _fetch_text the payload carries conv_id+token."""
+
     async def _fake(js_template, data, timeout=15):
         return payload_map.get(data.get("conv_id"), "")
+
     d._js_with_data_strict = _fake
     return d
 
 
 # ── 1. Auth TTL ────────────────────────────────────────────────
+
 
 @pytest.mark.asyncio
 async def test_ensure_token_refreshes_when_empty():
@@ -69,25 +73,32 @@ async def test_ensure_token_no_refresh_when_fresh():
 
 # ── 2. 15-site guard ───────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_read_methods_call_ensure_token_first():
     """A representative read method (get_models) calls ensure_token before its
     fetch. Verify via mock call-order."""
     d = _make_driver()
     d._refresh_token = AsyncMock()
+
     # _js_with_data returns a models JSON string
     async def _fake(js_template, data, timeout=15):
         return json.dumps({"title": "Models", "models": [{"slug": "auto", "title": "Auto"}]})
+
     d._js_with_data_strict = _fake
     # Patch ensure_token to record the call distinctly
     call_order = []
+
     async def _record_token():
         call_order.append("ensure_token")
         return d._access_token
+
     d.ensure_token = _record_token
+
     async def _rec_js(template, data, timeout=15):
         call_order.append("fetch")
         return json.dumps({"title": "M", "models": [{"slug": "auto", "title": "A"}]})
+
     d._js_with_data_strict = _rec_js
     await d.get_models()
     assert call_order == ["ensure_token", "fetch"], f"order: {call_order}"
@@ -95,11 +106,14 @@ async def test_read_methods_call_ensure_token_first():
 
 # ── 3. _fetch_text 401 raises AuthExpiredError ─────────────────
 
+
 @pytest.mark.asyncio
 async def test_fetch_text_401_raises_auth_expired():
     d = _make_driver()
+
     async def _fake(js_template, data, timeout=15):
         return '{"__status": 401}'
+
     d._js_with_data_strict = _fake
     d.ensure_token = AsyncMock(return_value="tok")
     with pytest.raises(AuthExpiredError):
@@ -110,8 +124,10 @@ async def test_fetch_text_401_raises_auth_expired():
 async def test_fetch_text_404_raises_runtime_error():
     """Non-401 non-OK status surfaces as RuntimeError with the code, not silent ''."""
     d = _make_driver()
+
     async def _fake(js_template, data, timeout=15):
         return '{"__status": 404}'
+
     d._js_with_data_strict = _fake
     d.ensure_token = AsyncMock(return_value="tok")
     with pytest.raises(RuntimeError) as ei:
@@ -122,8 +138,10 @@ async def test_fetch_text_404_raises_runtime_error():
 @pytest.mark.asyncio
 async def test_fetch_text_valid_body_returns_text():
     d = _make_driver()
+
     async def _fake(js_template, data, timeout=15):
         return "the assistant reply text"
+
     d._js_with_data_strict = _fake
     d.ensure_token = AsyncMock(return_value="tok")
     result = await d._fetch_text("conv-1")
@@ -131,6 +149,7 @@ async def test_fetch_text_valid_body_returns_text():
 
 
 # ── 4. Phase-1 stall (node count never changes) ────────────────
+
 
 @pytest.mark.asyncio
 async def test_phase1_stall_raises_generation_stuck(monkeypatch):
@@ -140,21 +159,27 @@ async def test_phase1_stall_raises_generation_stuck(monkeypatch):
     d = _make_driver()
     # Mock time to accelerate the test: advance monotonic fast.
     t = [0.0]
+
     def fake_monotonic():
         return t[0]
+
     monkeypatch.setattr("chatgpt_web2api.cdp_driver.time.monotonic", fake_monotonic)
+
     async def fast_sleep(s):
         t[0] += s  # each sleep advances "time" by the sleep amount
+
     monkeypatch.setattr("chatgpt_web2api.cdp_driver.asyncio.sleep", fast_sleep)
 
     # _js returns: rate-limit scan = harmless text; assistant count = constant 1
     call = {"n": 0}
+
     async def _fake_js(expr, timeout=15):
         call["n"] += 1
         # Count poll is the bare .length expression (no JSON.stringify)
         if "JSON.stringify" not in expr and ".length" in expr:
             return "1"  # constant count, never > initial_count
         return '{"text":"normal page text"}'
+
     d._js_strict = _fake_js
     d.type_message = AsyncMock()
     d.click_send = AsyncMock()
@@ -167,14 +192,17 @@ async def test_phase1_stall_raises_generation_stuck(monkeypatch):
 
 # ── 5. Phase-2 stall (text never changes, Stop present) ────────
 
+
 @pytest.mark.asyncio
 async def test_phase2_stall_raises_generation_stuck(monkeypatch):
     """Phase 2: text unchanging + Stop button present for >stall window → raise."""
     d = _make_driver()
     t = [0.0]
     monkeypatch.setattr("chatgpt_web2api.cdp_driver.time.monotonic", lambda: t[0])
+
     async def fast_sleep(s):
         t[0] += s
+
     monkeypatch.setattr("chatgpt_web2api.cdp_driver.asyncio.sleep", fast_sleep)
 
     # Track call sequence rather than expression-string matching (more robust).
@@ -182,19 +210,23 @@ async def test_phase2_stall_raises_generation_stuck(monkeypatch):
     # ending in `.length` (no JSON.stringify); the Phase-2 poll contains
     # `JSON.stringify`; the rate-limit scan contains `body.innerText`.
     state = {"count_polls": 0, "in_phase2": False}
+
     async def _fake_js(expr, timeout=15):
         if "has_action" in expr:
             # Phase-2 poll: the action button never appears (has_action=False)
             # and the text/html/child signals never change, so last_change_time
             # never resets and the stall detector fires.
             state["in_phase2"] = True
-            return json.dumps({"text": "partial", "html_len": 10, "child_count": 1, "has_action": False})
+            return json.dumps(
+                {"text": "partial", "html_len": 10, "child_count": 1, "has_action": False}
+            )
         if "body.innerText" in expr:
             # Rate-limit scan (Phase 1)
             return json.dumps({"text": "normal page"})
         # Count poll (bare .length expression)
         state["count_polls"] += 1
         return "1" if state["count_polls"] > 1 else "0"
+
     d._js_strict = _fake_js
     d.type_message = AsyncMock()
     d.click_send = AsyncMock()
@@ -208,6 +240,7 @@ async def test_phase2_stall_raises_generation_stuck(monkeypatch):
 
 # ── 6. Cap removal: slow appear succeeds ───────────────────────
 
+
 @pytest.mark.asyncio
 async def test_slow_appear_succeeds_without_cap(monkeypatch):
     """A response whose assistant node appears at t=70s succeeds, PROVIDED there
@@ -218,13 +251,16 @@ async def test_slow_appear_succeeds_without_cap(monkeypatch):
     d = _make_driver()
     t = [0.0]
     monkeypatch.setattr("chatgpt_web2api.cdp_driver.time.monotonic", lambda: t[0])
+
     async def fast_sleep(s):
         t[0] += s
+
     monkeypatch.setattr("chatgpt_web2api.cdp_driver.asyncio.sleep", fast_sleep)
 
     # Count wobbles 0→1→0→1... every ~10 polls so the stall clock keeps
     # resetting, then settles at 2 (>initial) at poll 150 (~75s) to break Phase 1.
     count_polls = {"n": 0}
+
     async def _fake_js(expr, timeout=15):
         if "has_action" in expr:
             return json.dumps({"text": "done", "has_action": True})
@@ -235,6 +271,7 @@ async def test_slow_appear_succeeds_without_cap(monkeypatch):
         if n > 150:
             return "2"  # appear + break at ~75s
         return "1" if (n // 10) % 2 == 0 else "0"  # wobble 0/1 — progress signal
+
     d._js_strict = _fake_js
     d.type_message = AsyncMock()
     d.click_send = AsyncMock()
@@ -249,6 +286,7 @@ async def test_slow_appear_succeeds_without_cap(monkeypatch):
 
 # ── 7. Progressing generation does NOT raise ───────────────────
 
+
 @pytest.mark.asyncio
 async def test_progressing_generation_does_not_raise(monkeypatch):
     """A generation that keeps making progress (text changing) does NOT raise
@@ -257,11 +295,14 @@ async def test_progressing_generation_does_not_raise(monkeypatch):
     d = _make_driver()
     t = [0.0]
     monkeypatch.setattr("chatgpt_web2api.cdp_driver.time.monotonic", lambda: t[0])
+
     async def fast_sleep(s):
         t[0] += s
+
     monkeypatch.setattr("chatgpt_web2api.cdp_driver.asyncio.sleep", fast_sleep)
 
     state = {"phase1_polls": 0, "phase2_polls": 0, "text": ""}
+
     async def _fake_js(expr, timeout=15):
         if "has_action" in expr:
             state["phase2_polls"] += 1
@@ -272,6 +313,7 @@ async def test_progressing_generation_does_not_raise(monkeypatch):
             return json.dumps({"text": "normal"})
         state["phase1_polls"] += 1
         return "1" if state["phase1_polls"] > 1 else "0"
+
     d._js_strict = _fake_js
     d.type_message = AsyncMock()
     d.click_send = AsyncMock()
@@ -284,6 +326,7 @@ async def test_progressing_generation_does_not_raise(monkeypatch):
 
 
 # ── 7b. Thinking-model streaming regression ────────────────────
+
 
 @pytest.mark.asyncio
 async def test_thinking_model_streams_during_answer_phase(monkeypatch):
@@ -303,29 +346,35 @@ async def test_thinking_model_streams_during_answer_phase(monkeypatch):
     d = _make_driver()
     t = [0.0]
     monkeypatch.setattr("chatgpt_web2api.cdp_driver.time.monotonic", lambda: t[0])
+
     async def fast_sleep(s):
         t[0] += s
+
     monkeypatch.setattr("chatgpt_web2api.cdp_driver.asyncio.sleep", fast_sleep)
 
     state = {"phase1": 0, "phase2": 0, "text": ""}
+
     async def _fake_js(expr, timeout=15):
         if "body.innerText" in expr:
             return json.dumps({"text": "normal"})
         if "has_action" in expr:
             state["phase2"] += 1
             state["text"] += "answer chunk. "
-            return json.dumps({
-                "text": "Thinking... " + state["text"],  # innerText w/ reasoning label
-                "md_text": state["text"],                 # clean answer from .markdown
-                "html_len": len(state["text"]) + 20,
-                "child_count": 1,
-                "has_action": state["phase2"] > 5,
-                "is_thinking": True,  # .result-thinking lingers post-reasoning
-            })
+            return json.dumps(
+                {
+                    "text": "Thinking... " + state["text"],  # innerText w/ reasoning label
+                    "md_text": state["text"],  # clean answer from .markdown
+                    "html_len": len(state["text"]) + 20,
+                    "child_count": 1,
+                    "has_action": state["phase2"] > 5,
+                    "is_thinking": True,  # .result-thinking lingers post-reasoning
+                }
+            )
         if ".length" in expr and "querySelectorAll" in expr and "JSON.stringify" not in expr:
             state["phase1"] += 1
             return "1" if state["phase1"] > 1 else "0"
         return ""
+
     d._js_strict = _fake_js
     d.type_message = AsyncMock()
     d.click_send = AsyncMock()
@@ -336,16 +385,13 @@ async def test_thinking_model_streams_during_answer_phase(monkeypatch):
         chunks.append(chunk)
 
     full = "".join(c.delta for c in chunks if c.delta)
-    assert "answer chunk" in full, (
-        f"is_thinking suppressed streaming — no answer deltas: {chunks}"
-    )
-    assert "Thinking" not in full, (
-        f"reasoning UI label leaked as a delta: {full}"
-    )
+    assert "answer chunk" in full, f"is_thinking suppressed streaming — no answer deltas: {chunks}"
+    assert "Thinking" not in full, f"reasoning UI label leaked as a delta: {full}"
     assert chunks[-1].finish_reason == "stop"
 
 
 # ── 8. R4: backend end_turn fallback for completion ────────────
+
 
 @pytest.mark.asyncio
 async def test_phase2_end_turn_fallback_completes_when_dom_action_missing(monkeypatch):
@@ -356,8 +402,10 @@ async def test_phase2_end_turn_fallback_completes_when_dom_action_missing(monkey
     d = _make_driver()
     t = [0.0]
     monkeypatch.setattr("chatgpt_web2api.cdp_driver.time.monotonic", lambda: t[0])
+
     async def fast_sleep(s):
         t[0] += s
+
     monkeypatch.setattr("chatgpt_web2api.cdp_driver.asyncio.sleep", fast_sleep)
     # Pretend we know the conversation id (set during Phase-1 in real flow).
     d._current_conv_id = "conv-fallback-test"
@@ -365,15 +413,18 @@ async def test_phase2_end_turn_fallback_completes_when_dom_action_missing(monkey
 
     end_turn_calls = {"n": 0}
     state = {"count_polls": 0}
+
     async def _fake_js(expr, timeout=15):
         if "has_action" in expr:
             # DOM action button NEVER appears (simulates selector drift).
-            return json.dumps({"text": "the full answer", "html_len": 10,
-                               "child_count": 1, "has_action": False})
+            return json.dumps(
+                {"text": "the full answer", "html_len": 10, "child_count": 1, "has_action": False}
+            )
         if "body.innerText" in expr:
             return json.dumps({"text": "normal page"})
         state["count_polls"] += 1
         return "1" if state["count_polls"] > 1 else "0"
+
     d._js_strict = _fake_js
     d.type_message = AsyncMock()
     d.click_send = AsyncMock()
@@ -381,9 +432,11 @@ async def test_phase2_end_turn_fallback_completes_when_dom_action_missing(monkey
     # Backend says end_turn is true on first check → completes.
     d._fetch_end_turn = AsyncMock(return_value=True)
     end_turn_calls["n"] = 0
+
     async def _counting_end_turn(cid):
         end_turn_calls["n"] += 1
         return True
+
     d._fetch_end_turn = _counting_end_turn
 
     chunks = []
@@ -400,28 +453,35 @@ async def test_phase2_end_turn_fallback_ignored_on_fetch_failure(monkeypatch):
     d = _make_driver()
     t = [0.0]
     monkeypatch.setattr("chatgpt_web2api.cdp_driver.time.monotonic", lambda: t[0])
+
     async def fast_sleep(s):
         t[0] += s
+
     monkeypatch.setattr("chatgpt_web2api.cdp_driver.asyncio.sleep", fast_sleep)
     d._current_conv_id = "conv-x"
     d._access_token = "tok"
 
     state = {"count_polls": 0}
+
     async def _fake_js(expr, timeout=15):
         if "has_action" in expr:
-            return json.dumps({"text": "partial", "html_len": 10,
-                               "child_count": 1, "has_action": False})
+            return json.dumps(
+                {"text": "partial", "html_len": 10, "child_count": 1, "has_action": False}
+            )
         if "body.innerText" in expr:
             return json.dumps({"text": "normal page"})
         state["count_polls"] += 1
         return "1" if state["count_polls"] > 1 else "0"
+
     d._js_strict = _fake_js
     d.type_message = AsyncMock()
     d.click_send = AsyncMock()
     d._fetch_text = AsyncMock(return_value="")
+
     # Backend fetch raises — must be swallowed, not propagated.
     async def _raising_end_turn(cid):
         raise RuntimeError("backend blew up")
+
     d._fetch_end_turn = _raising_end_turn
 
     # Should still raise GenerationStuckError (stall), NOT the backend error.
@@ -439,30 +499,35 @@ async def test_phase2_end_turn_fallback_skipped_when_no_text(monkeypatch):
     d = _make_driver()
     t = [0.0]
     monkeypatch.setattr("chatgpt_web2api.cdp_driver.time.monotonic", lambda: t[0])
+
     async def fast_sleep(s):
         t[0] += s
+
     monkeypatch.setattr("chatgpt_web2api.cdp_driver.asyncio.sleep", fast_sleep)
     d._current_conv_id = "conv-empty"
     d._access_token = "tok"
 
     end_turn_calls = {"n": 0}
     state = {"count_polls": 0}
+
     async def _fake_js(expr, timeout=15):
         if "has_action" in expr:
             # No text streamed (empty answer).
-            return json.dumps({"text": "", "html_len": 0,
-                               "child_count": 0, "has_action": False})
+            return json.dumps({"text": "", "html_len": 0, "child_count": 0, "has_action": False})
         if "body.innerText" in expr:
             return json.dumps({"text": "normal page"})
         state["count_polls"] += 1
         return "1" if state["count_polls"] > 1 else "0"
+
     d._js_strict = _fake_js
     d.type_message = AsyncMock()
     d.click_send = AsyncMock()
     d._fetch_text = AsyncMock(return_value="")
+
     async def _counting_end_turn(cid):
         end_turn_calls["n"] += 1
         return True
+
     d._fetch_end_turn = _counting_end_turn
 
     with pytest.raises(GenerationStuckError):
@@ -473,79 +538,126 @@ async def test_phase2_end_turn_fallback_skipped_when_no_text(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_phase2_dom_action_wins_over_backend(monkeypatch):
-    """R4: the DOM action button is the PRIMARY signal. When has_action is true,
-    the backend end_turn check is never consulted (no unnecessary fetch)."""
+async def test_phase2_backend_end_turn_is_primary_over_dom(monkeypatch):
+    """R4 (updated for #12): backend end_turn is the PRIMARY signal. When
+    conv_id is available, the backend is consulted first; has_action is a
+    fallback only when conv_id is unavailable or the backend fetch failed.
+    With conv_id set and end_turn=True, completion fires via the backend
+    even if has_action is also true."""
     d = _make_driver()
     t = [0.0]
     monkeypatch.setattr("chatgpt_web2api.cdp_driver.time.monotonic", lambda: t[0])
+
     async def fast_sleep(s):
         t[0] += s
+
     monkeypatch.setattr("chatgpt_web2api.cdp_driver.asyncio.sleep", fast_sleep)
     d._current_conv_id = "conv-dom"
     d._access_token = "tok"
 
     end_turn_calls = {"n": 0}
     state = {"count_polls": 0}
+
     async def _fake_js(expr, timeout=15):
         if "has_action" in expr:
-            return json.dumps({"text": "answer", "html_len": 10,
-                               "child_count": 1, "has_action": True})
+            return json.dumps(
+                {
+                    "text": "answer",
+                    "md_text": "answer",
+                    "html_len": 10,
+                    "child_count": 1,
+                    "has_action": True,
+                    "is_thinking": False,
+                }
+            )
         if "body.innerText" in expr:
             return json.dumps({"text": "normal page"})
         state["count_polls"] += 1
         return "1" if state["count_polls"] > 1 else "0"
+
     d._js_strict = _fake_js
     d.type_message = AsyncMock()
     d.click_send = AsyncMock()
     d._fetch_text = AsyncMock(return_value="answer")
+
     async def _counting_end_turn(cid):
         end_turn_calls["n"] += 1
         return True
+
     d._fetch_end_turn = _counting_end_turn
 
     async for _ in d.send_and_stream("hi", timeout=10000):
         pass
-    # DOM signal fired first → backend never consulted.
-    assert end_turn_calls["n"] == 0
+    # Backend is PRIMARY now — it was consulted (conv_id was available).
+    assert end_turn_calls["n"] >= 1
 
 
 # ── 9. Thinking-stall fix: is_thinking as progress + fallback unlock ──
+
 
 @pytest.mark.asyncio
 async def test_thinking_placeholder_does_not_stall_past_90s(monkeypatch):
     """A static 'Thinking...' placeholder for >90s of simulated polls must NOT
     raise GenerationStuckError. is_thinking resets the stall clock — reasoning
     is active generation, not a stall. This is the root fix for the bug that
-    broke long reasoning responses."""
+    broke long reasoning responses.
+
+    Updated for #12: with conv_id available, backend end_turn is primary. The
+    test models a reasoning phase followed by backend confirmation (end_turn
+    flips True after the thinking settles), which is how completion now works."""
     d = _make_driver()
     t = [0.0]
     monkeypatch.setattr("chatgpt_web2api.cdp_driver.time.monotonic", lambda: t[0])
+
     async def fast_sleep(s):
         t[0] += s
+
     monkeypatch.setattr("chatgpt_web2api.cdp_driver.asyncio.sleep", fast_sleep)
     d._current_conv_id = "conv-think"
     d._access_token = "tok"
 
-    state = {"count_polls": 0, "phase2_polls": 0}
+    state = {"count_polls": 0, "phase2_polls": 0, "end_turn_calls": 0}
+
     async def _fake_js(expr, timeout=15):
         if "has_action" in expr:
             state["phase2_polls"] += 1
             if state["phase2_polls"] > 10:
-                return json.dumps({"text": "the answer", "md_text": "the answer",
-                                   "html_len": 10, "child_count": 1,
-                                   "has_action": True, "is_thinking": False})
-            return json.dumps({"text": "", "md_text": "", "html_len": 0,
-                               "child_count": 0, "has_action": False, "is_thinking": True})
+                return json.dumps(
+                    {
+                        "text": "the answer",
+                        "md_text": "the answer",
+                        "html_len": 10,
+                        "child_count": 1,
+                        "has_action": True,
+                        "is_thinking": False,
+                    }
+                )
+            return json.dumps(
+                {
+                    "text": "",
+                    "md_text": "",
+                    "html_len": 0,
+                    "child_count": 0,
+                    "has_action": False,
+                    "is_thinking": True,
+                }
+            )
         if "body.innerText" in expr:
             return json.dumps({"text": "normal page"})
         state["count_polls"] += 1
         return "1" if state["count_polls"] > 1 else "0"
+
     d._js_strict = _fake_js
     d.type_message = AsyncMock()
     d.click_send = AsyncMock()
     d._fetch_text = AsyncMock(return_value="the answer")
-    d._fetch_end_turn = AsyncMock(return_value=False)
+
+    # Backend says not-done during thinking, then done once the answer appears.
+    async def _end_turn(cid):
+        state["end_turn_calls"] += 1
+        return state["phase2_polls"] > 10
+
+    d._fetch_end_turn = _end_turn
 
     chunks = []
     async for chunk in d.send_and_stream("think hard", timeout=10000):
@@ -560,21 +672,33 @@ async def test_saw_thinking_unlocks_fallback_but_empty_end_turn_does_not_finish(
     d = _make_driver()
     t = [0.0]
     monkeypatch.setattr("chatgpt_web2api.cdp_driver.time.monotonic", lambda: t[0])
+
     async def fast_sleep(s):
         t[0] += s
+
     monkeypatch.setattr("chatgpt_web2api.cdp_driver.asyncio.sleep", fast_sleep)
     d._current_conv_id = "conv-empty-think"
     d._access_token = "tok"
 
     state = {"count_polls": 0}
+
     async def _fake_js(expr, timeout=15):
         if "has_action" in expr:
-            return json.dumps({"text": "", "md_text": "", "html_len": 0,
-                               "child_count": 0, "has_action": False, "is_thinking": True})
+            return json.dumps(
+                {
+                    "text": "",
+                    "md_text": "",
+                    "html_len": 0,
+                    "child_count": 0,
+                    "has_action": False,
+                    "is_thinking": True,
+                }
+            )
         if "body.innerText" in expr:
             return json.dumps({"text": "normal page"})
         state["count_polls"] += 1
         return "1" if state["count_polls"] > 1 else "0"
+
     d._js_strict = _fake_js
     d.type_message = AsyncMock()
     d.click_send = AsyncMock()
@@ -588,8 +712,9 @@ async def test_saw_thinking_unlocks_fallback_but_empty_end_turn_does_not_finish(
     chunks = []
     async for chunk in d.send_and_stream("think", timeout=5):
         chunks.append(chunk)
-    assert not any(c.delta for c in chunks), \
+    assert not any(c.delta for c in chunks), (
         "fallback must not complete an empty answer even with end_turn=true"
+    )
 
 
 @pytest.mark.asyncio
@@ -599,22 +724,33 @@ async def test_saw_thinking_with_end_turn_and_content_finishes(monkeypatch):
     d = _make_driver()
     t = [0.0]
     monkeypatch.setattr("chatgpt_web2api.cdp_driver.time.monotonic", lambda: t[0])
+
     async def fast_sleep(s):
         t[0] += s
+
     monkeypatch.setattr("chatgpt_web2api.cdp_driver.asyncio.sleep", fast_sleep)
     d._current_conv_id = "conv-rescue"
     d._access_token = "tok"
 
     state = {"count_polls": 0}
+
     async def _fake_js(expr, timeout=15):
         if "has_action" in expr:
-            return json.dumps({"text": "the full answer", "md_text": "the full answer",
-                               "html_len": 10, "child_count": 1,
-                               "has_action": False, "is_thinking": False})
+            return json.dumps(
+                {
+                    "text": "the full answer",
+                    "md_text": "the full answer",
+                    "html_len": 10,
+                    "child_count": 1,
+                    "has_action": False,
+                    "is_thinking": False,
+                }
+            )
         if "body.innerText" in expr:
             return json.dumps({"text": "normal page"})
         state["count_polls"] += 1
         return "1" if state["count_polls"] > 1 else "0"
+
     d._js_strict = _fake_js
     d.type_message = AsyncMock()
     d.click_send = AsyncMock()
@@ -628,6 +764,7 @@ async def test_saw_thinking_with_end_turn_and_content_finishes(monkeypatch):
 
 
 # ── 10. MCP mapping ─────────────────────────────────────────────
+
 
 @pytest.mark.asyncio
 async def test_mcp_auth_expired_returns_error_result():
@@ -643,10 +780,12 @@ async def test_mcp_auth_expired_returns_error_result():
     drv.is_connected = True
     drv.select_model = AsyncMock(return_value=True)
     drv.navigate_new_chat = AsyncMock()
+
     # send_and_stream must be an async GENERATOR that raises on iteration.
     async def _raising_stream(text, timeout=120):
         raise AuthExpiredError()
         yield  # unreachable, makes this a generator
+
     drv.send_and_stream = _raising_stream
 
     with pytest.raises(AuthExpiredError):
@@ -655,10 +794,12 @@ async def test_mcp_auth_expired_returns_error_result():
 
 # ── 9. HTTP mapping ────────────────────────────────────────────
 
+
 def test_http_error_response_auth_expired_is_401():
     from unittest.mock import MagicMock
 
     from chatgpt_web2api.api_server import APIServer
+
     srv = APIServer.__new__(APIServer)  # bypass __init__
     srv._driver = MagicMock()
     resp = srv._error_response(AuthExpiredError())
@@ -669,6 +810,7 @@ def test_http_error_response_generation_stuck_is_504():
     from unittest.mock import MagicMock
 
     from chatgpt_web2api.api_server import APIServer
+
     srv = APIServer.__new__(APIServer)
     srv._driver = MagicMock()
     resp = srv._error_response(GenerationStuckError("phase_2_stream", 47.3))

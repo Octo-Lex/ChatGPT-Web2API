@@ -1892,11 +1892,12 @@ class CDPDriver:
             # OR have seen a thinking phase — a long reasoning response has empty
             # last_dom_text during thinking, but the backend reports end_turn once
             # the model finishes. Completion stays strict (end_turn AND usable
-            # content) so this can't complete an empty answer. Fetch failures
-            # fall through to the DOM fallback below.
+            # content) so this can't complete an empty answer. Fetch failures set
+            # backend_fetch_failed so the DOM fallback below is unlocked this poll.
+            backend_fetch_failed = False
             if (
                 conv_id_for_check
-                and (last_dom_text or saw_thinking or is_thinking)
+                and (last_dom_text or saw_thinking or is_thinking or had_non_text_content)
                 and time.monotonic() - last_backend_check > 3.0
             ):
                 last_backend_check = time.monotonic()
@@ -1917,13 +1918,24 @@ class CDPDriver:
                             conv_id_for_check,
                         )
                 except Exception as e:
+                    backend_fetch_failed = True
                     logger.debug("end_turn fetch failed (ignored): %s", e)
 
-            # FALLBACK: DOM action button (has_action). Used when conv_id is
-            # unavailable or the backend fetch failed. ChatGPT renders the
-            # copy/feedback row only on a finished turn. See the JS block above
-            # for the depth-8 / widened-geometry selector rationale.
-            if has_action:
+            # FALLBACK: DOM action button (has_action). Used ONLY when the primary
+            # backend signal can't run: conv_id is unavailable (before the URL
+            # resolves) OR the backend fetch just failed this poll. When the
+            # backend IS available it is authoritative — a widened has_action
+            # match (depth 8, top-180) can hit a PRIOR turn's action row, so DOM
+            # must not override a live backend that says "not done yet" or that
+            # hasn't been consulted yet due to throttle. Also requires usable
+            # content (same strict guard as the primary) so it can't complete an
+            # empty answer off a stale button.
+            if (
+                has_action
+                and (not conv_id_for_check or backend_fetch_failed)
+                and (last_dom_text or had_non_text_content)
+            ):
+                logger.info("DOM has_action (fallback completion) — no backend signal")
                 break
 
             if time.monotonic() - last_change_time > PHASE_STALL_SECONDS:
