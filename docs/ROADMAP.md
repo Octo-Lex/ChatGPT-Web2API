@@ -138,7 +138,13 @@ into the `__main__.py` subcommand dispatch. Point-in-time reconcile: checks
 REST + SSE, starts whichever is missing, verifies SSE via real MCP handshake,
 exits 0 when ready. Lock-protected (SSE-port-keyed startup lock, bounded
 contention). Degraded-REST policy honored (20s poll before restart). No
-watchdog loop. 15 unit tests in `tests/test_ensure.py`.
+watchdog loop. 30 unit tests in `tests/test_ensure.py`.
+
+Restart hardening (#16): Unix listener discovery uses a `lsof` → `ss` → `fuser`
+fallback chain (no single-tool dependency); `_stop_listener` returns False (and
+logs an error) when a port is occupied but no PID can be found, so the caller
+aborts the restart instead of launching into an occupied port. SSE
+handshake-failed path stops the existing listener before relaunch.
 
 ### Command
 
@@ -153,7 +159,9 @@ dispatch in `__main__.py`.
 
 1. Check REST `/health`.
 2. Reconcile REST per the **degraded-REST policy** below.
-3. Wait until REST is healthy.
+3. Wait until REST is ready (`healthy`, or `starting` + Chrome/CDP/driver
+   all connected — a cold bootstrap that hasn't served a chat yet is ready
+   enough for SSE to attach).
 4. Check MCP/SSE on `:8090`.
 5. If missing, start MCP/SSE.
 6. Verify MCP/SSE: initialize succeeds + list tools succeeds.

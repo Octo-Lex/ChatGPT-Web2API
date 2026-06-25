@@ -65,8 +65,8 @@ def _patch_sse_verify(monkeypatch, result):
 
 
 def _patch_listener_stop(monkeypatch):
-    """Patch _find_listener_pid + _terminate_pid so restart tests don't call
-    real netstat/taskkill. Returns a dict tracking calls."""
+    """Patch _stop_listener + _find_listener_pid + _terminate_pid so restart
+    tests don't call real netstat/taskkill. Returns a dict tracking calls."""
     calls = {"find": 0, "terminate": 0, "stopped_ports": []}
 
     def fake_find(port):
@@ -76,12 +76,13 @@ def _patch_listener_stop(monkeypatch):
     def fake_terminate(pid):
         calls["terminate"] += 1
 
-    async def fake_stop(port):
+    async def fake_stop(port, label="REST"):
         calls["stopped_ports"].append(port)
+        return True  # success
 
     monkeypatch.setattr(ensure_mod, "_find_listener_pid", fake_find)
     monkeypatch.setattr(ensure_mod, "_terminate_pid", fake_terminate)
-    monkeypatch.setattr(ensure_mod, "_stop_rest_listener", fake_stop)
+    monkeypatch.setattr(ensure_mod, "_stop_listener", fake_stop)
     return calls
 
 
@@ -481,7 +482,7 @@ async def test_ensure_accepts_starting_connected_as_ready(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_restart_calls_stop_listener_before_launch(monkeypatch):
-    """The broken/degraded-timeout restart path must call _stop_rest_listener
+    """The broken/degraded-timeout restart path must call _stop_listener
     BEFORE _launch_detached — a bare launch on an occupied port fails to bind.
     This is covered in test_broken_restarts_rest and test_degraded_waits_then_restarts
     above; this is a focused unit test on _restart_rest itself."""
@@ -489,7 +490,7 @@ async def test_restart_calls_stop_listener_before_launch(monkeypatch):
     monkeypatch.setattr(ensure_mod, "_rest_health", lambda *a, **kw: {"status": "healthy"})
 
     stop_order = []
-    monkeypatch.setattr(ensure_mod, "_stop_rest_listener", _make_async_recorder(stop_order, "stop"))
+    monkeypatch.setattr(ensure_mod, "_stop_listener", _make_async_recorder(stop_order, "stop"))
     monkeypatch.setattr(ensure_mod, "_launch_detached", _make_recorder(stop_order, "launch"))
     monkeypatch.setattr(ensure_mod, "_wait_rest_ready", _make_async_recorder(stop_order, "wait"))
 
@@ -512,3 +513,156 @@ def _make_async_recorder(lst, tag):
         return True
 
     return _record
+
+
+# ── 15. Unix listener discovery fallback (issue #16) ───────────────────
+
+
+def test_find_listener_pid_uses_netstat_on_windows(monkeypatch):
+    """On Windows, _find_listener_pid uses netstat (not the Unix chain)."""
+    from unittest.mock import patch
+
+    with (
+        patch.object(ensure_mod.sys, "platform", "win32"),
+        patch.object(ensure_mod, "_find_listener_pid_netstat", return_value=999) as netstat_mock,
+        patch.object(ensure_mod, "_find_listener_pid_lsof", return_value=111) as lsof_mock,
+    ):
+        assert ensure_mod._find_listener_pid(8080) == 999
+        netstat_mock.assert_called_once_with(8080)
+        lsof_mock.assert_not_called()
+
+
+def test_find_listener_pid_unix_lsof_found(monkeypatch):
+    """On Unix, when lsof succeeds, its PID is returned (no fallback needed)."""
+    from unittest.mock import patch
+
+    with (
+        patch.object(ensure_mod.sys, "platform", "linux"),
+        patch.object(ensure_mod, "_find_listener_pid_lsof", return_value=111),
+        patch.object(ensure_mod, "_find_listener_pid_ss", return_value=222) as ss_mock,
+    ):
+        assert ensure_mod._find_listener_pid(8080) == 111
+        ss_mock.assert_not_called()
+
+
+def test_find_listener_pid_unix_falls_back_to_ss():
+    """When lsof returns None (absent/fails), ss is tried."""
+    from unittest.mock import patch
+
+    with (
+        patch.object(ensure_mod.sys, "platform", "linux"),
+        patch.object(ensure_mod, "_find_listener_pid_lsof", return_value=None),
+        patch.object(ensure_mod, "_find_listener_pid_ss", return_value=222),
+    ):
+        assert ensure_mod._find_listener_pid(8080) == 222
+
+
+def test_find_listener_pid_unix_falls_back_to_fuser():
+    """When lsof and ss both fail, fuser is tried."""
+    from unittest.mock import patch
+
+    with (
+        patch.object(ensure_mod.sys, "platform", "linux"),
+        patch.object(ensure_mod, "_find_listener_pid_lsof", return_value=None),
+        patch.object(ensure_mod, "_find_listener_pid_ss", return_value=None),
+        patch.object(ensure_mod, "_find_listener_pid_fuser", return_value=333),
+    ):
+        assert ensure_mod._find_listener_pid(8080) == 333
+
+
+def test_find_listener_pid_unix_all_fail_returns_none():
+    """When all three Unix tools fail/are absent, returns None (not an error)."""
+    from unittest.mock import patch
+
+    with (
+        patch.object(ensure_mod.sys, "platform", "linux"),
+        patch.object(ensure_mod, "_find_listener_pid_lsof", return_value=None),
+        patch.object(ensure_mod, "_find_listener_pid_ss", return_value=None),
+        patch.object(ensure_mod, "_find_listener_pid_fuser", return_value=None),
+    ):
+        assert ensure_mod._find_listener_pid(8080) is None
+
+
+# ── 16. Occupied port but no PID → _stop_listener returns False (issue #16)
+
+
+@pytest.mark.asyncio
+async def test_stop_listener_returns_false_when_port_occupied_but_no_pid(monkeypatch):
+    """The dangerous case: port is occupied (accepts connections) but no PID can
+    be found (tools missing). _stop_listener must return False so the caller
+    does NOT relaunch into the occupied port."""
+    monkeypatch.setattr(ensure_mod, "_find_listener_pid", lambda port: None)
+    monkeypatch.setattr(ensure_mod, "_port_accepts", lambda port: True)  # occupied
+
+    result = await ensure_mod._stop_listener(8080, "REST")
+    assert result is False, "must return False when occupied but no PID found"
+
+
+@pytest.mark.asyncio
+async def test_stop_listener_returns_true_when_port_free(monkeypatch):
+    """Nothing listening → _stop_listener returns True (safe to launch)."""
+    monkeypatch.setattr(ensure_mod, "_find_listener_pid", lambda port: None)
+    monkeypatch.setattr(ensure_mod, "_port_accepts", lambda port: False)  # free
+
+    result = await ensure_mod._stop_listener(8080, "REST")
+    assert result is True
+
+
+@pytest.mark.asyncio
+async def test_restart_rest_aborts_when_listener_cannot_be_stopped(monkeypatch):
+    """If _stop_listener returns False (can't stop), _restart_rest must NOT
+    launch — returns False (the launch would fail to bind)."""
+    _install_virtual_clock(monkeypatch)
+    monkeypatch.setattr(ensure_mod, "_rest_health", lambda *a, **kw: {"status": "healthy"})
+    launches = _patch_launch(monkeypatch)
+
+    async def stop_fails(port, label="REST"):
+        return False  # can't stop
+
+    monkeypatch.setattr(ensure_mod, "_stop_listener", stop_fails)
+
+    result = await ensure_mod._restart_rest(8080, 9222, None, None)
+    assert result is False
+    assert launches == [], "must NOT launch when listener can't be stopped"
+
+
+# ── 17. SSE broken-handshake stops listener before relaunch (issue #16) ─
+
+
+@pytest.mark.asyncio
+async def test_sse_broken_handshake_stops_listener_before_relaunch(monkeypatch):
+    """TCP-up + handshake-failed → _stop_listener called on the SSE port
+    before launching a new SSE. The old behavior launched without stopping,
+    causing a bind failure."""
+    _install_virtual_clock(monkeypatch)
+    _patch_health(monkeypatch, [{"status": "healthy"}])
+    # TCP up, handshake fails, then TCP up + handshake succeeds after relaunch
+    _patch_sse_tcp(monkeypatch, [True, False, True])
+    _patch_sse_verify(monkeypatch, False)  # first handshake fails
+    # But we need the second verify to succeed — use a sequence
+    verify_results = [False, True]
+
+    async def seq_verify(sse_port):
+        return verify_results.pop(0) if verify_results else True
+
+    monkeypatch.setattr(ensure_mod, "_sse_verify", seq_verify)
+    launches = _patch_launch(monkeypatch)
+    _patch_lock(monkeypatch)
+
+    stop_calls = []
+
+    # First TCP check returns True (port up), _stop_listener must be called.
+    # After stop, TCP goes False, then after launch TCP goes True.
+    async def fake_stop(port, label="REST"):
+        stop_calls.append((port, label))
+        return True
+
+    monkeypatch.setattr(ensure_mod, "_stop_listener", fake_stop)
+
+    code = await run_ensure(rest_port=8080, sse_port=8090)
+    assert code == 0
+    assert len(launches) == 1  # SSE was launched
+    # _stop_listener was called on the SSE port
+    assert any(p == 8090 and lbl == "SSE" for p, lbl in stop_calls), (
+        f"SSE broken-handshake must call _stop_listener: {stop_calls}"
+    )

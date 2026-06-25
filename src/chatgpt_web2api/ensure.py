@@ -225,27 +225,77 @@ def _launch_detached(cmd: list[str]) -> subprocess.Popen:
 
 def _find_listener_pid(port: int) -> int | None:
     """Find the PID listening on the given TCP port (loopback). Returns None
-    if nothing is listening or the lookup fails."""
+    if nothing is listening or the lookup fails.
+
+    Windows: ``netstat -ano`` (ubiquitous). Unix: a fallback chain of
+    ``lsof`` → ``ss`` → ``fuser`` — no single tool is guaranteed on every
+    distro/container, so we try each in turn. Returns the first PID found.
+    """
+    if sys.platform == "win32":
+        return _find_listener_pid_netstat(port)
+    for finder in (_find_listener_pid_lsof, _find_listener_pid_ss, _find_listener_pid_fuser):
+        pid = finder(port)
+        if pid is not None:
+            return pid
+    return None
+
+
+def _find_listener_pid_netstat(port: int) -> int | None:
     try:
-        if sys.platform == "win32":
-            # netstat -ano: last column is the PID for LISTENING rows
-            out = subprocess.check_output(
-                ["netstat", "-ano"], text=True, stderr=subprocess.DEVNULL, timeout=5
-            )
-            for line in out.splitlines():
-                parts = line.split()
-                if len(parts) >= 5 and "LISTENING" in line:
-                    if parts[1].endswith(f":{port}"):
-                        return int(parts[-1])
-        else:
-            # lsof -ti :<port> returns the PID(s) of listeners
-            out = subprocess.check_output(
-                ["lsof", "-ti", f":{port}"], text=True, stderr=subprocess.DEVNULL, timeout=5
-            ).strip()
-            if out:
-                return int(out.splitlines()[0])
+        out = subprocess.check_output(
+            ["netstat", "-ano"], text=True, stderr=subprocess.DEVNULL, timeout=5
+        )
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 5 and "LISTENING" in line and parts[1].endswith(f":{port}"):
+                return int(parts[-1])
     except Exception:
-        return None
+        pass
+    return None
+
+
+def _find_listener_pid_lsof(port: int) -> int | None:
+    try:
+        out = subprocess.check_output(
+            ["lsof", "-ti", f":{port}"], text=True, stderr=subprocess.DEVNULL, timeout=5
+        ).strip()
+        if out:
+            return int(out.splitlines()[0])
+    except Exception:
+        pass
+    return None
+
+
+def _find_listener_pid_ss(port: int) -> int | None:
+    """``ss -tlnp`` — standard on modern Linux (iproute2). Parse the pid= from
+    the users: column."""
+    try:
+        out = subprocess.check_output(
+            ["ss", "-tlnp"], text=True, stderr=subprocess.DEVNULL, timeout=5
+        )
+        for line in out.splitlines():
+            if f":{port}" in line and "pid=" in line:
+                # Extract pid=NNN from the users:(("proc",pid=NNN,...)) column
+                import re as _re
+
+                m = _re.search(r"pid=(\d+)", line)
+                if m:
+                    return int(m.group(1))
+    except Exception:
+        pass
+    return None
+
+
+def _find_listener_pid_fuser(port: int) -> int | None:
+    """``fuser <port>/tcp`` — older Linux fallback (psmisc)."""
+    try:
+        out = subprocess.check_output(
+            ["fuser", f"{port}/tcp"], text=True, stderr=subprocess.DEVNULL, timeout=5
+        ).strip()
+        if out:
+            return int(out.split()[0])
+    except Exception:
+        pass
     return None
 
 
@@ -271,25 +321,50 @@ def _terminate_pid(pid: int) -> None:
         logger.debug("terminate pid %s failed: %s", pid, e)
 
 
-async def _stop_rest_listener(rest_port: int) -> None:
-    """Stop whatever process is listening on the REST port, then wait for the
+async def _stop_listener(port: int, label: str) -> bool:
+    """Stop whatever process is listening on the given port, then wait for the
     port to free. A bare ``_launch_detached`` on an occupied port fails to bind
-    (stderr is discarded), so a restart must stop the existing listener first."""
-    pid = _find_listener_pid(rest_port)
+    (stderr is discarded), so a restart must stop the existing listener first.
+
+    Returns True if the port is free (either nothing was listening, or the
+    listener was stopped). Returns False if the port is still occupied but no
+    PID could be found to terminate — caller should NOT relaunch in that case
+    (the new process would fail to bind with no diagnostic)."""
+    pid = _find_listener_pid(port)
     if pid is None:
-        return
-    logger.info("Stopping existing REST listener (pid %s) on :%d", pid, rest_port)
+        # Check if the port is actually free (nothing listening) vs occupied
+        # but no PID discoverable (tools missing) — the dangerous case.
+        if _port_accepts(port):
+            logger.error(
+                "Port :%d (%s) is occupied but no listener PID could be found "
+                "(lsof/ss/fuser/netstat all failed or absent). Cannot safely "
+                "restart — the new process would fail to bind. Aborting restart.",
+                port,
+                label,
+            )
+            return False
+        return True  # port is genuinely free
+
+    logger.info("Stopping existing %s listener (pid %s) on :%d", label, pid, port)
     await asyncio.to_thread(_terminate_pid, pid)
     # Wait for the port to free (bind would fail if still occupied)
     for _ in range(20):
-        try:
-            with socket.socket() as s:
-                s.settimeout(0.5)
-                s.connect(("127.0.0.1", rest_port))
-            # still accepting connections — wait
-        except OSError:
-            break  # port closed — ready
+        if not _port_accepts(port):
+            return True  # port closed — ready
         await asyncio.sleep(0.5)
+    logger.error("%s listener (pid %s) did not release :%d after 10s", label, pid, port)
+    return False
+
+
+def _port_accepts(port: int) -> bool:
+    """Does anything accept a TCP connection on this loopback port?"""
+    try:
+        with socket.socket() as s:
+            s.settimeout(0.5)
+            s.connect(("127.0.0.1", port))
+        return True
+    except OSError:
+        return False
 
 
 async def _restart_rest(
@@ -297,8 +372,10 @@ async def _restart_rest(
 ) -> bool:
     """Stop the existing REST listener, then launch a fresh one. Used for
     ``broken`` and degraded-after-timeout — not for ``missing`` (no listener
-    to stop)."""
-    await _stop_rest_listener(rest_port)
+    to stop). Returns False if the listener couldn't be stopped (port still
+    occupied) — in that case do NOT relaunch (bind would fail silently)."""
+    if not await _stop_listener(rest_port, "REST"):
+        return False
     _launch_detached(_build_rest_cmd(rest_port, cdp_port, config_path, log_level))
     return await _wait_rest_ready(rest_port, _REST_HEALTHY_TIMEOUT)
 
@@ -357,15 +434,23 @@ async def _reconcile_rest(
 async def _reconcile_sse(
     sse_port: int, cdp_port: int, config_path: str | None, log_level: str | None
 ) -> bool:
-    """Start SSE if missing, then verify via real MCP handshake."""
+    """Start SSE if missing, then verify via real MCP handshake. If the port is
+    up but the handshake fails (broken/hung SSE), stop the existing listener
+    before relaunching — a bare launch on the occupied port would fail to bind."""
     if _sse_tcp_up(sse_port):
         ready = await _sse_verify(sse_port)
         if ready:
             logger.info("SSE ready on :%d", sse_port)
             return True
-        logger.info("SSE port up but handshake failed — treating as not ready")
+        # Port is up but handshake failed — stop the broken listener first.
+        # If _stop_listener can't confirm termination (tools missing), abort:
+        # a relaunch would fail to bind with no diagnostic.
+        logger.info("SSE port up but handshake failed — stopping broken listener")
+        if not await _stop_listener(sse_port, "SSE"):
+            logger.error("Could not stop broken SSE listener on :%d — aborting", sse_port)
+            return False
 
-    logger.info("SSE missing — starting")
+    logger.info("SSE starting")
     _launch_detached(_build_sse_cmd(sse_port, cdp_port, config_path, log_level))
 
     # Wait for TCP, then verify handshake.
