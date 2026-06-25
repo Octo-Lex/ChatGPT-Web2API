@@ -177,7 +177,44 @@ the project captures deterministic evidence; the fix is human-applied.
 
 ### 🤖 MCP Server (16 Tools for AI Agents)
 
-Expose ChatGPT to Claude Desktop, Cursor, Craft Agent, or any MCP client:
+Expose ChatGPT to Claude Desktop, Cursor, Craft Agent, or any MCP client. Two
+transports are supported — **SSE is recommended** for persistent clients like
+ZCode; stdio is kept as a compatibility/dev mode.
+
+#### Recommended: SSE transport (one persistent server)
+
+SSE is recommended for ZCode because one long-lived MCP server can serve many
+client sessions without spawning a new MCP process or Chrome tab per session.
+Start the SSE server once, then point any number of clients at it.
+
+Start it (in a dedicated terminal — Chrome must already be running with an
+authenticated session, i.e. `chatgpt-web2api` started first):
+
+```bash
+chatgpt-web2api-mcp --transport sse --port 8090
+```
+
+Then add the client config:
+
+```json
+{
+  "mcpServers": {
+    "chatgpt-web2api-sse": {
+      "type": "sse",
+      "url": "http://localhost:8090/sse"
+    }
+  }
+}
+```
+
+Every client session that attaches to that URL shares the single MCP server
+and its Chrome connection — there is no per-session process or tab growth.
+
+#### Alternative: stdio transport (per-session, dev/debug)
+
+Stdio spawns one MCP child process per client session, so it is not
+recommended for many concurrent ZCode sessions. It is useful for single-client
+setups, local development, and debugging (logs go straight to stderr):
 
 ```json
 {
@@ -242,8 +279,9 @@ Gated tools are **hidden** from `list_tools` *and* **refused at call time** — 
 # Terminal 1: Start Chrome + API
 chatgpt-web2api
 
-# Terminal 2: MCP server (for AI agents)
-chatgpt-web2api-mcp
+# Terminal 2: MCP server (SSE recommended for ZCode; stdio also supported)
+chatgpt-web2api-mcp --transport sse --port 8090
+# or: chatgpt-web2api-mcp             # stdio (one MCP child per client)
 
 # Terminal 3: Any OpenAI SDK, curl, or HTTP client
 curl http://localhost:8080/v1/chat/completions ...

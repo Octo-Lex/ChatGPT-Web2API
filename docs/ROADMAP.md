@@ -79,30 +79,24 @@ may move the code, but Phase 1 makes failures visible first.
 
 ---
 
-## Phase 2 — Make SSE the recommended ZCode transport
+## Phase 2 — Make SSE the recommended ZCode transport  ✅ DONE
 
 **Goal:** replace stdio-per-session as the recommended mode. Eliminate the
 process multiplier (N ZCode sessions × stdio = N MCP children × N tabs).
 
-### Deliverables
+### Deliverables — all shipped
 
-1. **Document SSE config** (recommended):
-   ```json
-   {
-     "chatgpt-web2api-sse": {
-       "type": "sse",
-       "url": "http://localhost:8090/sse"
-     }
-   }
-   ```
-2. **Document stdio** as compatibility / dev-debug mode only. Not recommended
-   for many concurrent ZCode sessions.
-3. **Integration tests** for SSE:
+1. ✅ **Document SSE config** (recommended) — README now presents SSE first
+   with the `chatgpt-web2api-sse` snippet and launch command.
+2. ✅ **Document stdio** as compatibility / dev-debug mode only — README
+   repositions stdio under "Alternative," noting one MCP child per session.
+3. ✅ **Integration tests** for SSE (`tests/test_e2e_sse.py`, e2e-gated) —
+   real `sse_client` + uvicorn over a non-8090 port:
    - initialize handshake
    - list tools
    - list models
-   - one chat call
-   - repeated fresh connections (proves no tab/process growth)
+   - one chat call (also the live regression for the #10/#11 deadlock)
+   - repeated fresh connections (asserts no per-connection CDP target growth)
 
 ### Reframed constraint
 
@@ -116,24 +110,22 @@ Recommended ZCode mode is SSE-only:
 The vague "detect many stdio processes and warn" item is **dropped from v1** —
 under-specified, cross-cutting. Optional later.
 
-### Known follow-up (discovered during Phase 0 verification, 2026-06-25)
+### Known follow-up — ✅ RESOLVED (was discovered Phase 0, 2026-06-25)
 
 ```text
 MCP/SSE chat_completion can complete server-side but timeout client-side on
 response delivery. Short SSE tools work.
 ```
 
-Reproduction: `initialize` OK, `tools/list` OK (9 tools), `list_models` OK
-(1034 bytes returned). But `chat_completion` over SSE times out client-side
-at 120s — while the send *did* reach Chrome and the reply appeared in the
-account (conversation titled with the requested marker string). The REST
-chat path returned the same kind of generation in ~2s.
+**Resolved by #11** (fix `70f014a`): root cause was a completion-detection
+deadlock — on a new chat, `conv_id_for_check` was empty for the whole poll
+loop, disabling the backend `end_turn` fallback. With the DOM action-button
+selector drifted (3rd time), no completion signal fired and the loop ran to
+the 120s deadline. Fix resolves `conv_id_for_check` mid-loop from the live
+URL. Live SSE `chat_completion` now completes in 2–12s (was 120s+/timeout).
 
-This is a Phase 2 transport bug, **not** a PR #9 stabilization regression.
-Track under Phase 2. Debug hypotheses to check: progress notifications
-blocking, async generator never completing, MCP response never posted to
-`/messages`, uvicorn/starlette SSE flush/backpressure, or a long-running
-tool timeout mismatch.
+Diagnosis details: [issue #10 comment](https://github.com/Octo-Lex/ChatGPT-Web2API/issues/10#issuecomment-4796158081).
+Remaining follow-up: the DOM `has_action` selector is still dead — tracked in #12.
 
 ---
 

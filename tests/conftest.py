@@ -149,14 +149,13 @@ def pytest_runtest_makereport(item, call):
     if item.get_closest_marker("e2e") is None:
         return
     from chatgpt_web2api.cdp_driver import RateLimitError
+
     # The exception is recorded on the call's excinfo.
     if call.excinfo and isinstance(call.excinfo.value, RateLimitError):
         report.outcome = "skipped"
         # longrepr as a plain string is the standard way pytest records a
         # skip reason. Do NOT set wasxfail — that flips it to xfail handling.
-        report.longrepr = (
-            f"ChatGPT rate-limited the account: {call.excinfo.value}"
-        )
+        report.longrepr = f"ChatGPT rate-limited the account: {call.excinfo.value}"
 
 
 @pytest_asyncio.fixture(scope="session")
@@ -216,6 +215,92 @@ async def e2e_driver(e2e_login_ready, e2e_config: Config) -> CDPDriver:
     await driver.close()
 
 
+@pytest_asyncio.fixture
+async def e2e_sse_server(e2e_login_ready, e2e_config: Config) -> str:
+    """Start a real uvicorn SSE MCP server for e2e tests, return its URL.
+
+    Function-scoped (NOT session-scoped) on purpose: pytest-asyncio with
+    ``asyncio_mode="auto"`` runs each async test on its own loop, so a
+    session-scoped server would live on a different loop than the test's
+    ``sse_client`` — the HTTP request would be serviced on the server's loop
+    but the response could never reach the test's loop, and the call hangs.
+    Running the server per test keeps it on the same loop as the client.
+    Startup is ~4s, acceptable for opt-in e2e.
+
+    Runs on a non-8090 port so it never contends with an operational SSE
+    server. Wired to a dedicated driver via the module globals (the same
+    wiring ``_live_server`` in test_e2e_mcp uses), independent of the
+    per-test ``e2e_driver``.
+
+    Readiness is polled via a TCP socket connect — NOT a ``GET /sse``, which
+    would hold the connection open and look like a hang. Teardown cancels the
+    server task so no task is left dangling and the port is free for the next
+    test.
+    """
+    import socket as _socket
+
+    import chatgpt_web2api.mcp_server as mod
+
+    port = int(os.environ.get("W2A_SSE_PORT", "18090"))
+
+    # Fail clearly if the chosen port is already occupied (avoids a confusing
+    # "address in use" from uvicorn mid-test).
+    with _socket.socket() as probe:
+        try:
+            probe.bind(("127.0.0.1", port))
+        except OSError as e:
+            raise RuntimeError(
+                f"e2e_sse_server: port {port} is occupied. Set W2A_SSE_PORT to a free port. ({e})"
+            )
+
+    # Dedicated driver for the SSE server this test, separate from the
+    # per-test e2e_driver. Wire the module globals so create_server()/_run_sse
+    # see it.
+    sse_driver = CDPDriver(cdp_port=e2e_config.chrome.cdp_port)
+    await sse_driver.connect()
+    mod._driver = sse_driver
+    mod._config = e2e_config
+    mod._lock = asyncio.Lock()
+
+    server = mod.create_server()
+    init_options = server.create_initialization_options()
+
+    # Run _run_sse as a background task; it serves until cancelled at teardown.
+    sse_task = asyncio.create_task(mod._run_sse(server, init_options, e2e_config, port))
+
+    url = f"http://127.0.0.1:{port}/sse"
+
+    # Wait for the TCP port to accept connections (server readiness). Poll
+    # rather than GET /sse: an SSE endpoint holds the connection open, so an
+    # HTTP probe can look like a hang even when the server is correct.
+    deadline = time.monotonic() + 15.0
+    ready = False
+    while time.monotonic() < deadline:
+        try:
+            with _socket.socket() as s:
+                s.settimeout(0.5)
+                s.connect(("127.0.0.1", port))
+                ready = True
+                break
+        except OSError:
+            await asyncio.sleep(0.2)
+    if not ready:
+        sse_task.cancel()
+        await asyncio.gather(sse_task, return_exceptions=True)
+        raise TimeoutError(f"SSE server did not become ready on port {port}")
+
+    yield url
+
+    # Clean teardown: cancel the server task, then close the driver. Cancelling
+    # (and awaiting the gather) avoids a dangling task / occupied port on the
+    # next test.
+    try:
+        sse_task.cancel()
+        await asyncio.gather(sse_task, return_exceptions=True)
+    finally:
+        await sse_driver.close()
+
+
 async def _wait_for_login(driver: CDPDriver, timeout: int) -> None:
     """Navigate to chatgpt.com and poll for an auth token (mirrors Service)."""
     print("\n" + "=" * 52 + "\n  NOT LOGGED IN — log into ChatGPT in the window\n" + "=" * 52)
@@ -266,8 +351,11 @@ async def e2e_cleanup(e2e_created, e2e_config: Config, request):
     only ever ids the tests themselves created. No-op if no e2e tests ran.
     """
     yield
-    if not e2e_created["conversations"] and not e2e_created["memories"] \
-            and not e2e_created["projects"]:
+    if (
+        not e2e_created["conversations"]
+        and not e2e_created["memories"]
+        and not e2e_created["projects"]
+    ):
         return
     driver = CDPDriver(cdp_port=e2e_config.chrome.cdp_port)
     try:
@@ -291,8 +379,10 @@ async def e2e_cleanup(e2e_created, e2e_config: Config, request):
             # works but create_project's payload is broken — tracked as xfail).
             deleter = getattr(driver, "delete_project", None)
             if deleter is None:
-                print(f"[e2e cleanup] project {pid} has no delete method — "
-                      "remove manually in the ChatGPT UI.")
+                print(
+                    f"[e2e cleanup] project {pid} has no delete method — "
+                    "remove manually in the ChatGPT UI."
+                )
                 continue
             try:
                 await deleter(pid)
@@ -300,4 +390,3 @@ async def e2e_cleanup(e2e_created, e2e_config: Config, request):
                 print(f"[e2e cleanup] could not delete project {pid}: {e}")
     finally:
         await driver.close()
-
