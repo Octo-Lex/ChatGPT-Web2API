@@ -64,6 +64,27 @@ def _patch_sse_verify(monkeypatch, result):
     monkeypatch.setattr(ensure_mod, "_sse_verify", fake_verify)
 
 
+def _patch_listener_stop(monkeypatch):
+    """Patch _find_listener_pid + _terminate_pid so restart tests don't call
+    real netstat/taskkill. Returns a dict tracking calls."""
+    calls = {"find": 0, "terminate": 0, "stopped_ports": []}
+
+    def fake_find(port):
+        calls["find"] += 1
+        return 12345  # pretend a listener exists
+
+    def fake_terminate(pid):
+        calls["terminate"] += 1
+
+    async def fake_stop(port):
+        calls["stopped_ports"].append(port)
+
+    monkeypatch.setattr(ensure_mod, "_find_listener_pid", fake_find)
+    monkeypatch.setattr(ensure_mod, "_terminate_pid", fake_terminate)
+    monkeypatch.setattr(ensure_mod, "_stop_rest_listener", fake_stop)
+    return calls
+
+
 def _patch_launch(monkeypatch):
     """Patch subprocess.Popen to capture commands without launching."""
     launches = []
@@ -155,6 +176,7 @@ async def test_degraded_waits_then_restarts(monkeypatch):
     _patch_sse_verify(monkeypatch, True)
     launches = _patch_launch(monkeypatch)
     _patch_lock(monkeypatch)
+    stop_calls = _patch_listener_stop(monkeypatch)
 
     code = await run_ensure(rest_port=8080, sse_port=8090)
     assert code == 0
@@ -163,6 +185,8 @@ async def test_degraded_waits_then_restarts(monkeypatch):
     assert any("start" in a for a in launches[0])
     # Must have waited (clock advanced past the degraded budget)
     assert t[0] >= 20.0
+    # Restart MUST stop the existing listener before launching
+    assert stop_calls["stopped_ports"] == [8080]
 
 
 # ── 5. degraded recovers, no restart ────────────────────────────────────
@@ -196,11 +220,16 @@ async def test_broken_restarts_rest(monkeypatch):
     _patch_sse_verify(monkeypatch, True)
     launches = _patch_launch(monkeypatch)
     _patch_lock(monkeypatch)
+    stop_calls = _patch_listener_stop(monkeypatch)
 
     code = await run_ensure(rest_port=8080, sse_port=8090)
     assert code == 0
     assert len(launches) == 1
     assert any("start" in a for a in launches[0])
+    # Restart MUST stop the existing listener before launching — not a bare launch
+    assert stop_calls["stopped_ports"] == [8080], (
+        "restart must call _stop_rest_listener before relaunch"
+    )
 
 
 # ── 7. concurrent lock prevents double-launch (bounded wait) ───────────
@@ -352,3 +381,134 @@ def test_build_sse_cmd_full():
     assert "--cdp-port" in cmd and "9333" in cmd
     assert "--config" in cmd and "/tmp/c.json" in cmd
     assert "--log-level" in cmd and "WARNING" in cmd
+
+
+# ── 12. Lock handle retained until release (review fix #1) ─────────────
+
+
+@pytest.mark.asyncio
+async def test_startup_lock_retains_handle_until_release(monkeypatch):
+    """The portalocker file handle must be HELD open until __aexit__. The old
+    code locked one handle then stored a different unlocked one — so concurrent
+    ensures could double-launch. Verify the held handle is the locked one and
+    survives until release."""
+    import tempfile
+    from pathlib import Path
+
+    # Use a temp dir so we don't clobber the real lock
+    tmpdir = tempfile.mkdtemp()
+    monkeypatch.setattr(Path, "home", lambda: Path(tmpdir))
+
+    lock = ensure_mod._StartupLock(sse_port=99999, timeout=5.0)
+    await lock.__aenter__()
+    # The handle must be set and open (not None, not closed)
+    assert lock._fh is not None, "lock handle must be retained after acquire"
+    assert not lock._fh.closed, "lock handle must still be open while held"
+    await lock.__aexit__(None, None, None)
+    # After release, the handle is closed
+    assert lock._fh.closed, "lock handle must be closed after release"
+
+
+# ── 13. starting + connected is ready for ensure (review fix #2) ───────
+
+
+def test_rest_ready_for_ensure_accepts_starting_connected():
+    """A cold-bootstrap REST may report 'starting' (no chat yet) but with
+    Chrome/CDP/driver all connected. That's ready enough for SSE to attach."""
+    assert (
+        ensure_mod._rest_ready_for_ensure(
+            {
+                "status": "starting",
+                "chrome_running": True,
+                "cdp_connected": True,
+                "driver_connected": True,
+            }
+        )
+        is True
+    )
+
+
+def test_rest_ready_for_ensure_rejects_starting_not_connected():
+    """starting WITHOUT full connectivity (Chrome up but driver not connected)
+    must NOT pass — SSE can't attach to a half-started REST."""
+    assert (
+        ensure_mod._rest_ready_for_ensure(
+            {
+                "status": "starting",
+                "chrome_running": True,
+                "cdp_connected": False,
+                "driver_connected": False,
+            }
+        )
+        is False
+    )
+
+
+def test_rest_ready_for_ensure_rejects_degraded_broken():
+    assert ensure_mod._rest_ready_for_ensure({"status": "degraded"}) is False
+    assert ensure_mod._rest_ready_for_ensure({"status": "broken"}) is False
+    assert ensure_mod._rest_ready_for_ensure(None) is False
+
+
+@pytest.mark.asyncio
+async def test_ensure_accepts_starting_connected_as_ready(monkeypatch):
+    """End-to-end: REST reports starting+connected → ensure proceeds to SSE,
+    no restart, exits 0."""
+    _install_virtual_clock(monkeypatch)
+    _patch_health(
+        monkeypatch,
+        [
+            {
+                "status": "starting",
+                "chrome_running": True,
+                "cdp_connected": True,
+                "driver_connected": True,
+            }
+        ],
+    )
+    _patch_sse_tcp(monkeypatch, [True])
+    _patch_sse_verify(monkeypatch, True)
+    launches = _patch_launch(monkeypatch)
+    _patch_lock(monkeypatch)
+
+    code = await run_ensure(rest_port=8080, sse_port=8090)
+    assert code == 0
+    assert launches == [], "should not launch anything — starting+connected is ready"
+
+
+# ── 14. restart stops listener before relaunch (review fix #3) ─────────
+
+
+@pytest.mark.asyncio
+async def test_restart_calls_stop_listener_before_launch(monkeypatch):
+    """The broken/degraded-timeout restart path must call _stop_rest_listener
+    BEFORE _launch_detached — a bare launch on an occupied port fails to bind.
+    This is covered in test_broken_restarts_rest and test_degraded_waits_then_restarts
+    above; this is a focused unit test on _restart_rest itself."""
+    _install_virtual_clock(monkeypatch)
+    monkeypatch.setattr(ensure_mod, "_rest_health", lambda *a, **kw: {"status": "healthy"})
+
+    stop_order = []
+    monkeypatch.setattr(ensure_mod, "_stop_rest_listener", _make_async_recorder(stop_order, "stop"))
+    monkeypatch.setattr(ensure_mod, "_launch_detached", _make_recorder(stop_order, "launch"))
+    monkeypatch.setattr(ensure_mod, "_wait_rest_ready", _make_async_recorder(stop_order, "wait"))
+
+    await ensure_mod._restart_rest(8080, 9222, None, None)
+    # stop MUST come before launch
+    assert stop_order == ["stop", "launch", "wait"], f"order wrong: {stop_order}"
+
+
+def _make_recorder(lst, tag):
+    def _record(*a, **kw):
+        lst.append(tag)
+        return MagicMock()
+
+    return _record
+
+
+def _make_async_recorder(lst, tag):
+    async def _record(*a, **kw):
+        lst.append(tag)
+        return True
+
+    return _record

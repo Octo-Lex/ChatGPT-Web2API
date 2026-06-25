@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import socket
 import subprocess
 import sys
@@ -79,15 +80,19 @@ class _StartupLock:
                 await asyncio.sleep(0.3)
 
     def _try_acquire(self):
+        """Open the lockfile and acquire an exclusive non-blocking lock on it.
+
+        Returns the file handle (which MUST be held open until release —
+        closing it drops the OS lock). Raises ``_LockBusy`` if another process
+        holds the lock.
+        """
+        fh = open(self._path, "w")
         try:
-            self.portalocker.lock(
-                open(self._path, "w"),
-                self.portalocker.LOCK_EX | self.portalocker.LOCK_NB,
-            )
-            # If we get here, the lock was acquired. Keep the fh.
-            self._fh = open(self._path, "w")
+            self.portalocker.lock(fh, self.portalocker.LOCK_EX | self.portalocker.LOCK_NB)
         except self.portalocker.LockException:
+            fh.close()
             raise _LockBusy()
+        return fh
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         if self._fh:
@@ -100,6 +105,25 @@ class _StartupLock:
 
 class _LockBusy(Exception):
     """Internal: lock is currently held by another process."""
+
+
+def _rest_ready_for_ensure(h: dict | None) -> bool:
+    """Is REST ready for ``ensure`` to proceed to SSE?
+
+    ``healthy`` is always ready. ``starting`` is ALSO acceptable for a cold
+    bootstrap: REST/Chrome/CDP are connected but no chat has succeeded yet —
+    that's enough for SSE to attach. Requires all three connection flags set
+    so a half-started REST (Chrome up but driver not connected) doesn't pass.
+    """
+    if not h:
+        return False
+    if h.get("status") == "healthy":
+        return True
+    if h.get("status") == "starting":
+        return bool(
+            h.get("chrome_running") and h.get("cdp_connected") and h.get("driver_connected")
+        )
+    return False
 
 
 def _rest_health(rest_port: int, timeout: float = 3.0) -> dict | None:
@@ -199,13 +223,92 @@ def _launch_detached(cmd: list[str]) -> subprocess.Popen:
     return subprocess.Popen(cmd, **kwargs)
 
 
-async def _wait_rest_healthy(rest_port: int, timeout: float) -> bool:
-    """Poll /health until status is healthy. Returns True if healthy within
-    the timeout, False otherwise."""
+def _find_listener_pid(port: int) -> int | None:
+    """Find the PID listening on the given TCP port (loopback). Returns None
+    if nothing is listening or the lookup fails."""
+    try:
+        if sys.platform == "win32":
+            # netstat -ano: last column is the PID for LISTENING rows
+            out = subprocess.check_output(
+                ["netstat", "-ano"], text=True, stderr=subprocess.DEVNULL, timeout=5
+            )
+            for line in out.splitlines():
+                parts = line.split()
+                if len(parts) >= 5 and "LISTENING" in line:
+                    if parts[1].endswith(f":{port}"):
+                        return int(parts[-1])
+        else:
+            # lsof -ti :<port> returns the PID(s) of listeners
+            out = subprocess.check_output(
+                ["lsof", "-ti", f":{port}"], text=True, stderr=subprocess.DEVNULL, timeout=5
+            ).strip()
+            if out:
+                return int(out.splitlines()[0])
+    except Exception:
+        return None
+    return None
+
+
+def _terminate_pid(pid: int) -> None:
+    """Terminate a process by PID. Force-kill if it doesn't exit gracefully."""
+    try:
+        if sys.platform == "win32":
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True, timeout=10
+            )
+        else:
+            import signal as _sig
+
+            os.kill(pid, _sig.SIGTERM)
+            time.sleep(2)
+            # Check if still alive; SIGKILL if so
+            try:
+                os.kill(pid, 0)
+                os.kill(pid, _sig.SIGKILL)
+            except ProcessLookupError:
+                pass
+    except Exception as e:
+        logger.debug("terminate pid %s failed: %s", pid, e)
+
+
+async def _stop_rest_listener(rest_port: int) -> None:
+    """Stop whatever process is listening on the REST port, then wait for the
+    port to free. A bare ``_launch_detached`` on an occupied port fails to bind
+    (stderr is discarded), so a restart must stop the existing listener first."""
+    pid = _find_listener_pid(rest_port)
+    if pid is None:
+        return
+    logger.info("Stopping existing REST listener (pid %s) on :%d", pid, rest_port)
+    await asyncio.to_thread(_terminate_pid, pid)
+    # Wait for the port to free (bind would fail if still occupied)
+    for _ in range(20):
+        try:
+            with socket.socket() as s:
+                s.settimeout(0.5)
+                s.connect(("127.0.0.1", rest_port))
+            # still accepting connections — wait
+        except OSError:
+            break  # port closed — ready
+        await asyncio.sleep(0.5)
+
+
+async def _restart_rest(
+    rest_port: int, cdp_port: int, config_path: str | None, log_level: str | None
+) -> bool:
+    """Stop the existing REST listener, then launch a fresh one. Used for
+    ``broken`` and degraded-after-timeout — not for ``missing`` (no listener
+    to stop)."""
+    await _stop_rest_listener(rest_port)
+    _launch_detached(_build_rest_cmd(rest_port, cdp_port, config_path, log_level))
+    return await _wait_rest_ready(rest_port, _REST_HEALTHY_TIMEOUT)
+
+
+async def _wait_rest_ready(rest_port: int, timeout: float) -> bool:
+    """Poll /health until REST is ready for ensure (healthy OR starting+connected).
+    Returns True if ready within the timeout, False otherwise."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        h = _rest_health(rest_port)
-        if h and h.get("status") == "healthy":
+        if _rest_ready_for_ensure(_rest_health(rest_port)):
             return True
         await asyncio.sleep(1.0)
     return False
@@ -214,23 +317,22 @@ async def _wait_rest_healthy(rest_port: int, timeout: float) -> bool:
 async def _reconcile_rest(
     rest_port: int, cdp_port: int, config_path: str | None, log_level: str | None
 ) -> bool:
-    """Apply the degraded-REST policy and wait for healthy. Returns True when
-    REST is healthy, False if it can't be made healthy."""
+    """Apply the degraded-REST policy and wait for ready. Returns True when
+    REST is ready for ensure, False if it can't be made ready."""
     h = _rest_health(rest_port)
     if h is None:
         logger.info("REST missing — starting")
         _launch_detached(_build_rest_cmd(rest_port, cdp_port, config_path, log_level))
-        return await _wait_rest_healthy(rest_port, _REST_HEALTHY_TIMEOUT)
+        return await _wait_rest_ready(rest_port, _REST_HEALTHY_TIMEOUT)
 
     status = h.get("status", "broken")
-    if status == "healthy":
-        logger.info("REST healthy")
+    if status in ("healthy", "starting") and _rest_ready_for_ensure(h):
+        logger.info("REST ready (status=%s)", status)
         return True
 
     if status == "broken":
         logger.info("REST broken (Chrome down) — restarting")
-        _launch_detached(_build_rest_cmd(rest_port, cdp_port, config_path, log_level))
-        return await _wait_rest_healthy(rest_port, _REST_HEALTHY_TIMEOUT)
+        return await _restart_rest(rest_port, cdp_port, config_path, log_level)
 
     if status == "degraded":
         # PINNED: degraded may be a transient CDP reconnect. Wait before bouncing.
@@ -239,18 +341,17 @@ async def _reconcile_rest(
         while time.monotonic() < deadline:
             await asyncio.sleep(_DEGRADED_POLL_INTERVAL)
             h = _rest_health(rest_port)
-            if h and h.get("status") == "healthy":
-                logger.info("REST recovered from degraded")
+            if _rest_ready_for_ensure(h):
+                logger.info("REST recovered from degraded/starting")
                 return True
             if h and h.get("status") == "broken":
                 break  # fall through to restart
         logger.info("REST still degraded after %.0fs — restarting", _DEGRADED_POLL_BUDGET)
-        _launch_detached(_build_rest_cmd(rest_port, cdp_port, config_path, log_level))
-        return await _wait_rest_healthy(rest_port, _REST_HEALTHY_TIMEOUT)
+        return await _restart_rest(rest_port, cdp_port, config_path, log_level)
 
-    # starting — just wait
-    logger.info("REST starting — waiting")
-    return await _wait_rest_healthy(rest_port, _REST_HEALTHY_TIMEOUT)
+    # starting without full connectivity — wait for it to resolve
+    logger.info("REST starting (not fully connected) — waiting")
+    return await _wait_rest_ready(rest_port, _REST_HEALTHY_TIMEOUT)
 
 
 async def _reconcile_sse(
@@ -295,9 +396,9 @@ async def run_ensure(
         logger.info("Startup lock held — waiting for another ensure to finish")
         for _ in range(_LOCK_CONTENTION_RECHECK_TRIES):
             await asyncio.sleep(_LOCK_CONTENTION_RECHECK_INTERVAL)
-            rest_ok = _rest_health(rest_port)
+            rest_ok = _rest_ready_for_ensure(_rest_health(rest_port))
             sse_ok = _sse_tcp_up(sse_port) and await _sse_verify(sse_port)
-            if rest_ok and rest_ok.get("status") == "healthy" and sse_ok:
+            if rest_ok and sse_ok:
                 print("REST + SSE ready (another ensure succeeded)")
                 return 0
         print(
