@@ -21,6 +21,7 @@ import urllib.request
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
+from .breakers import BreakerKind, BreakerRegistry
 from .diagnostics import diagnose
 
 try:
@@ -181,6 +182,26 @@ class CDPJSError(RuntimeError):
         super().__init__(message)
 
 
+class SendReadinessError(RuntimeError):
+    """Raised when the composer / send-readiness path fails — no composer found,
+    the composer wouldn't focus, or the send button didn't fire.
+
+    Typed (not bare ``RuntimeError``) so the breaker wiring can classify it
+    explicitly at the catch site as ``BreakerKind.COMPOSER_SEND_READINESS``
+    rather than guessing from a string. Raised by ``_ensure_send_ready``,
+    ``type_message``, and ``click_send``.
+    """
+
+
+class CDPReconnectError(RuntimeError):
+    """Raised when CDP reconnect exhausts its 3-attempt backoff without
+    re-establishing the websocket.
+
+    Typed (not bare ``RuntimeError``) so the breaker wiring can classify it
+    explicitly as ``BreakerKind.CDP_RECONNECT``.
+    """
+
+
 # Phrases ChatGPT uses in its rate-limit pop-up. Matched case-insensitively
 # against scanned DOM text. Kept narrow to avoid false positives on normal
 # chat content (e.g. a user asking about "rate limits" in a message).
@@ -263,6 +284,7 @@ class CDPDriver:
         cdp_port: int = 9222,
         tab_mode: str = "owned",
         instance_id: str | None = None,
+        breakers: BreakerRegistry | None = None,
     ) -> None:
         self.port = cdp_port
         # Tab isolation strategy: "owned" creates a dedicated chatgpt.com tab
@@ -305,6 +327,11 @@ class CDPDriver:
         # open tabs on clean shutdown.
         self._target_id: str | None = None
         self._owns_target: bool = False
+        # Phase 4 PR2: optional circuit-breaker registry. When set, failure
+        # sites record/trip their kind and success sites clear failures /
+        # recover half-open breakers. None = back-compat (tests, legacy
+        # construction) — every recorder checks `if self._breakers:`.
+        self._breakers = breakers
 
     # ── Connection ────────────────────────────────────────────
 
@@ -566,12 +593,19 @@ class CDPDriver:
                 await self._wait_for_chatgpt_ready()
                 await self._refresh_token()
                 logger.info("CDP reconnected on attempt %d", attempt)
+                # Success: clear CDP failure history and recover a half-open
+                # breaker. Only after refresh_token succeeds — a reconnect that
+                # reopens the socket but can't auth isn't a clean recovery.
+                if self._breakers:
+                    self._breakers.record_success(BreakerKind.CDP_RECONNECT)
                 return
             except Exception as e:
                 logger.warning("Reconnect attempt %d failed: %s", attempt, e)
                 if attempt < 3:
                     await asyncio.sleep(delay)
-        raise RuntimeError("CDP reconnect failed after 3 attempts")
+        if self._breakers:
+            self._breakers.record_failure(BreakerKind.CDP_RECONNECT)
+        raise CDPReconnectError("CDP reconnect failed after 3 attempts")
 
     async def _find_page_ws(self) -> str:
         """Find a suitable page's websocket URL."""
@@ -1233,7 +1267,9 @@ class CDPDriver:
         await self.navigate_new_chat()  # navigates to ?model=auto + polls composer
         if not await self._wait_for_composer(timeout=5):
             await self._capture_selector_diagnostic("composer (connect send-ready)")
-            raise RuntimeError("No composer found after navigating to a new chat")
+            if self._breakers:
+                self._breakers.record_failure(BreakerKind.COMPOSER_SEND_READINESS)
+            raise SendReadinessError("No composer found after navigating to a new chat")
 
     async def _wait_for_composer(self, timeout: float = 8) -> bool:
         """Poll until a composer appears, or *timeout* seconds elapse.
@@ -1381,7 +1417,9 @@ class CDPDriver:
         )
         if focus_result == "no composer":
             await self._capture_selector_diagnostic("composer (type_message)")
-            raise RuntimeError("No composer found")
+            if self._breakers:
+                self._breakers.record_failure(BreakerKind.COMPOSER_SEND_READINESS)
+            raise SendReadinessError("No composer found")
         focused_target = focus_result  # 'composer' or 'fallback'
 
         # Clear existing text and insert. Prefer a platform-aware select-all
@@ -1448,7 +1486,9 @@ class CDPDriver:
             await self._cdp("Input.insertText", {"text": text})
             await asyncio.sleep(0.5)
             if not await self._verify_composer_text(verify_selector, text):
-                raise RuntimeError(
+                if self._breakers:
+                    self._breakers.record_failure(BreakerKind.COMPOSER_SEND_READINESS)
+                raise SendReadinessError(
                     f"Composer text verification failed after retry; expected {text[:60]!r}"
                 )
         logger.info("Typed: %s", text[:80])
@@ -1576,8 +1616,15 @@ class CDPDriver:
         )
         if result != "sent":
             await self._capture_selector_diagnostic("send-button (click_send)")
-            raise RuntimeError(f"Send failed: {result}")
+            if self._breakers:
+                self._breakers.record_failure(BreakerKind.COMPOSER_SEND_READINESS)
+            raise SendReadinessError(f"Send failed: {result}")
         logger.info("Message sent")
+        # Success: clear composer failure history and recover a half-open
+        # breaker. Only after the message is confirmed sent — not after
+        # type_message alone, since a successful type can still fail to send.
+        if self._breakers:
+            self._breakers.record_success(BreakerKind.COMPOSER_SEND_READINESS)
 
     # ── Response Retrieval ────────────────────────────────────
 
@@ -2043,6 +2090,8 @@ class CDPDriver:
             except (json.JSONDecodeError, TypeError):
                 status = None
             if status == 401:
+                if self._breakers:
+                    self._breakers.trip(BreakerKind.AUTH_EXPIRED, "HTTP 401 from backend-api")
                 raise AuthExpiredError()
             if status is not None:
                 raise RuntimeError(f"_fetch_text HTTP {status} for {conversation_id}")
@@ -2204,6 +2253,8 @@ class CDPDriver:
         # Login pages contain these markers
         lower = raw[:500].lower()
         if "sign in" in lower and "chatgpt" in lower and "<html" in lower:
+            if self._breakers:
+                self._breakers.trip(BreakerKind.AUTH_EXPIRED, "login page returned instead of data")
             raise AuthExpiredError("Session expired — read returned login page instead of data")
 
     async def _capture_selector_diagnostic(self, selector_name: str) -> None:
