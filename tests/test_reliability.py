@@ -122,17 +122,25 @@ async def test_fetch_text_401_raises_auth_expired():
 
 @pytest.mark.asyncio
 async def test_fetch_text_404_raises_runtime_error():
-    """Non-401 non-OK status surfaces as RuntimeError with the code, not silent ''."""
+    """A persistent 404 (bound exhausted) surfaces as RuntimeError with the
+    code. The bounded retry in backend_client._fetch_text is exercised, but
+    backoff is zeroed here to keep the test fast."""
     d = _make_driver()
+    calls = {"n": 0}
 
     async def _fake(js_template, data, timeout=15):
+        calls["n"] += 1
         return '{"__status": 404}'
 
     d._js_with_data_strict = _fake
     d.ensure_token = AsyncMock(return_value="tok")
+    # Zero the backoff so the bound is exhausted without real sleeping.
+    d._backend_client._FETCH_TEXT_404_BACKOFF_SECONDS = 0.0
     with pytest.raises(RuntimeError) as ei:
         await d._fetch_text("conv-1")
     assert "404" in str(ei.value)
+    # Bound exhausted → one fetch per attempt.
+    assert calls["n"] == d._backend_client._FETCH_TEXT_404_MAX_ATTEMPTS
 
 
 @pytest.mark.asyncio

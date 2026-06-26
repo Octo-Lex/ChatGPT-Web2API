@@ -250,3 +250,120 @@ async def test_create_memory_success_false_when_get_memories_no_match():
     result = await client.create_memory("remember this please")
     assert result["success"] is False
     driver.get_memories.assert_awaited_once()
+
+
+# ── 8. _fetch_text bounded 404 retry (PR #23) ──────────────────────────
+#
+# The backend-api returns 404 immediately after a send while the just-created
+# conversation is still propagating server-side. _fetch_text treats 404 as a
+# transient race: bounded retry, NOT a breaker. 401 still raises immediately
+# (with breaker trip) and other non-OK statuses still raise RuntimeError
+# immediately — only 404 is retried.
+
+
+@pytest.mark.asyncio
+async def test_fetch_text_404_retries_then_succeeds():
+    """A transient 404 followed by a real body returns the body, not an error.
+    The fetch is retried until the conversation is persisted server-side."""
+    client, driver = _make_client()
+    client._FETCH_TEXT_404_BACKOFF_SECONDS = 0.0  # keep the test fast
+
+    responses = ['{"__status": 404}', '{"__status": 404}', "the assistant reply"]
+    calls = {"i": 0}
+
+    async def _fake(js_template, data, timeout=15):
+        r = responses[calls["i"]]
+        calls["i"] += 1
+        return r
+
+    driver._js_with_data_strict = _fake
+    result = await client._fetch_text("conv-1")
+    assert result == "the assistant reply"
+    assert calls["i"] == 3  # two 404s retried, third succeeded
+
+
+@pytest.mark.asyncio
+async def test_fetch_text_404_raises_after_bound():
+    """When 404 persists past the retry bound, it surfaces as RuntimeError
+    carrying the code, so callers see the same exception type as pre-retry."""
+    client, driver = _make_client()
+    client._FETCH_TEXT_404_BACKOFF_SECONDS = 0.0
+    calls = {"n": 0}
+
+    async def _fake(js_template, data, timeout=15):
+        calls["n"] += 1
+        return '{"__status": 404}'
+
+    driver._js_with_data_strict = _fake
+    with pytest.raises(RuntimeError) as ei:
+        await client._fetch_text("conv-1")
+    assert "404" in str(ei.value)
+    assert calls["n"] == client._FETCH_TEXT_404_MAX_ATTEMPTS
+
+
+@pytest.mark.asyncio
+async def test_fetch_text_401_not_retried_trips_breaker():
+    """401 is NOT a transient race: it must raise AuthExpiredError on the
+    first hit (no retry) and trip AUTH_EXPIRED. Guards against the 404 retry
+    accidentally swallowing auth failures."""
+    from chatgpt_web2api.breakers import BreakerKind, BreakerRegistry
+    from chatgpt_web2api.cdp_driver import AuthExpiredError
+
+    client, driver = _make_client()
+    driver._breakers = BreakerRegistry()
+    client._FETCH_TEXT_404_BACKOFF_SECONDS = 0.0
+    calls = {"n": 0}
+
+    async def _fake(js_template, data, timeout=15):
+        calls["n"] += 1
+        return '{"__status": 401}'
+
+    driver._js_with_data_strict = _fake
+    with pytest.raises(AuthExpiredError):
+        await client._fetch_text("conv-1")
+    # No retry: exactly one fetch attempt.
+    assert calls["n"] == 1
+    assert driver._breakers.is_open(BreakerKind.AUTH_EXPIRED)
+
+
+@pytest.mark.asyncio
+async def test_fetch_text_other_status_not_retried():
+    """Non-404 non-401 statuses (e.g. 500) raise RuntimeError immediately —
+    only the 404 propagation race is retried."""
+    client, driver = _make_client()
+    client._FETCH_TEXT_404_BACKOFF_SECONDS = 0.0
+    calls = {"n": 0}
+
+    async def _fake(js_template, data, timeout=15):
+        calls["n"] += 1
+        return '{"__status": 500}'
+
+    driver._js_with_data_strict = _fake
+    with pytest.raises(RuntimeError) as ei:
+        await client._fetch_text("conv-1")
+    assert "500" in str(ei.value)
+    assert calls["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_fetch_text_404_no_breaker_signal(monkeypatch):
+    """A transient 404 must NOT trip any breaker — it is a propagation race,
+    not an auth failure or persistent backend fault (follow-up C decides
+    breaker policy for backend errors separately)."""
+    from chatgpt_web2api.breakers import BreakerKind, BreakerRegistry
+
+    client, driver = _make_client()
+    reg = BreakerRegistry()
+    driver._breakers = reg
+    client._FETCH_TEXT_404_BACKOFF_SECONDS = 0.0
+
+    # Trip is the only mutation path; fail the test if anything tries it.
+    monkeypatch.setattr(reg, "trip", lambda *a, **k: pytest.fail("404 must not trip a breaker"))
+
+    async def _fake(js_template, data, timeout=15):
+        return '{"__status": 404}'
+
+    driver._js_with_data_strict = _fake
+    with pytest.raises(RuntimeError):
+        await client._fetch_text("conv-1")
+    assert not reg.is_open(BreakerKind.AUTH_EXPIRED)

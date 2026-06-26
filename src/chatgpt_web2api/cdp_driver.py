@@ -1980,9 +1980,10 @@ class CDPDriver:
     async def _fetch_text(self, conversation_id: str) -> str:
         """Fetch the latest assistant text from the conversation API.
 
-        Delegated to BackendClient (Phase 5 PR1 extraction). The 404→RuntimeError
-        and 401→AuthExpiredError+trip behavior is preserved exactly; the 404
-        bounded-retry is a separate follow-up (PR #23).
+        Delegated to BackendClient (Phase 5 PR1 extraction). The 401→
+        AuthExpiredError+trip behavior is preserved exactly; a transient 404
+        (conversation not yet persisted after send) is now retried a bounded
+        number of times before surfacing as RuntimeError (PR #23).
         """
         return await self._backend_client._fetch_text(conversation_id)
 

@@ -42,6 +42,17 @@ from .breakers import BreakerKind
 
 logger = logging.getLogger(__name__)
 
+
+class _Transient404(Exception):
+    """Sentinel raised by ``_fetch_text_once`` on a backend 404.
+
+    Internal to ``_fetch_text``'s bounded retry loop — never escapes this
+    module. The 404 is a transient race (conversation not yet persisted
+    immediately after a send), NOT an auth failure or persistent backend
+    fault, so it is deliberately not modeled as a breaker signal.
+    """
+
+
 # Re-check the access token if it's older than this. The observed ChatGPT
 # JWT has a ~10-day lifetime, so 1h is a conservative refresh interval: it
 # avoids unnecessary refetches on the happy path while guaranteeing a stale
@@ -203,6 +214,16 @@ class BackendClient:
 
     # ── Conversation fetch ────────────────────────────────────
 
+    # Bounded retry for the transient 404 returned by the backend-api
+    # immediately after a send, before the just-created conversation is
+    # persisted server-side. This is a transient race, NOT an auth failure or
+    # a persistent backend fault, so it is deliberately NOT a breaker signal
+    # (follow-up C decides separately whether persistent 404/5xx should ever
+    # trip a breaker). The bound stays small so a genuinely-missing
+    # conversation surfaces quickly.
+    _FETCH_TEXT_404_MAX_ATTEMPTS = 4
+    _FETCH_TEXT_404_BACKOFF_SECONDS = 0.5
+
     async def _fetch_text(self, conversation_id: str) -> str:
         """Fetch the latest assistant text from the conversation API.
 
@@ -212,6 +233,15 @@ class BackendClient:
         error. This parse-and-raise happens here, before any return reaches
         the caller, so callers never see a raw status blob as text.
 
+        A 404 specifically is treated as a transient race and retried a
+        bounded number of times: the backend-api returns 404 immediately
+        after a send while the just-created conversation is still
+        propagating server-side. Only 404 is retried — 401 still raises
+        ``AuthExpiredError`` immediately (with breaker trip) and any other
+        non-OK status still raises ``RuntimeError`` immediately. After the
+        retry bound is exhausted the 404 surfaces as ``RuntimeError`` so
+        callers see the same type they did pre-retry.
+
         Picks the newest assistant text message by ``create_time`` rather than
         trusting the API's ``current_node`` pointer: that pointer lags behind
         on continued conversations (it still points at the previous turn right
@@ -219,45 +249,86 @@ class BackendClient:
         request N-1's text. The newest-by-create-time selection is immune to
         that lag.
         """
+        from .cdp_driver import CDPJSError
+
+        last_error: Exception | None = None
+        for attempt in range(1, self._FETCH_TEXT_404_MAX_ATTEMPTS + 1):
+            try:
+                return await self._fetch_text_once(conversation_id)
+            except _Transient404 as e:
+                # Transient race — retry after a short backoff unless this was
+                # the final attempt, in which case it falls through to the
+                # RuntimeError raise below.
+                last_error = e
+                if attempt < self._FETCH_TEXT_404_MAX_ATTEMPTS:
+                    logger.debug(
+                        "_fetch_text 404 for %s (attempt %d/%d), retrying",
+                        conversation_id,
+                        attempt,
+                        self._FETCH_TEXT_404_MAX_ATTEMPTS,
+                    )
+                    await asyncio.sleep(self._FETCH_TEXT_404_BACKOFF_SECONDS)
+                continue
+            except CDPJSError as e:
+                # JS transport failure: not a 404 race. Preserve the pre-retry
+                # behavior of swallowing it and returning "" (callers retry
+                # the whole send poll loop).
+                logger.debug("_fetch_text JS failed: %s", e)
+                return ""
+        # Bound exhausted — surface the 404 as RuntimeError, matching the
+        # pre-retry behavior callers already handle.
+        raise RuntimeError(
+            f"_fetch_text HTTP 404 for {conversation_id} "
+            f"after {self._FETCH_TEXT_404_MAX_ATTEMPTS} attempts"
+        ) from last_error
+
+    async def _fetch_text_once(self, conversation_id: str) -> str:
+        """Single backend-api conversation fetch + status decode.
+
+        Returns the assistant text on success, raises ``_Transient404`` on a
+        404 (so the bounded retry loop in ``_fetch_text`` can catch it),
+        raises ``AuthExpiredError`` (with breaker trip) on 401, and raises
+        ``RuntimeError`` for any other non-OK status. Empty/blank bodies and
+        JS-transport failures are handled by the caller.
+
+        Status decode (the ``__status`` blob shape) lives here so it runs
+        before any text reaches the caller regardless of the retry wrapper.
+        """
         # Imported lazily to avoid a module-load circular dependency.
-        from .cdp_driver import AuthExpiredError, CDPJSError
+        from .cdp_driver import AuthExpiredError
 
         d = self._driver
         await self._driver.ensure_token()
-        try:
-            raw = await d._js_with_data_strict(
-                "(async function() {"
-                "  try {"
-                "    var r = await fetch('/backend-api/conversation/' + __D.conv_id + '?offset=0&limit=5', {"
-                "      headers: {'Authorization': 'Bearer ' + __D.token}"
-                "    });"
-                "    if (!r.ok) return JSON.stringify({__status: r.status});"
-                "    var conv = await r.json();"
-                "    var mapping = conv.mapping || {};"
-                # Find the NEWEST assistant text message by create_time.
-                # current_node lags on continued conversations, so we cannot
-                # trust it to point at the turn we just sent.
-                "    var best = null;"
-                "    var bestTime = -1;"
-                "    for (var k in mapping) {"
-                "      var n = mapping[k];"
-                "      var m = n.message;"
-                "      if (!m || !m.author || m.author.role !== 'assistant') continue;"
-                "      if (!m.content || m.content.content_type !== 'text') continue;"
-                "      var parts = m.content.parts || [];"
-                "      if (!parts.length || !parts.some(function(p){ return String(p).trim(); })) continue;"
-                "      var t = m.create_time || 0;"
-                "      if (t >= bestTime) { bestTime = t; best = parts.filter(function(p){ return String(p).trim(); }).join('\\n'); }"
-                "    }"
-                "    return best || '';"
-                "  } catch(e) { return ''; }"
-                "})()",
-                {"conv_id": conversation_id, "token": d._access_token},
-                timeout=15,
-            )
-        except CDPJSError as e:
-            logger.debug("_fetch_text JS failed (will retry): %s", e)
-            return ""
+        raw = await d._js_with_data_strict(
+            "(async function() {"
+            "  try {"
+            "    var r = await fetch('/backend-api/conversation/' + __D.conv_id + '?offset=0&limit=5', {"
+            "      headers: {'Authorization': 'Bearer ' + __D.token}"
+            "    });"
+            "    if (!r.ok) return JSON.stringify({__status: r.status});"
+            "    var conv = await r.json();"
+            "    var mapping = conv.mapping || {};"
+            # Find the NEWEST assistant text message by create_time.
+            # current_node lags on continued conversations, so we cannot
+            # trust it to point at the turn we just sent.
+            "    var best = null;"
+            "    var bestTime = -1;"
+            "    for (var k in mapping) {"
+            "      var n = mapping[k];"
+            "      var m = n.message;"
+            "      if (!m || !m.author || m.author.role !== 'assistant') continue;"
+            "      if (!m.content || m.content.content_type !== 'text') continue;"
+            "      var parts = m.content.parts || [];"
+            "      if (!parts.length || !parts.some(function(p){ return String(p).trim(); })) continue;"
+            "      var t = m.create_time || 0;"
+            "      if (t >= bestTime) { bestTime = t; best = parts.filter(function(p){ return String(p).trim(); }).join('\\n'); }"
+            "    }"
+            "    return best || '';"
+            "  } catch(e) { return ''; }"
+            "})()",
+            {"conv_id": conversation_id, "token": d._access_token},
+            timeout=15,
+        )
         if not raw:
             return ""
         # Detect the status-blob shape (non-OK response) and raise appropriately.
@@ -272,6 +343,10 @@ class BackendClient:
                 if d._breakers:
                     d._breakers.trip(BreakerKind.AUTH_EXPIRED, "HTTP 401 from backend-api")
                 raise AuthExpiredError()
+            if status == 404:
+                # Transient race: conversation not yet persisted after send.
+                # The bounded retry in _fetch_text catches this.
+                raise _Transient404(conversation_id)
             if status is not None:
                 raise RuntimeError(f"_fetch_text HTTP {status} for {conversation_id}")
         return raw
