@@ -1,0 +1,518 @@
+"""ChatGPT DOM interaction — composer/send-button/rate-limit DOM helpers.
+
+Phase 5 PR3 extraction (no behavior change). Owns the ChatGPT-composer
+interaction surface that was previously inlined in ``CDPDriver``:
+
+  - composer selectors (``COMPOSER_SELECTOR`` etc.)
+  - composer presence / send-readiness (``_has_composer``,
+    ``_wait_for_composer``, ``_ensure_send_ready``)
+  - message typing / verification (``type_message``,
+    ``_detect_select_all_modifier``, ``_verify_composer_text``)
+  - send button click (``click_send``)
+  - rate-limit popup dismissal (``dismiss_rate_limit``)
+  - selector-drift diagnostics (``_capture_selector_diagnostic``)
+
+The driver-reference collaborator seam: ``ChatGPTDom`` holds a reference to
+its owning ``CDPDriver`` and reaches through it for the CDP transport
+(``_js`` / ``_js_strict`` / ``_cdp``), for shared mutable state
+(``_breakers``, ``_current_conv_id``), and for navigation peers
+(``navigate_new_chat``). None of that state migrates into this module — it
+stays on the driver so external attribute reads and test stubs keep working
+unchanged.
+
+Boundary: this module is the ChatGPT page DOM-interaction layer. Connection
+lifecycle, navigation (``navigate_new_chat`` / ``navigate_conversation`` /
+``navigate_gpt`` / ``select_model``), ``send_and_stream`` orchestration, and
+conversation-id ownership stay in ``cdp_driver.py``.
+
+Breaker rule: three methods record ``BreakerKind.COMPOSER_SEND_READINESS``
+failures/successes. The breaker registry STAYS on the driver; this module
+only calls ``record_failure`` / ``record_success`` through
+``self._driver._breakers``. No breaker-policy code moves.
+
+Call-rule inside ChatGPTDom method bodies — every internal call routes
+through ``self._driver`` (NOT ``self``) to preserve monkeypatch interception
+on the driver-facing seam (the PR2 lesson):
+
+  transport:        self._driver._js(...)
+                    self._driver._js_strict(...)
+                    self._driver._cdp(...)
+  moved DOM peers:  self._driver._verify_composer_text(...)
+                    self._driver._detect_select_all_modifier(...)
+                    self._driver._has_composer(...)
+                    self._driver._capture_selector_diagnostic(...)
+  navigation:       self._driver.navigate_new_chat(...)
+  breaker:          self._driver._breakers.record_failure(...)
+                    self._driver._breakers.record_success(...)
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import time
+
+from .breakers import BreakerKind
+
+logger = logging.getLogger(__name__)
+
+
+# ChatGPT composer selectors (post-2026 composer redesign).
+#
+# The old composer was a real <textarea id="prompt-textarea">. The new
+# composer is a contenteditable ProseMirror div; the element that still
+# carries id="prompt-textarea" is a HIDDEN fallback (<textarea
+# class="wcDTda_fallbackTextarea">) that overlays the real composer when
+# JS is off. Typing into it does not reach the composer, so the message
+# never lands — every send then fails with "no send button" because the
+# composer is empty. These selectors target the real, interactive nodes.
+#
+# COMPOSER_SELECTOR is the primary target; the #prompt-textarea fallback
+# is kept as a last-resort so the driver still works if ChatGPT rolls
+# the composer back (or on an A/B holdout that hasn't shipped the new
+# UI). Both are tried in preference order by the helpers below.
+COMPOSER_SELECTOR = 'div[role="textbox"]#prompt-textarea, div[role="textbox"].ProseMirror'
+COMPOSER_FALLBACK_SELECTOR = "textarea#prompt-textarea"
+
+# The send button. The new composer has no data-testid="send-button" —
+# its affordances are composer-plus-btn and dictation, plus a
+# stop-button while generating. The send affordance is the submit
+# <button> inside the composer form whose aria-label is "send" (and
+# which is not the stop button). We match by aria-label first, then by
+# the legacy testid for older deployments.
+SEND_BUTTON_SELECTOR = 'button[aria-label*="Send" i]:not([data-testid="stop-button"])'
+SEND_BUTTON_FALLBACK_SELECTOR = 'button[data-testid="send-button"]'
+
+
+class ChatGPTDom:
+    """ChatGPT-composer DOM interaction, composed by ``CDPDriver``.
+
+    Constructed once in ``CDPDriver.__init__`` and stored as
+    ``self._dom``. The driver keeps thin delegating methods for every
+    method here so its public/private API surface is byte-identical to
+    pre-extraction.
+    """
+
+    def __init__(self, driver) -> None:
+        self._driver = driver
+
+    # ── Send readiness ────────────────────────────────────────
+
+    async def _has_composer(self) -> bool:
+        """Is a send-capable composer present on the live tab?
+
+        True only when one of the known composer selectors matches. The home/
+        landing page is auth-valid but NOT send-valid: it has a different,
+        unnamed textarea that none of these selectors match, so a tab on
+        ``chatgpt.com/`` (or any non-chat page) returns False. Authentication
+        and send-readiness are separate invariants — this one is send-readiness.
+        """
+        # Imported lazily to avoid a module-load circular dependency.
+        from .cdp_driver import CDPJSError
+
+        d = self._driver
+        try:
+            result = await d._js(
+                "(function(){"
+                f"  return JSON.stringify({{"
+                f"    ready: !!document.querySelector('{COMPOSER_SELECTOR}')"
+                f"         || !!document.querySelector('{COMPOSER_FALLBACK_SELECTOR}')"
+                "  });"  # {{ opens the object literal; a single } closes it
+                "})()"
+            )
+            return json.loads(result).get("ready") is True
+        except (json.JSONDecodeError, TypeError, CDPJSError):
+            return False
+
+    async def _wait_for_composer(self, timeout: float = 8) -> bool:
+        """Poll until a composer appears, or *timeout* seconds elapse.
+
+        Returns True if a composer is present within the window, False on
+        timeout. Never raises — callers decide fail-closed behavior. The
+        composer on the home shell hydrates a few seconds after the sidebar,
+        so a single probe races it; this wait absorbs that render delay.
+        """
+        d = self._driver
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if await d._has_composer():
+                return True
+            await asyncio.sleep(0.5)
+        return False
+
+    async def _ensure_send_ready(self) -> None:
+        """Guarantee the live tab can accept a typed message.
+
+        ``connect()`` may attach to a ``chatgpt.com/`` home/landing tab (or
+        adopt an arbitrary existing ChatGPT tab). Such a tab is auth-valid but
+        not send-valid: it lacks the real composer, so the very next
+        ``type_message`` would raise "No composer found" and — through the REST
+        layer — surface as an opaque "no close frame received or sent" 500.
+        This normalizes the tab into a usable chat page before ``connect()``
+        returns, establishing the invariant the rest of the driver assumes:
+        a connected driver is a send-capable driver.
+
+        The composer renders lazily on the home shell (the sidebar hydrates
+        first, the composer seconds later), so a single ``_has_composer``
+        probe races the render. We poll briefly first; only if that window
+        passes without a composer do we navigate (to ``?model=auto``, which
+        renders the real composer — see ``navigate_new_chat``) and re-check.
+        """
+        d = self._driver
+        if await d._wait_for_composer(timeout=8):
+            return
+        logger.info(
+            "Attached tab has no composer after waiting; navigating to a new chat "
+            "to become send-ready"
+        )
+        await d.navigate_new_chat()  # navigates to ?model=auto + polls composer
+        if not await d._wait_for_composer(timeout=5):
+            await d._capture_selector_diagnostic("composer (connect send-ready)")
+            if d._breakers:
+                d._breakers.record_failure(BreakerKind.COMPOSER_SEND_READINESS)
+            from .cdp_driver import SendReadinessError
+
+            raise SendReadinessError("No composer found after navigating to a new chat")
+
+    # ── Message typing ────────────────────────────────────────
+
+    async def type_message(self, text: str) -> None:
+        """Type text into the ChatGPT composer.
+
+        The new composer is a contenteditable ProseMirror div; the legacy
+        composer was a <textarea id="prompt-textarea">. We focus the new
+        textbox first (COMPOSER_SELECTOR), falling back to the textarea
+        for older deployments. Once focused, ``Input.insertText`` routes
+        the text to whichever element holds focus, so the same insert
+        works for both layouts.
+        """
+        d = self._driver
+        # Focus the composer. Try the ProseMirror textbox first, then the
+        # legacy textarea fallback. Returns which one was focused (or
+        # 'no composer') so the verify step reads the right element.
+        focus_result = await d._js(
+            "(function() {"
+            f"  var el = document.querySelector('{COMPOSER_SELECTOR}');"
+            "  if (el) { el.focus(); return 'composer'; }"
+            f"  var fb = document.querySelector('{COMPOSER_FALLBACK_SELECTOR}');"
+            "  if (fb) { fb.focus(); return 'fallback'; }"
+            "  return 'no composer';"
+            "})()"
+        )
+        if focus_result == "no composer":
+            await d._capture_selector_diagnostic("composer (type_message)")
+            if d._breakers:
+                d._breakers.record_failure(BreakerKind.COMPOSER_SEND_READINESS)
+            from .cdp_driver import SendReadinessError
+
+            raise SendReadinessError("No composer found")
+        focused_target = focus_result  # 'composer' or 'fallback'
+
+        # Clear existing text and insert. Prefer a platform-aware select-all
+        # via keyboard events (modifiers: 2 = Ctrl on Win/Linux, 4 = Cmd on
+        # macOS — detected at runtime so select-all doesn't silently no-op on
+        # Mac). Insert via CDP, dispatched to the focused composer.
+        select_all_mods = await d._detect_select_all_modifier()
+        await d._cdp(
+            "Input.dispatchKeyEvent",
+            {
+                "type": "rawKeyDown",
+                "key": "a",
+                "code": "KeyA",
+                "windowsVirtualKeyCode": 65,
+                "modifiers": select_all_mods,
+            },
+        )
+        await d._cdp(
+            "Input.dispatchKeyEvent",
+            {
+                "type": "keyUp",
+                "key": "a",
+                "code": "KeyA",
+                "windowsVirtualKeyCode": 65,
+                "modifiers": select_all_mods,
+            },
+        )
+        await asyncio.sleep(0.1)
+        await d._cdp("Input.insertText", {"text": text})
+        await asyncio.sleep(0.5)
+
+        # Verify the composer holds EXACTLY the intended input (canonicalized),
+        # not just "is non-empty". With ProseMirror contenteditable, a stale or
+        # partially-cleared composer passes a non-empty check while corrupting
+        # the prompt — so we compare canonical editor-visible text. On mismatch,
+        # retry once: clear via execCommand('selectAll') + delete (ProseMirror
+        # sees editor-like input events), re-insert, re-verify. Only then raise.
+        verify_selector = (
+            COMPOSER_SELECTOR if focused_target == "composer" else COMPOSER_FALLBACK_SELECTOR
+        )
+        if not await d._verify_composer_text(verify_selector, text):
+            logger.warning(
+                "Composer text mismatch on first insert; retrying with execCommand clear"
+            )
+            await d._js_strict(
+                "(function(){"
+                f"  var el = document.querySelector('{verify_selector}');"
+                "  if (el) {"
+                "    if (el.tagName === 'TEXTAREA') {"
+                "      el.focus(); el.select();"
+                "      try { document.execCommand('delete'); } catch(e) {}"
+                "    } else {"
+                "      el.focus();"
+                "      var sel = window.getSelection(); sel.removeAllRanges();"
+                "      var range = document.createRange(); range.selectNodeContents(el);"
+                "      sel.addRange(range);"
+                "      try { document.execCommand('delete'); } catch(e) {}"
+                "    }"
+                "  }"
+                "  return true;"
+                "})()"
+            )
+            await asyncio.sleep(0.1)
+            await d._cdp("Input.insertText", {"text": text})
+            await asyncio.sleep(0.5)
+            if not await d._verify_composer_text(verify_selector, text):
+                if d._breakers:
+                    d._breakers.record_failure(BreakerKind.COMPOSER_SEND_READINESS)
+                from .cdp_driver import SendReadinessError
+
+                raise SendReadinessError(
+                    f"Composer text verification failed after retry; expected {text[:60]!r}"
+                )
+        logger.info("Typed: %s", text[:80])
+
+    async def _detect_select_all_modifier(self) -> int:
+        """Return the CDP modifiers value for select-all on the live platform.
+
+        ``2`` = Ctrl (Windows/Linux), ``4`` = Cmd (macOS). Probed once via
+        ``navigator.userAgentData``/``navigator.platform`` so the keyboard
+        select-all doesn't silently no-op on macOS (where Cmd, not Ctrl,
+        selects all). Falls back to Ctrl (2) on any probe failure.
+        """
+        # Imported lazily to avoid a module-load circular dependency.
+        from .cdp_driver import CDPJSError
+
+        d = self._driver
+        try:
+            ua = await d._js_strict(
+                "(navigator.userAgentData && navigator.userAgentData.platform)"
+                " || navigator.platform || ''"
+            )
+            if ua and "mac" in ua.lower():
+                return 4
+        except CDPJSError:
+            pass
+        return 2
+
+    async def _verify_composer_text(self, selector: str, expected: str) -> bool:
+        """Canonical-equality check: does the composer hold *expected*?
+
+        Compares editor-visible text with canonical normalization (CRLF→LF,
+        NBSP→space, tolerate a trailing block newline ProseMirror adds) — but
+        does NOT broadly collapse internal whitespace, since that would hide
+        real corruption of code/YAML/Markdown indentation.
+
+        For a contenteditable ProseMirror div, neither ``innerText`` nor
+        ``textContent`` reconstructs what the user typed across line breaks:
+        ``\\n`` in the input becomes a new ``<p>`` block, and ProseMirror
+        renders blank-line paragraphs as ``<p><br></p>``. ``innerText`` then
+        emits *several* newlines per block boundary (measured: a 2-newline
+        input read back as 5), while ``textContent`` joins blocks with
+        *nothing* (0 newlines). Both fail canonical equality for any
+        multi-line prompt. The fix is a block-aware extractor: join each
+        top-level block child's text with a single ``\\n``, and treat an
+        empty block (the ``<br>``-only paragraph from a blank line) as one
+        newline. This reconstructs the typed text faithfully for both
+        single-line and multi-line input. Legacy ``<textarea>`` still reads
+        ``.value``, which is already exact.
+        """
+        # Imported lazily to avoid a module-load circular dependency.
+        from .cdp_driver import CDPJSError
+
+        d = self._driver
+        try:
+            actual = await d._js_strict(
+                "(function(){"
+                f"  var el = document.querySelector('{selector}');"
+                "  if (!el) return '';"
+                "  if (el.tagName === 'TEXTAREA') return el.value;"
+                # Block-aware read for contenteditable. Walk the immediate
+                # child nodes; each element block contributes its text plus
+                # one trailing newline, each text node contributes itself.
+                # An empty block (the <br>-only paragraph from a blank line)
+                # collapses to a single blank line, matching a typed "\n\n".
+                # This yields exactly the number of newlines the user typed.
+                "  var parts = [];"
+                "  function blockText(node) {"
+                "    return (node.textContent || '').replace(/\\u00a0/g, ' ');"
+                "  }"
+                "  for (var i = 0; i < el.childNodes.length; i++) {"
+                "    var child = el.childNodes[i];"
+                "    if (child.nodeType === 3) { parts.push(child.nodeValue || ''); }"
+                "    else if (child.nodeType === 1) {"
+                "      parts.push(blockText(child));"
+                "    }"
+                "  }"
+                "  var joined = parts.join('\\n');"
+                # ProseMirror may append a trailing empty <p>/<br> block that
+                # adds a stray trailing newline; strip at most one to mirror
+                # the single-trailing-newline tolerance below.
+                "  return joined.replace(/\\n$/, '');"
+                "})()"
+            )
+        except CDPJSError:
+            return False
+        if not actual:
+            return False
+        canon_actual = actual.replace("\r\n", "\n").replace("\r", "\n").replace("\u00a0", " ")
+        canon_expected = expected.replace("\r\n", "\n").replace("\r", "\n").replace("\u00a0", " ")
+        # ProseMirror wraps input in a <p> and may append a trailing block
+        # newline. Tolerate AT MOST ONE editor-added trailing newline — but
+        # never strip a user-intended trailing newline. So accept an exact
+        # match, OR actual == expected + one editor newline. (Stripping
+        # unconditionally would corrupt prompts that legitimately end in \n.)
+        return canon_actual == canon_expected or canon_actual == canon_expected + "\n"
+
+    async def click_send(self) -> None:
+        """Click the send button via JS MouseEvent sequence.
+
+        The new composer has no ``data-testid="send-button"``; its send
+        affordance is the submit ``<button aria-label="Send ...">`` inside
+        the composer form. We prefer that, falling back to the legacy
+        testid selector for older deployments. The stop button (which
+        appears during generation) is explicitly excluded — it also
+        carries an aria-label, but never "Send".
+        """
+        d = self._driver
+        # Wait for the send button to appear and be enabled. Try the new
+        # aria-label selector first, then the legacy testid fallback.
+        for _ in range(10):
+            has_btn = await d._js(
+                "(function() {"
+                f"  var btn = document.querySelector('{SEND_BUTTON_SELECTOR}')"
+                f"       || document.querySelector('{SEND_BUTTON_FALLBACK_SELECTOR}');"
+                "  return btn && !btn.disabled ? 'yes' : 'no';"
+                "})()"
+            )
+            if has_btn == "yes":
+                break
+            await asyncio.sleep(0.3)
+
+        result = await d._js(
+            "(function() {"
+            f"  var btn = document.querySelector('{SEND_BUTTON_SELECTOR}')"
+            f"       || document.querySelector('{SEND_BUTTON_FALLBACK_SELECTOR}');"
+            "  if (!btn) return 'no send button';"
+            "  if (btn.disabled) return 'button disabled';"
+            "  var evts = ['pointerdown','mousedown','pointerup','mouseup','click'];"
+            "  for (var i = 0; i < evts.length; i++) {"
+            "    btn.dispatchEvent(new MouseEvent(evts[i], {bubbles:true, cancelable:true, view:window}));"
+            "  }"
+            "  return 'sent';"
+            "})()"
+        )
+        if result != "sent":
+            await d._capture_selector_diagnostic("send-button (click_send)")
+            if d._breakers:
+                d._breakers.record_failure(BreakerKind.COMPOSER_SEND_READINESS)
+            from .cdp_driver import SendReadinessError
+
+            raise SendReadinessError(f"Send failed: {result}")
+        logger.info("Message sent")
+        # Success: clear composer failure history and recover a half-open
+        # breaker. Only after the message is confirmed sent — not after
+        # type_message alone, since a successful type can still fail to send.
+        if d._breakers:
+            d._breakers.record_success(BreakerKind.COMPOSER_SEND_READINESS)
+
+    # ── Rate-limit popup ──────────────────────────────────────
+
+    async def dismiss_rate_limit(self) -> bool:
+        """Dismiss ChatGPT's 'Too many requests' pop-up by clicking 'Got it'.
+
+        Targets the pop-up by its text ('Too many requests') rather than fragile
+        class names: find the ``[role=dialog]`` whose text matches, then click
+        the button inside it whose text is 'Got it'. After clicking, re-scan the
+        page to confirm the pop-up cleared.
+
+        Best-effort: never raises. Returns True if the pop-up is gone after the
+        attempt, False if it couldn't be dismissed (button missing, or the
+        limit persists), None if the status is unknown (scan error — the
+        click may have succeeded but we can't confirm). Callers should retry
+        on False but NOT on None, to avoid hammering an already-dismissed pop-up.
+        """
+        d = self._driver
+        click_js = (
+            "(function(){"
+            "  try {"
+            "    var dlgs = document.querySelectorAll('[role=dialog]');"
+            "    var target = null;"
+            "    for (var i = 0; i < dlgs.length; i++) {"
+            "      if (/too many requests/i.test(dlgs[i].innerText || '')) { target = dlgs[i]; break; }"
+            "    }"
+            "    if (!target) return JSON.stringify({clicked: false});"
+            "    var btns = target.querySelectorAll('button');"
+            "    var btn = null;"
+            "    for (var j = 0; j < btns.length; j++) {"
+            "      if ((btns[j].innerText || '').trim().toLowerCase() === 'got it') { btn = btns[j]; break; }"
+            "    }"
+            "    if (!btn) return JSON.stringify({clicked: false});"
+            "    btn.click();"
+            "    return JSON.stringify({clicked: true});"
+            "  } catch(e) { return JSON.stringify({clicked: false, error: e.message}); }"
+            "})()"
+        )
+        try:
+            click_raw = await d._js_strict(click_js, timeout=10)
+            clicked = json.loads(click_raw).get("clicked", False) if click_raw else False
+        except Exception:  # best-effort: never raise
+            logger.warning("dismiss_rate_limit: click failed", exc_info=True)
+            return None  # unknown — don't trigger retry storm
+        if not clicked:
+            return False
+
+        # Re-scan to confirm the pop-up cleared.
+        try:
+            scan = await d._js_strict(
+                "(function(){var t=(document.body&&document.body.innerText)||'';"
+                "return JSON.stringify({text:t.slice(0,4000)});})()",
+                timeout=10,
+            )
+            text = json.loads(scan).get("text", "") if scan else ""
+        except Exception:
+            # #19: If the re-scan errors, the status is unknown (not False).
+            # Returning False would trigger a retry storm against an already-
+            # dismissed pop-up; returning None lets callers skip the retry.
+            return None
+        from .cdp_driver import is_rate_limited_text
+
+        return not is_rate_limited_text(text)
+
+    # ── Diagnostics ───────────────────────────────────────────
+
+    async def _capture_selector_diagnostic(self, selector_name: str) -> None:
+        """#5: Capture DOM state when a selector fails to match.
+
+        Logs a diagnostic snapshot (URL, title, body text preview, button count)
+        so selector drift is diagnosable without W2A_DIAGNOSE=1. Called at the
+        point of selector failure (e.g. 'no send button', 'No textarea').
+        Best-effort — never raises.
+        """
+        d = self._driver
+        try:
+            snapshot = await d._js_strict(
+                "(function(){"
+                "  return JSON.stringify({"
+                "    url: location.href,"
+                "    title: document.title,"
+                "    body_preview: (document.body && document.body.innerText || '').slice(0, 300),"
+                "    button_count: document.querySelectorAll('button').length,"
+                "    textarea_count: document.querySelectorAll('textarea').length"
+                "  });"
+                "})()",
+                timeout=5,
+            )
+            logger.warning("Selector drift diagnostic (%s): %s", selector_name, snapshot)
+        except Exception:
+            logger.warning("Selector drift diagnostic (%s): capture failed", selector_name)
