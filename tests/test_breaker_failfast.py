@@ -70,6 +70,7 @@ def _make_mcp_server_with_open_breaker():
     driver.navigate_new_chat = AsyncMock()
     driver.navigate_conversation = AsyncMock()
     driver.ensure_current_conversation = AsyncMock()
+    driver.recover_auth = AsyncMock(return_value=False)
     driver._current_conv_id = ""
     driver._current_model = None
 
@@ -135,6 +136,7 @@ async def test_mcp_closed_breaker_does_not_fail_fast(monkeypatch):
     driver.navigate_new_chat = AsyncMock()
     driver.navigate_conversation = AsyncMock()
     driver.ensure_current_conversation = AsyncMock()
+    driver.recover_auth = AsyncMock(return_value=False)
     driver._current_conv_id = ""
     driver._current_model = None
 
@@ -162,3 +164,250 @@ async def test_mcp_closed_breaker_does_not_fail_fast(monkeypatch):
         )
 
     assert result.isError is False
+
+
+# ── Blocker 1: post-lock re-check catches a race ──────────────────────
+
+
+@pytest.mark.asyncio
+async def test_rest_post_lock_check_catches_race(monkeypatch):
+    """If a breaker trips while a request waits on the cross-process lock, the
+    post-lock check must catch it and return 503 without driving Chrome.
+
+    Simulates: breaker closed at pre-lock check → trip during lock wait →
+    post-lock check catches it. select_model / navigate_new_chat /
+    send_and_stream must NOT be called.
+    """
+    import chatgpt_web2api.api_server as srv
+
+    server = srv.APIServer.__new__(srv.APIServer)
+    server._last_conv_id = None
+    server._last_project_id = None
+    server._request_count = 0
+    server._cdp_port = 9222
+    server._config = srv.Config.load(None)
+    server._last_error = None
+    reg = BreakerRegistry()
+    server._breakers = reg
+
+    driver = MagicMock()
+    driver._current_conv_id = None
+    driver._current_model = None
+    driver.recover_auth = AsyncMock(return_value=False)
+    driver.select_model = AsyncMock(return_value=True)
+    driver.navigate_new_chat = AsyncMock()
+    driver.navigate_conversation = AsyncMock()
+    driver.ensure_current_conversation = AsyncMock()
+
+    async def _stream(text, timeout=120):
+        yield MagicMock()
+
+    driver.send_and_stream = _stream
+    server._driver = driver
+
+    # A lock wrapper that trips a breaker ONCE (simulating a concurrent request
+    # tripping it during the wait). The pre-lock check sees closed; the post-
+    # lock check sees open.
+    tripped = {"done": False}
+
+    class _RacingLock:
+        def __init__(self, *a, **kw):
+            pass
+
+        async def __aenter__(self):
+            if not tripped["done"]:
+                reg.trip(
+                    BreakerKind.COMPOSER_SEND_READINESS,
+                    "race trip",
+                    cooldown_s=300.0,
+                )
+                tripped["done"] = True
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+    import chatgpt_web2api.api_server as mod
+
+    monkeypatch.setattr(mod, "CrossProcessLock", _RacingLock)
+
+    request = MagicMock()
+    request.json = AsyncMock(
+        return_value={
+            "messages": [{"role": "user", "content": "hello"}],
+            "model": "auto",
+            "stream": False,
+        }
+    )
+
+    resp = await server._handle_chat(request)
+
+    assert resp.status == 503
+    body = json.loads(resp.body)
+    assert body["error"]["code"] == "circuit_open"
+    # Chrome was NOT driven — the post-lock check fired first.
+    driver.select_model.assert_not_called()
+    driver.navigate_new_chat.assert_not_called()
+    driver.navigate_conversation.assert_not_called()
+
+
+# ── Blocker 2: AUTH_EXPIRED recovery probe ────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_rest_auth_recovery_probes_then_proceeds(monkeypatch):
+    """When AUTH_EXPIRED is open, the preflight probes recover_auth() before
+    failing fast. If recovery succeeds (user logged back in), the breaker is
+    reset and the request proceeds normally — no 503."""
+    import chatgpt_web2api.api_server as srv
+
+    server = srv.APIServer.__new__(srv.APIServer)
+    server._last_conv_id = None
+    server._last_project_id = None
+    server._request_count = 0
+    server._cdp_port = 9222
+    server._config = srv.Config.load(None)
+    server._last_error = None
+    server._last_successful_send_at = None
+    reg = BreakerRegistry()
+    reg.trip(BreakerKind.AUTH_EXPIRED, "401", cooldown_s=0)
+    server._breakers = reg
+
+    driver = MagicMock()
+    driver._current_conv_id = None
+    driver._current_model = None
+    # Recovery succeeds — auth is valid again. The mock mimics the real
+    # recover_auth() by resetting the breaker before returning True.
+    recover_called = {"count": 0}
+
+    async def _recover_ok():
+        recover_called["count"] += 1
+        reg.reset(BreakerKind.AUTH_EXPIRED)
+        return True
+
+    driver.recover_auth = _recover_ok
+    driver.select_model = AsyncMock(return_value=True)
+    driver.navigate_new_chat = AsyncMock()
+    driver.navigate_conversation = AsyncMock()
+    driver.ensure_current_conversation = AsyncMock()
+
+    reached = {"sent": False}
+
+    async def _full_response(*a, **kw):
+        reached["sent"] = True
+        resp = MagicMock()
+        resp.status = 200
+        return resp
+
+    server._full_response = _full_response
+    server._stream_response = _full_response
+    server._driver = driver
+
+    # Bypass the cross-process lock.
+    class _NullLock:
+        def __init__(self, *a, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+    import chatgpt_web2api.api_server as mod
+
+    monkeypatch.setattr(mod, "CrossProcessLock", _NullLock)
+
+    request = MagicMock()
+    request.json = AsyncMock(
+        return_value={
+            "messages": [{"role": "user", "content": "hello"}],
+            "model": "auto",
+            "stream": False,
+        }
+    )
+
+    await server._handle_chat(request)
+
+    # Recovery was probed and succeeded; the request proceeded.
+    assert reached["sent"] is True
+    assert recover_called["count"] >= 1
+    # Breaker was reset.
+    assert reg.is_open(BreakerKind.AUTH_EXPIRED) is False
+
+
+@pytest.mark.asyncio
+async def test_rest_auth_recovery_fails_still_fail_fasts():
+    """When AUTH_EXPIRED is open and recovery fails, the preflight still
+    fails fast with 503 circuit_open."""
+    import chatgpt_web2api.api_server as srv
+
+    server = srv.APIServer.__new__(srv.APIServer)
+    server._last_conv_id = None
+    server._last_project_id = None
+    server._request_count = 0
+    server._cdp_port = 9222
+    server._config = srv.Config.load(None)
+    server._last_error = None
+    reg = BreakerRegistry()
+    reg.trip(BreakerKind.AUTH_EXPIRED, "401", cooldown_s=0)
+    server._breakers = reg
+
+    driver = MagicMock()
+    driver._current_conv_id = None
+    driver._current_model = None
+    # Recovery fails — auth still invalid.
+    driver.recover_auth = AsyncMock(return_value=False)
+    driver.select_model = AsyncMock(return_value=True)
+    driver.navigate_new_chat = AsyncMock()
+    server._driver = driver
+
+    request = MagicMock()
+    request.json = AsyncMock(
+        return_value={
+            "messages": [{"role": "user", "content": "hello"}],
+            "model": "auto",
+            "stream": False,
+        }
+    )
+
+    resp = await server._handle_chat(request)
+
+    assert resp.status == 503
+    body = json.loads(resp.body)
+    assert body["error"]["code"] == "circuit_open"
+    driver.navigate_new_chat.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_driver_recover_auth_resets_on_successful_refresh(monkeypatch):
+    """driver.recover_auth() calls _refresh_token and resets AUTH_EXPIRED on
+    success; on failure leaves the breaker open."""
+    from chatgpt_web2api.cdp_driver import CDPDriver
+
+    driver = CDPDriver.__new__(CDPDriver)
+    driver._breakers = BreakerRegistry()
+    driver._access_token = ""
+
+    # Success path: _refresh_token returns (non-empty token) → reset.
+    driver._breakers.trip(BreakerKind.AUTH_EXPIRED, "401", cooldown_s=0)
+    assert driver._breakers.is_open(BreakerKind.AUTH_EXPIRED) is True
+
+    async def _ok_refresh():
+        driver._access_token = "newtoken"
+
+    driver._refresh_token = _ok_refresh
+    result = await driver.recover_auth()
+    assert result is True
+    assert driver._breakers.is_open(BreakerKind.AUTH_EXPIRED) is False
+
+    # Failure path: _refresh_token raises → breaker stays open.
+    driver._breakers.trip(BreakerKind.AUTH_EXPIRED, "401", cooldown_s=0)
+
+    async def _bad_refresh():
+        raise RuntimeError("No access token")
+
+    driver._refresh_token = _bad_refresh
+    result = await driver.recover_auth()
+    assert result is False
+    assert driver._breakers.is_open(BreakerKind.AUTH_EXPIRED) is True

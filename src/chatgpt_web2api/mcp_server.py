@@ -42,7 +42,7 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from pydantic import BaseModel, Field
 
-from .breakers import BreakerRegistry, CircuitOpenError
+from .breakers import BreakerKind, BreakerRegistry, CircuitOpenError
 from .cdp_driver import (
     AuthExpiredError,
     CDPDriver,
@@ -1514,10 +1514,16 @@ def create_server() -> Server:
         async def _run() -> dict:
             """Execute the handler, with transparent rate-limit retry for chat tools."""
             # Circuit-open fail-fast (Phase 4 PR2): refuse before driving Chrome
-            # if a breaker is open on this process's driver. Checked here so it
-            # covers both chat and non-chat tools.
-            if _breakers is not None and (open_kind := _breakers.first_open()):
-                raise CircuitOpenError(open_kind)
+            # if a breaker is open on this process's driver. If AUTH_EXPIRED is
+            # open, probe auth recovery first (the user may have logged back in).
+            if _breakers is not None:
+                open_kind = _breakers.first_open()
+                if open_kind is not None:
+                    if open_kind is BreakerKind.AUTH_EXPIRED:
+                        if await _driver.recover_auth():
+                            open_kind = _breakers.first_open()
+                    if open_kind is not None:
+                        raise CircuitOpenError(open_kind)
             if name in _CHAT_TOOLS:
                 # on_progress is the same callback the lambda captures and
                 # passes into the business function; here it's also used by

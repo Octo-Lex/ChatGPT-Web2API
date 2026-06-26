@@ -17,7 +17,7 @@ import uuid
 
 from aiohttp import web
 
-from .breakers import BreakerRegistry, CircuitOpenError
+from .breakers import BreakerKind, BreakerRegistry, CircuitOpenError
 from .cdp_driver import (
     AuthExpiredError,
     CDPDriver,
@@ -309,11 +309,17 @@ class APIServer:
             # the except below → _error_response + _last_error, consistent with
             # every other failure path. Checked before acquiring the lock so a
             # process that already knows it will refuse doesn't block on the
-            # browser lock.
-            if open_kind := self._breakers.first_open():
-                raise CircuitOpenError(open_kind)
+            # browser lock. If AUTH_EXPIRED is open, probes auth recovery first
+            # (the user may have logged back in).
+            await self._check_circuit_or_recover()
 
             async with CrossProcessLock(cdp_port=self._cdp_port):
+                # Second circuit-open check, now that we hold the lock. A
+                # concurrent request may have tripped a breaker while we were
+                # waiting. Without this, we'd drive Chrome despite the process
+                # already knowing the circuit is open.
+                await self._check_circuit_or_recover()
+
                 # Select model if specified (non-fatal on failure)
                 if model_slug and model_slug != "auto":
                     selected = await self._driver.select_model(model_slug)
@@ -354,6 +360,28 @@ class APIServer:
             logger.error("Chat error: %s", e, exc_info=True)
             self._last_error = f"{type(e).__name__}: {e}"
             return self._error_response(e)
+
+    async def _check_circuit_or_recover(self) -> None:
+        """Fail-fast if a breaker is open, with one exception: if AUTH_EXPIRED
+        is the open breaker, probe auth recovery first (the user may have logged
+        back in via the browser since the trip). If recovery succeeds the breaker
+        is reset and the request proceeds; if it fails, or if a non-auth breaker
+        is open, raise CircuitOpenError.
+
+        Called at each fail-fast checkpoint (pre-lock, post-lock, streaming
+        pre-prepare). Does NOT drive a chat send — recovery is a lightweight
+        ``/api/auth/session`` token fetch via ``driver.recover_auth()``.
+        """
+        open_kind = self._breakers.first_open()
+        if open_kind is None:
+            return
+        if open_kind is BreakerKind.AUTH_EXPIRED:
+            if await self._driver.recover_auth():
+                # Auth restored — re-check in case another breaker is also open.
+                open_kind = self._breakers.first_open()
+                if open_kind is None:
+                    return
+        raise CircuitOpenError(open_kind)
 
     # ── Error mapping ─────────────────────────────────────────
 
@@ -528,13 +556,11 @@ class APIServer:
             # Persistent at pre-flight: still pre-prepare, so send a clean 429.
             raise
 
-        # Circuit-open fail-fast (Phase 4 PR2): second check, after navigation
-        # and rate-limit preflight but still before prepare() commits HTTP 200.
-        # A breaker may have opened during model selection/navigation since the
-        # pre-lock check in _handle_chat. After prepare() no status change is
-        # possible, so this must stay pre-prepare.
-        if open_kind := self._breakers.first_open():
-            raise CircuitOpenError(open_kind)
+        # Circuit-open fail-fast (Phase 4 PR2): final check, after rate-limit
+        # preflight but still before prepare() commits HTTP 200. A breaker may
+        # have opened during model selection/navigation. After prepare() no
+        # status change is possible, so this must stay pre-prepare.
+        await self._check_circuit_or_recover()
 
         resp = web.StreamResponse()
         resp.content_type = "text/event-stream"

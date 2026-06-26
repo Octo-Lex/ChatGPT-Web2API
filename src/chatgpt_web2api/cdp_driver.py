@@ -2953,6 +2953,33 @@ class CDPDriver:
         self._owns_target = False
         logger.info("CDP driver closed")
 
+    async def recover_auth(self) -> bool:
+        """Probe whether the ChatGPT session is valid again, and if so reset
+        the AUTH_EXPIRED breaker.
+
+        Called by the REST/MCP fail-fast preflight when AUTH_EXPIRED is the open
+        breaker — a user may have logged back in via the browser since the trip.
+        This refreshes the access token (a lightweight ``/api/auth/session``
+        fetch, NOT a chat send): a non-empty token means auth is restored, so we
+        reset the breaker and return True. A failure or empty token leaves the
+        breaker open and returns False (caller proceeds to fail-fast).
+
+        Does NOT touch ``record_success`` — auth recovery is an explicit
+        ``reset()``, matching the indefinite-auth semantics (auth is not a
+        rolling-window breaker).
+        """
+        if self._breakers is None or not self._breakers.is_open(BreakerKind.AUTH_EXPIRED):
+            return True  # nothing to recover
+        try:
+            await self._refresh_token()
+        except Exception as e:
+            logger.info("Auth recovery probe failed: %s", e)
+            return False
+        # _refresh_token only returns on a non-empty token (it raises on failure).
+        logger.info("Auth recovered — resetting AUTH_EXPIRED breaker")
+        self._breakers.reset(BreakerKind.AUTH_EXPIRED)
+        return True
+
     @property
     def is_connected(self) -> bool:
         return self._ws is not None and self._ws.state.name == "OPEN"
