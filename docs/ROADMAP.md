@@ -56,12 +56,15 @@ start in Phase 2+.
 
 ### Remaining work only
 
-1. **Regression tests for zombie states.** A process that is listening but not
-   connected must not report healthy:
+1. **Regression tests for zombie states** — ✅ largely done. The pinned cases
+   already exist in `tests/test_health.py`:
    - listener alive, Chrome alive, driver disconnected → `/health` returns
-     `degraded`
+     `degraded` (`test_health_degraded_when_chrome_alive_but_driver_disconnected`)
    - listener alive, Chrome dead → `/health` returns `broken`
-   - in neither case may `status` be `healthy` or `starting`
+     (`test_health_broken_when_chrome_dead`)
+   - PR3 added further coverage: an open breaker never forces `broken`, a
+     disconnect-degraded is not worsened, and `starting`/`healthy` downgrade
+     correctly. Audit remaining gaps before adding more; most are covered.
 
 2. **Targeted debug logging for meaningful silent failures.** Many
    `except Exception: pass` exist (~20, mostly `cdp_driver.py`). Most are
@@ -223,86 +226,126 @@ MCP/SSE remains one persistent attaching process
 
 ---
 
-## Phase 4 — Non-rate-limit breaker policy
+## Phase 4 — Non-rate-limit breaker policy  ✅ DONE
 
 **Scope correction:** rate-limit retry/backoff is **already substantially
 implemented** in `resilience.py` (transparent retry, `Retry-After` respected,
 jitter, `max_attempts=3`, dismiss-popup, persistent-limit escape → parseable
 `RateLimitError`). Do not rebuild it.
 
-### Remaining breaker classes
+### Breaker classes — all shipped
 
-1. **Auth expired**
-   - trip immediately
-   - no retry storm
-   - require human browser login
-   - expose `auth_required`
+1. **Auth expired** (`auth_required`)
+   - trips immediately on `AuthExpiredError`; no retry storm
+   - sticky (no half-open) — requires human browser login
+   - exposed as `auth_required` in `/health`
+2. **Composer / send-readiness** (`composer_send_readiness`)
+   - trip after 3 failures in a 120s window; 300s cooldown
+3. **CDP reconnect failures** (`cdp_reconnect`)
+   - 5 failures in a 120s window → 120s cooldown
+4. **Chrome crash loop** (`chrome_crash_loop`)
+   - 3 restarts in a 300s window → 300s cooldown
 
-2. **Composer / send-readiness**
-   - one `navigate_new_chat` recovery attempt
-   - trip after repeated failures (3 in 2 min)
-   - cooldown 2–5 min
-
-3. **CDP reconnect failures**
-   - track repeated failed reconnects
-   - cooldown before more send attempts (5 failures in 2 min → 2 min cooldown)
-
-4. **Chrome crash loop**
-   - track repeated Chrome restarts (3 in 5 min)
-   - enter degraded/broken state with cooldown (5 min)
+Thresholds/windows/cooldowns are hardcoded in `_DEFAULT_POLICIES`
+(`breakers.py`); see the deferred follow-up E below before making them
+configurable.
 
 ### Exposure
 
 ```text
-/health          (breaker state in the response)
-REST errors
-MCP errors
+/health          status downgrade + open_breakers + per-breaker snapshot
+REST errors      503 circuit_open (with kind)
+MCP errors       isError result (circuit_open, kind=...)
 logs
 ```
 
-**Keep this before the big refactor (Phase 5).** Stabilize behavior first, then
-move code.
+**Kept before the big refactor (Phase 5).** Behavior is now instrumented and
+proven stable; Phase 5 may move the code.
 
-### Sequencing — two PRs
+### Sequencing — three PRs (all merged)
 
-Phase 4 is split to keep review tight: ship the infrastructure with no behavior
-change first, then wire the real failure signals in a second PR.
+Phase 4 was split to keep review tight: ship the infrastructure with no
+behavior change, then wire the real failure signals, then add operator-facing
+status policy.
 
-- **PR1 — breaker registry + `/health` exposure.** Ships
+- ✅ **PR1 (#18) — breaker registry + `/health` exposure.** Shipped
   `src/chatgpt_web2api/breakers.py`: a `BreakerRegistry` keyed by `BreakerKind`
-  (auth_required, composer_send_readiness, cdp_reconnect, chrome_crash_loop)
   with `record_failure` / `record_success` / `trip` / `is_open` / `snapshot`.
-  `/health` gains a `breakers` snapshot field. **Nothing records failures or
-  trips a breaker yet** — the registry only counts, and `trip()` is the explicit
-  caller-driven path (threshold auto-trip is deferred). Zero behavior change:
-  `/health` always reports all breakers closed. This proves the plumbing
+  `/health` gained a `breakers` snapshot field. Zero behavior change at the
+  time: `/health` always reported all breakers closed. Proved the plumbing
   risk-free.
-- **PR2 — wire failure signals + fail-fast.** Adds the typed exceptions the
-  composer/CDP paths need (`SendReadinessError`, `CDPReconnectError` — they
-  previously raised bare `RuntimeError`, so a type-keyed breaker couldn't
-  distinguish them), calls `record_failure`/`trip` at the detection sites
-  (`AuthExpiredError` at `cdp_driver.py:2046`/`:2207` uses explicit `trip()`;
-  composer at `_ensure_send_ready`/`type_message`/`click_send` and CDP reconnect
-  at `reconnect()` use `record_failure` with auto-trip; Chrome at
-  `chrome.py:restart()` records `CHROME_CRASH_LOOP`), enforces the thresholds
-  above, adds REST fail-fast (`_error_response` 503 `circuit_open`) + MCP
-  `(circuit_open, kind=...)` result, and wires half-open recovery
-  (`record_success` after a confirmed send / successful reconnect; auth stays
-  indefinite until explicit `reset()`). The registry is per-process
-  (driver-owned via DI): REST shares one across Chrome + driver + server; MCP
-  has its own for its driver. `CircuitOpenError` lives in `breakers.py` (not the
-  driver) since it is a control-plane preflight signal, not a driver failure.
-- **PR3 — `/health` status policy + config tunables (deferred).** PR2 ships the
-  `breakers` snapshot but does NOT change the `/health` status string (an open
-  breaker does not yet flip `healthy` → `degraded`) and does NOT add config
-  tunables (`W2A_BREAKER_*`). Both are deferred until the PR2 behavior is proven
-  in operation; the policy constants stay in `breakers.py` until real-world
-  tuning data shows the defaults need adjustment.
+- ✅ **PR2 (#19) — wire failure signals + fail-fast + half-open recovery.** Added
+  the typed exceptions the composer/CDP paths need (`SendReadinessError`,
+  `CDPReconnectError`), wired `record_failure`/`trip` at the detection sites,
+  enforced thresholds, added REST fail-fast (`_error_response` 503
+  `circuit_open`) + MCP `(circuit_open, kind=...)` result, and wired half-open
+  recovery (`record_success` after a confirmed send / successful reconnect; auth
+  stays indefinite until explicit `reset()` via `recover_auth()`). Includes the
+  post-lock re-check and AUTH_EXPIRED recovery probe in REST/MCP preflight. The
+  registry is per-process (driver-owned via DI). `CircuitOpenError` lives in
+  `breakers.py`. Runtime-validated on `dd97f91`.
+- ✅ **PR3 (#20) — `/health` status policy + breaker-aware ensure.** An open
+  breaker now **downgrades** `starting`/`healthy` → `degraded` (never `broken`;
+  a disconnect-degraded stays degraded). New `/health` fields: a top-level
+  `open_breakers` current-state list (distinct from the historical/latching
+  `last_error`) and a per-breaker `cooldown_seconds_remaining` duration (not an
+  opaque monotonic timestamp) so `ensure.py` can reason about cooldown across
+  the process boundary. `ensure` is breaker-aware: degraded + open
+  `auth_required` → **exit 2** (login needed, no REST restart, no SSE
+  reconcile); degraded + open timed breaker → wait cooldown+grace then
+  recover/restart (with a cooldown-boundary re-fetch); degraded without breaker
+  info → legacy 20s-poll-then-restart. Adds narrow **ensure-only** config
+  tunables (`EnsureConfig`: poll interval/budget, cooldown grace) via
+  `ensure_*` flat keys + `W2A_ENSURE_*` env; config `port`/`cdp_port` never
+  override explicit `run_ensure` args. Exit codes: `0` ready, `1` generic
+  failure, `2` auth/login needed. Runtime-validated on `2668243`.
 
 ```
-PR1  →  registry + snapshot (no behavior change)
-PR2  →  signals + typed exceptions + fail-fast + half-open recovery
-PR3  →  status policy (degraded on open breaker) + config tunables
+PR1 (#18) →  registry + snapshot (no behavior change)
+PR2 (#19) →  signals + typed exceptions + fail-fast + half-open recovery
+PR3 (#20) →  status policy + breaker-aware ensure + ensure-only tunables
+```
+
+> **Tunables scope note:** PR3 shipped **ensure-only** tunables, NOT
+> `BreakerPolicy` threshold/window/cooldown config. `W2A_BREAKER_*` keys do not
+> exist. Threshold constants stay in `breakers.py` until real-world tuning data
+> shows the defaults need adjustment (deferred follow-up E).
+
+### Known follow-ups (not yet roadmap phases)
+
+Discovered during Phase 4 runtime validation. Each is a separate, small PR — do
+not bundle them into the Phase 5 refactor.
+
+```text
+A. _fetch_text transient 404 retry
+   cdp_driver._fetch_text can hit a backend 404 immediately after send, before
+   the just-created conversation is persisted server-side. Treat this as a
+   bounded transient retry, NOT a breaker. Recommended sequence: extract
+   backend_client.py (Phase 5 PR1, no behavior change) FIRST, then fix the 404
+   in the new module so the retry patch is easy to review.
+
+B. requests_served semantics
+   /health.requests_served currently counts requests accepted/handled, not
+   successful responses. Either document it as "accepted/handled" or add a
+   distinct successful_requests counter. Do NOT change the existing counter's
+   meaning silently.
+
+C. Non-401 backend-error observability
+   Only HTTP 401 trips a breaker (AUTH_EXPIRED). Other backend errors (404/5xx)
+   raise a bare RuntimeError and never fail-fast. Decide whether persistent
+   backend 5xx/404 should stay observability-only, become a breaker signal, or
+   get a distinct /health field. Keep transient errors out of breakers unless
+   persistence is proven.
+
+D. MCP /messages trailing-slash redirect
+   The SSE-announced endpoint is /messages?session_id=... but the server 307-
+   redirects to /messages/?... (trailing slash); a 307 can drop the JSON body
+   depending on the client. Harden (announce the canonical URL) or document the
+   redirect. Real MCP clients add the slash today.
+
+E. BreakerPolicy threshold config
+   Still defer W2A_BREAKER_* threshold/window/cooldown tunables unless
+   production data shows the defaults need tuning. Do NOT add them speculatively.
 ```
 
 ---
@@ -360,14 +403,19 @@ always-on / server users → use OS supervision (this phase)
 ## Final sequencing
 
 ```text
-0. Merge PR #9
-1. Observability gaps: zombie regression tests + silent-failure logging
-2. SSE recommended transport (docs + integration tests)
-3. ensure command + ZCode hook docs
-4. non-rate-limit breaker policy
-5. split cdp_driver.py
-6. optional OS-supervision docs
+0. Merge PR #9                              ✅
+1. Observability gaps: zombie regression tests + silent-failure logging   (partial — see Phase 1)
+2. SSE recommended transport (docs + integration tests)  ✅
+3. ensure command + ZCode hook docs                        ✅
+4. non-rate-limit breaker policy                           ✅ (PR1 #18 / PR2 #19 / PR3 #20)
+5. split cdp_driver.py                                     (next architectural phase)
+6. optional OS-supervision docs                            (last, docs-only)
 ```
+
+Known follow-ups (A–E, listed under Phase 4) slot in around Phase 5 as small
+standalone PRs — do not bundle them into the refactor. The recommended
+post-Phase-4 order: extract `backend_client.py` (Phase 5 PR1, no behavior
+change) → fix `_fetch_text` 404 (follow-up A) in the new module.
 
 This version removes the stale health work, avoids duplicate rate-limit work,
 drops the under-specified stdio-process warning, moves `ensure` earlier
