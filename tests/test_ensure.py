@@ -996,3 +996,139 @@ async def test_config_does_not_override_explicit_ports(monkeypatch, tmp_path):
     assert all(p == 8080 for p in seen_ports), (
         f"config port must not override explicit arg: {seen_ports}"
     )
+
+
+# ── 20. PR3 review blockers: boundary & legacy-loop edge cases ────────
+
+
+@pytest.mark.asyncio
+async def test_timed_boundary_not_ready_does_not_return_ok(monkeypatch):
+    """Blocker 1 regression: at the cooldown boundary, the re-fetch (h2) may
+    show degraded + no open breaker + driver disconnected. That is NOT ready,
+    so the boundary branch must NOT return ok=True. It must keep polling (or
+    restart) rather than proceeding to SSE on an unready REST.
+
+    Sequence:
+      idx0: initial health in _reconcile_rest — timed open, cooldown=0.0
+            (boundary) → _wait_timed_breaker entered, first poll tick consumes idx1
+      idx1: still timed-open at cooldown 0.0 → boundary re-fetch consumes idx2
+      idx2: degraded, NO open breaker, driver_connected=False (not ready)
+            → must NOT return ok=True here; continue polling
+      idx3+: healthy → recovers legitimately via _rest_ready_for_ensure
+    """
+    _install_virtual_clock(monkeypatch)
+    boundary = _timed_open_health("cdp_reconnect", 0.0)
+    not_ready_no_breaker = {
+        "status": "degraded",
+        "chrome_running": True,
+        "cdp_connected": False,
+        "driver_connected": False,  # not ready
+        "breakers": {
+            "auth_required": _breaker_entry(False),
+            "composer_send_readiness": _breaker_entry(False),
+            "cdp_reconnect": _breaker_entry(False),  # breaker cleared
+            "chrome_crash_loop": _breaker_entry(False),
+        },
+    }
+    health_calls = _patch_health(
+        monkeypatch,
+        [boundary, boundary, not_ready_no_breaker, {"status": "healthy"}],
+    )
+    _patch_sse_tcp(monkeypatch, [True])
+    _patch_sse_verify(monkeypatch, True)
+    launches = _patch_launch(monkeypatch)
+    _patch_lock(monkeypatch)
+
+    code = await run_ensure(rest_port=8080, sse_port=8090)
+    assert code == 0
+    # It must NOT have short-circuited ok=True at idx2 (the unready no-breaker
+    # health). Proof: it consumed MORE than 3 health calls (kept polling past
+    # the boundary re-fetch until idx3 returned genuinely healthy).
+    assert health_calls["n"] > 3, (
+        f"must keep polling past the unready boundary re-fetch (calls={health_calls['n']})"
+    )
+    assert launches == [], "must not restart — it recovered via continued polling"
+
+
+@pytest.mark.asyncio
+async def test_timed_boundary_not_ready_eventually_restarts(monkeypatch):
+    """Blocker 1 regression (restart variant): boundary re-fetch is unready +
+    no breaker, and REST never recovers → must restart rather than exit 0 on
+    an unready REST."""
+    _install_virtual_clock(monkeypatch)
+    boundary = _timed_open_health("cdp_reconnect", 0.0)
+    not_ready_no_breaker = {
+        "status": "degraded",
+        "chrome_running": True,
+        "cdp_connected": False,
+        "driver_connected": False,
+        "breakers": {
+            "auth_required": _breaker_entry(False),
+            "composer_send_readiness": _breaker_entry(False),
+            "cdp_reconnect": _breaker_entry(False),
+            "chrome_crash_loop": _breaker_entry(False),
+        },
+    }
+    # boundary → boundary → unready-no-breaker, then stays unready until the
+    # timed deadline (cooldown 0 + grace 5 = 5s budget) expires → restart →
+    # _wait_rest_ready → healthy.
+    _patch_health(
+        monkeypatch,
+        [boundary, boundary, not_ready_no_breaker] + [not_ready_no_breaker] * 10 + [{"status": "healthy"}],
+    )
+    _patch_sse_tcp(monkeypatch, [True])
+    _patch_sse_verify(monkeypatch, True)
+    launches = _patch_launch(monkeypatch)
+    _patch_lock(monkeypatch)
+    _patch_listener_stop(monkeypatch)
+
+    code = await run_ensure(rest_port=8080, sse_port=8090)
+    assert code == 0
+    # Must have restarted (never returned ok=True on the unready health).
+    assert len(launches) == 1, "must restart when REST stays unready past the timed budget"
+
+
+@pytest.mark.asyncio
+async def test_legacy_degraded_loop_dispatches_timed_breaker_mid_poll(monkeypatch):
+    """Blocker 2 regression: a timed breaker that opens during the legacy
+    degraded poll (with a cooldown LARGER than the legacy budget) must dispatch
+    to _wait_timed_breaker instead of restarting at the legacy budget. The
+    legacy budget is 20s; a cooldown of 30s would be cut short without the fix.
+
+    Sequence:
+      idx0: degraded, no open breakers → enters legacy loop
+      idx1: first poll — timed breaker now open, cooldown_remaining=30.0
+            → dispatches to _wait_timed_breaker (NOT legacy restart)
+      idx2: recovered healthy (within cooldown+grace wait)
+    """
+    t = _install_virtual_clock(monkeypatch)
+    no_breaker_degraded = {
+        "status": "degraded",
+        "breakers": {
+            "auth_required": _breaker_entry(False),
+            "composer_send_readiness": _breaker_entry(False),
+            "cdp_reconnect": _breaker_entry(False),
+            "chrome_crash_loop": _breaker_entry(False),
+        },
+    }
+    _patch_health(
+        monkeypatch,
+        [
+            no_breaker_degraded,  # idx0: legacy degraded, no breakers
+            _timed_open_health("cdp_reconnect", 30.0),  # idx1: timed opens mid-poll
+            {"status": "healthy"},  # idx2: recovers
+        ],
+    )
+    _patch_sse_tcp(monkeypatch, [True])
+    _patch_sse_verify(monkeypatch, True)
+    launches = _patch_launch(monkeypatch)
+    _patch_lock(monkeypatch)
+
+    code = await run_ensure(rest_port=8080, sse_port=8090)
+    assert code == 0
+    assert launches == [], "must NOT restart — dispatched to timed wait and recovered"
+    # Must NOT have restarted at the 20s legacy budget (the timed wait was used
+    # instead). It recovered on the first timed poll tick, well under 20s.
+    assert t[0] < 20.0, (
+        f"must use timed-wait dispatch, not legacy 20s budget (t={t[0]})"
+    )

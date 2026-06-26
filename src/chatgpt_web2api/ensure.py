@@ -592,13 +592,26 @@ async def _reconcile_degraded(
             return RestReconcileResult(ok=True)
         if h and h.get("status") == "broken":
             break  # fall through to restart
-        # An auth breaker may open mid-poll (e.g. session lapsed during wait).
+        # A breaker may open mid-poll (e.g. session lapsed or a timed trip
+        # fires during the wait). Reclassify and dispatch accordingly.
         cls = _classify_degraded_breakers((h or {}).get("breakers", {}))
         if cls.auth_open:
             logger.warning(
                 "REST degraded: auth_required breaker open — login needed; not restarting"
             )
             return RestReconcileResult(ok=False, auth_needed=True)
+        # A timed breaker opened with a known cooldown: switch to the
+        # cooldown+grace wait rather than letting the (possibly shorter)
+        # legacy budget expire into a premature restart.
+        if cls.timed_open_kind is not None and cls.cooldown_remaining_s is not None:
+            logger.info(
+                "Timed breaker '%s' opened during degraded poll — switching to "
+                "cooldown+grace wait",
+                cls.timed_open_kind,
+            )
+            return await _wait_timed_breaker(
+                rest_port, cdp_port, config_path, log_level, policy, cls
+            )
     logger.info("REST still degraded after %.0fs — restarting", policy.degraded_poll_budget_s)
     ok = await _restart_rest(rest_port, cdp_port, config_path, log_level)
     return RestReconcileResult(ok=ok)
@@ -656,11 +669,21 @@ async def _wait_timed_breaker(
             h2 = _rest_health(rest_port)
             if _rest_ready_for_ensure(h2):
                 return RestReconcileResult(ok=True)
+            if h2 and h2.get("status") == "broken":
+                break  # fall through to restart
             cur2 = _classify_degraded_breakers((h2 or {}).get("breakers", {}))
-            if not cur2.timed_open_kind and not cur2.auth_open:
-                # Breaker cleared on the re-fetch — recovered.
-                return RestReconcileResult(ok=True)
-            break  # still open → restart
+            if cur2.auth_open:
+                logger.warning(
+                    "REST degraded: auth_required breaker open — login needed; not restarting"
+                )
+                return RestReconcileResult(ok=False, auth_needed=True)
+            if cur2.timed_open_kind is not None:
+                break  # still timed-open after boundary re-fetch → restart
+            # No breaker open on h2, but REST is still not ready (e.g.
+            # driver_connected=false). Do NOT return ok=True — keep polling
+            # the remaining deadline so we don't proceed to SSE on an
+            # unready REST.
+    logger.info("Timed breaker still open past cooldown+grace — restarting")
     logger.info("Timed breaker still open past cooldown+grace — restarting")
     ok = await _restart_rest(rest_port, cdp_port, config_path, log_level)
     return RestReconcileResult(ok=ok)
