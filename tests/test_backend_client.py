@@ -199,3 +199,54 @@ def test_driver_keeps_token_ttl_seconds_reexport():
     from chatgpt_web2api import cdp_driver
 
     assert cdp_driver.TOKEN_TTL_SECONDS == 3600
+
+
+# ── 7. create_memory verification uses the driver-facing get_memories seam ─
+
+
+@pytest.mark.asyncio
+async def test_create_memory_uses_driver_get_memories_for_verification():
+    """Regression: BackendClient.create_memory must verify via
+    driver.get_memories (the caller-facing seam that carries @diagnose and is
+    interceptable by driver monkeypatches), NOT via self.get_memories (the
+    client-internal method). Pre-extraction this resolved through the driver
+    method; the extraction must not bypass it."""
+    from chatgpt_web2api.cdp_driver import StreamChunk
+
+    client, driver = _make_client()
+
+    # driver.navigate_new_chat: no-op
+    driver.navigate_new_chat = AsyncMock()
+    # driver.send_and_stream: yield a small response chunk
+    async def _stream(*a, **kw):
+        yield StreamChunk(delta="ok", finish_reason=None)
+        yield StreamChunk(delta="", finish_reason="stop")
+
+    driver.send_and_stream = _stream
+    # driver.get_memories: returns a memory matching the content prefix
+    driver.get_memories = AsyncMock(return_value=[{"content": "remember this please"}])
+
+    result = await client.create_memory("remember this please")
+
+    assert result["success"] is True
+    driver.get_memories.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_create_memory_success_false_when_get_memories_no_match():
+    """When driver.get_memories returns no matching memory, success is False.
+    Guards the verification path stays wired through the driver seam."""
+    from chatgpt_web2api.cdp_driver import StreamChunk
+
+    client, driver = _make_client()
+    driver.navigate_new_chat = AsyncMock()
+
+    async def _stream(*a, **kw):
+        yield StreamChunk(delta="ok", finish_reason="stop")
+
+    driver.send_and_stream = _stream
+    driver.get_memories = AsyncMock(return_value=[{"content": "something unrelated"}])
+
+    result = await client.create_memory("remember this please")
+    assert result["success"] is False
+    driver.get_memories.assert_awaited_once()

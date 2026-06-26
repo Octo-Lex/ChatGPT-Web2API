@@ -802,7 +802,7 @@ class BackendClient:
         # this check the caller can't tell success from failure.
         memory_created = False
         try:
-            memories = await self.get_memories()
+            memories = await d.get_memories()
             memory_created = any(
                 content[:30].lower() in (m.get("content", "")[:50].lower()) for m in memories
             )
