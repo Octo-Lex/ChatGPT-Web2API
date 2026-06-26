@@ -17,6 +17,7 @@ import sys
 import time
 
 from .api_server import APIServer
+from .breakers import BreakerRegistry
 from .cdp_driver import CDPDriver
 from .chrome import ChromeProcess
 from .config import Config
@@ -43,11 +44,18 @@ class Service:
         # Enable reactive diagnostics capture if the operator opted in.
         # Off by default; only writes artifacts when W2A_DIAGNOSE=1.
         from .diagnostics import apply_env_enablement
+
         apply_env_enablement()
+
+        # 0. Circuit-breaker registry (Phase 4 PR2) — one per REST process,
+        # shared by Chrome (crash-loop), the CDP driver (auth/composer/CDP),
+        # and the API server (snapshot + fail-fast). Constructed first so every
+        # component below can record into the same registry.
+        self._breakers = BreakerRegistry()
 
         # 1. Chrome
         logger.info("Ensuring Chrome is running...")
-        self._chrome = ChromeProcess(cfg)
+        self._chrome = ChromeProcess(cfg, breakers=self._breakers)
         await self._chrome.ensure_running()
         await self._chrome.start_monitor()
 
@@ -60,6 +68,7 @@ class Service:
                 cdp_port=cfg.chrome.cdp_port,
                 server_identity=f"rest:{cfg.server.port}",
             ),
+            breakers=self._breakers,
         )
 
         try:
@@ -71,7 +80,7 @@ class Service:
             await self._driver.connect()
 
         # 3. API server
-        self._server = APIServer(cfg, self._driver)
+        self._server = APIServer(cfg, self._driver, breakers=self._breakers)
         self._runner = await self._start_server()
 
         self._print_banner()
@@ -162,6 +171,7 @@ class Service:
         names it so a user who hits the failure knows the escape hatch.
         """
         import os
+
         # Normalize empty/None to explicit loopback — security defaults must
         # not rely on empty-string semantics (aiohttp's empty-host bind is
         # loopback today, but making it explicit avoids ambiguity).
@@ -174,7 +184,8 @@ class Service:
             logger.warning(
                 "API bound to loopback (%s) with no api_keys — local no-auth "
                 "mode. Safe for single-user local use; do NOT bind remotely "
-                "without setting api_keys.", host or "127.0.0.1",
+                "without setting api_keys.",
+                host or "127.0.0.1",
             )
         elif not loopback and has_keys:
             logger.warning(

@@ -42,6 +42,7 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from pydantic import BaseModel, Field
 
+from .breakers import BreakerRegistry
 from .cdp_driver import (
     AuthExpiredError,
     CDPDriver,
@@ -71,8 +72,10 @@ ProgressCallback = Callable[[str], Awaitable[None]]
 # Input Schemas — Pydantic BaseModel (official pattern from mcp-server-git)
 # ═══════════════════════════════════════════════════════════════
 
+
 class ChatCompletionInput(BaseModel):
     """Input schema for chat_completion tool."""
+
     message: str = Field(description="The user message to send to ChatGPT")
     system_prompt: str | None = Field(
         default=None,
@@ -113,11 +116,13 @@ class ChatCompletionInput(BaseModel):
 
 class ListModelsInput(BaseModel):
     """No inputs needed — empty schema."""
+
     pass
 
 
 class ListProjectsInput(BaseModel):
     """No inputs needed — empty schema."""
+
     pass
 
 
@@ -152,6 +157,7 @@ class GetConversationInput(BaseModel):
 
 class ListConversationsInput(BaseModel):
     """Input for listing recent conversations."""
+
     limit: int = Field(
         default=28,
         description="Maximum number of conversations to return (default: 28)",
@@ -164,6 +170,7 @@ class ListConversationsInput(BaseModel):
 
 class DeleteConversationInput(BaseModel):
     """Input for deleting a conversation."""
+
     conversation_id: str = Field(
         description="UUID of the conversation to delete",
     )
@@ -171,10 +178,9 @@ class DeleteConversationInput(BaseModel):
 
 class CreateProjectInput(BaseModel):
     """Input for creating a new ChatGPT project."""
+
     name: str = Field(
-        description=(
-            "Display name for the project. This name appears in the ChatGPT sidebar."
-        ),
+        description=("Display name for the project. This name appears in the ChatGPT sidebar."),
     )
     instructions: str = Field(
         default="",
@@ -198,6 +204,7 @@ class CreateProjectInput(BaseModel):
 
 class UpdateProjectInstructionsInput(BaseModel):
     """Input for updating a project's custom instructions."""
+
     project_id: str = Field(
         description="Project gizmo ID (e.g. g-p-abc123)",
     )
@@ -212,6 +219,7 @@ class UpdateProjectInstructionsInput(BaseModel):
 
 class ArchiveConversationInput(BaseModel):
     """Input for archiving or unarchiving a conversation."""
+
     conversation_id: str = Field(description="UUID of the conversation")
     archive: bool = Field(
         default=True,
@@ -221,11 +229,13 @@ class ArchiveConversationInput(BaseModel):
 
 class ListMemoriesInput(BaseModel):
     """No inputs needed."""
+
     pass
 
 
 class CreateMemoryInput(BaseModel):
     """Input for creating a new ChatGPT memory."""
+
     content: str = Field(
         description=(
             "The fact or information to store in ChatGPT's memory. "
@@ -237,21 +247,25 @@ class CreateMemoryInput(BaseModel):
 
 class DeleteMemoryInput(BaseModel):
     """Input for deleting a ChatGPT memory."""
+
     memory_id: str = Field(description="ID of the memory to delete")
 
 
 class DeleteProjectInput(BaseModel):
     """Input for deleting a ChatGPT project."""
+
     project_id: str = Field(description="ID of the project to delete (g-p-...)")
 
 
 class ListGptsInput(BaseModel):
     """No inputs needed."""
+
     pass
 
 
 class ListProjectFilesInput(BaseModel):
     """Input for listing project files."""
+
     project_id: str = Field(
         description="Project gizmo ID to list files for",
     )
@@ -259,10 +273,10 @@ class ListProjectFilesInput(BaseModel):
 
 class ChatWithGptInput(BaseModel):
     """Input for chatting with a specific Custom GPT."""
+
     gpt_id: str = Field(
         description=(
-            "Custom GPT gizmo ID (e.g. g-hkJGhxxx). "
-            "Use list_gpts to discover available GPTs."
+            "Custom GPT gizmo ID (e.g. g-hkJGhxxx). Use list_gpts to discover available GPTs."
         ),
     )
     message: str = Field(description="The message to send to the GPT")
@@ -271,6 +285,7 @@ class ChatWithGptInput(BaseModel):
 # ═══════════════════════════════════════════════════════════════
 # Tool Name Enum — prevents typos (official pattern from mcp-server-git)
 # ═══════════════════════════════════════════════════════════════
+
 
 class ToolName(str, Enum):
     # Core chat
@@ -558,19 +573,23 @@ WRITE_ENV = "W2A_ENABLE_WRITE"
 DESTRUCTIVE_ENV = "W2A_ENABLE_DESTRUCTIVE"
 
 # Tools requiring W2A_ENABLE_WRITE=1 to be visible/callable
-_WRITE_GATED_TOOLS = frozenset({
-    ToolName.CREATE_PROJECT.value,
-    ToolName.UPDATE_PROJECT_INSTRUCTIONS.value,
-    ToolName.CREATE_MEMORY.value,
-    ToolName.ARCHIVE_CONVERSATION.value,
-})
+_WRITE_GATED_TOOLS = frozenset(
+    {
+        ToolName.CREATE_PROJECT.value,
+        ToolName.UPDATE_PROJECT_INSTRUCTIONS.value,
+        ToolName.CREATE_MEMORY.value,
+        ToolName.ARCHIVE_CONVERSATION.value,
+    }
+)
 
 # Tools requiring W2A_ENABLE_DESTRUCTIVE=1 (irreversible account changes)
-_DESTRUCTIVE_TOOLS = frozenset({
-    ToolName.DELETE_CONVERSATION.value,
-    ToolName.DELETE_MEMORY.value,
-    ToolName.DELETE_PROJECT.value,
-})
+_DESTRUCTIVE_TOOLS = frozenset(
+    {
+        ToolName.DELETE_CONVERSATION.value,
+        ToolName.DELETE_MEMORY.value,
+        ToolName.DELETE_PROJECT.value,
+    }
+)
 
 # Auth metadata advertised to clients. When api_keys is empty the
 # server genuinely has no authentication — saying so lets MCP clients
@@ -609,7 +628,8 @@ def warn_non_loopback(host: str, transport: str) -> None:
     logger.warning(
         "%s transport bound to %s with no authentication. Exposed tools "
         "are reachable from the network. Bind to 127.0.0.1 or set api_keys.",
-        transport, host,
+        transport,
+        host,
     )
 
 
@@ -638,28 +658,36 @@ def _visible_tool_names() -> set[str]:
 
 _driver: CDPDriver | None = None
 _config: Config | None = None
+# Phase 4 PR2: per-process breaker registry (MCP-local). MCP has no
+# ChromeProcess, so CHROME_CRASH_LOOP is never tripped here. Auth/composer/CDP
+# failures on MCP's own driver DO record into this registry. None until
+# run_mcp() sets it. No cross-process propagation to/from REST.
+_breakers: BreakerRegistry | None = None
 # Cross-process lock factory — creates a fresh CrossProcessLock per critical
 # section, keyed on the CDP port so all processes sharing a Chrome instance
 # serialize. None until run_mcp() sets it. Read-only tools run lock-free.
 _lock_cdp_port: int | None = None
 
 # Tools that mutate browser state — must hold the lock
-_MUTATING_TOOLS = frozenset({
-    ToolName.CHAT_COMPLETION.value,
-    ToolName.CHAT_WITH_GPT.value,
-    ToolName.DELETE_CONVERSATION.value,
-    ToolName.CREATE_PROJECT.value,
-    ToolName.UPDATE_PROJECT_INSTRUCTIONS.value,
-    ToolName.DELETE_PROJECT.value,
-    ToolName.ARCHIVE_CONVERSATION.value,
-    ToolName.CREATE_MEMORY.value,
-    ToolName.DELETE_MEMORY.value,
-})
+_MUTATING_TOOLS = frozenset(
+    {
+        ToolName.CHAT_COMPLETION.value,
+        ToolName.CHAT_WITH_GPT.value,
+        ToolName.DELETE_CONVERSATION.value,
+        ToolName.CREATE_PROJECT.value,
+        ToolName.UPDATE_PROJECT_INSTRUCTIONS.value,
+        ToolName.DELETE_PROJECT.value,
+        ToolName.ARCHIVE_CONVERSATION.value,
+        ToolName.CREATE_MEMORY.value,
+        ToolName.DELETE_MEMORY.value,
+    }
+)
 
 
 # ═══════════════════════════════════════════════════════════════
 # Business Logic — pure functions (official pattern from mcp-server-git)
 # ═══════════════════════════════════════════════════════════════
+
 
 async def _notify(on_progress: ProgressCallback | None, message: str) -> None:
     """Invoke a progress callback if present, swallowing any error.
@@ -677,19 +705,22 @@ async def _notify(on_progress: ProgressCallback | None, message: str) -> None:
     except Exception:
         logger.debug("progress notification dropped", exc_info=True)
 
+
 async def do_chat_completion(
-    driver: CDPDriver, args: dict, config: Config,
+    driver: CDPDriver,
+    args: dict,
+    config: Config,
     on_progress: ProgressCallback | None = None,
 ) -> dict:
     """Execute a chat completion through the CDP driver."""
     validated = ChatCompletionInput(**args)
-    project_id = validated.project_id or (
-        config.chatgpt.default_project_id if config else None
-    )
+    project_id = validated.project_id or (config.chatgpt.default_project_id if config else None)
 
     # Build the full text with optional system prompt
     if validated.system_prompt:
-        full_text = f"[System Instructions]\n{validated.system_prompt}\n\n[User]\n{validated.message}"
+        full_text = (
+            f"[System Instructions]\n{validated.system_prompt}\n\n[User]\n{validated.message}"
+        )
     else:
         full_text = validated.message
 
@@ -748,10 +779,7 @@ async def do_list_models(driver: CDPDriver) -> dict:
     """List available models."""
     models = await driver.get_models()
     return {
-        "models": [
-            {"id": m.get("slug", ""), "title": m.get("title", "")}
-            for m in models
-        ],
+        "models": [{"id": m.get("slug", ""), "title": m.get("title", "")} for m in models],
     }
 
 
@@ -892,16 +920,19 @@ async def do_list_memories(driver: CDPDriver) -> dict:
     result = []
     for m in memories:
         if isinstance(m, dict):
-            result.append({
-                "id": m.get("id", ""),
-                "content": m.get("content", m.get("text", "")),
-                "created_at": m.get("created_at", ""),
-            })
+            result.append(
+                {
+                    "id": m.get("id", ""),
+                    "content": m.get("content", m.get("text", "")),
+                    "created_at": m.get("created_at", ""),
+                }
+            )
     return {"memories": result}
 
 
 async def do_create_memory(
-    driver: CDPDriver, args: dict,
+    driver: CDPDriver,
+    args: dict,
     on_progress: ProgressCallback | None = None,
 ) -> dict:
     """Create a new ChatGPT memory.
@@ -951,7 +982,8 @@ async def do_list_project_files(driver: CDPDriver, args: dict) -> dict:
 
 
 async def do_chat_with_gpt(
-    driver: CDPDriver, args: dict,
+    driver: CDPDriver,
+    args: dict,
     on_progress: ProgressCallback | None = None,
 ) -> dict:
     """Chat with a specific Custom GPT."""
@@ -982,6 +1014,7 @@ async def do_chat_with_gpt(
 # ═══════════════════════════════════════════════════════════════
 # Tool Definitions — declarative list with full annotations
 # ═══════════════════════════════════════════════════════════════
+
 
 def _build_tools() -> list[mcp_types.Tool]:
     """Build the FULL list of tool definitions (all 15), unfiltered.
@@ -1361,6 +1394,7 @@ def build_tools() -> list[mcp_types.Tool]:
 # Server Factory
 # ═══════════════════════════════════════════════════════════════
 
+
 def create_server() -> Server:
     """Create and configure the MCP server with all capabilities."""
 
@@ -1423,16 +1457,16 @@ def create_server() -> Server:
     ) -> tuple[list[mcp_types.TextContent], dict] | list[mcp_types.TextContent] | dict:
         """Route tool calls to business logic functions."""
         if _driver is None:
-            raise ConnectionError(
-                "Not connected to Chrome. Run 'chatgpt-web2api' first."
-            )
+            raise ConnectionError("Not connected to Chrome. Run 'chatgpt-web2api' first.")
 
         # Build once per request: the callback reads server.request_context,
         # which is request-scoped. None when the client can't receive progress.
         on_progress = _make_progress_callback()
 
         handlers = {
-            ToolName.CHAT_COMPLETION.value: lambda: do_chat_completion(_driver, arguments, _config, on_progress),
+            ToolName.CHAT_COMPLETION.value: lambda: do_chat_completion(
+                _driver, arguments, _config, on_progress
+            ),
             ToolName.LIST_MODELS.value: lambda: do_list_models(_driver),
             ToolName.LIST_PROJECTS.value: lambda: do_list_projects(_driver),
             ToolName.GET_CONVERSATION.value: lambda: do_get_conversation(_driver, arguments),
@@ -1440,8 +1474,12 @@ def create_server() -> Server:
             ToolName.DELETE_CONVERSATION.value: lambda: do_delete_conversation(_driver, arguments),
             ToolName.CREATE_PROJECT.value: lambda: do_create_project(_driver, arguments),
             ToolName.DELETE_PROJECT.value: lambda: do_delete_project(_driver, arguments),
-            ToolName.UPDATE_PROJECT_INSTRUCTIONS.value: lambda: do_update_project_instructions(_driver, arguments),
-            ToolName.ARCHIVE_CONVERSATION.value: lambda: do_archive_conversation(_driver, arguments),
+            ToolName.UPDATE_PROJECT_INSTRUCTIONS.value: lambda: do_update_project_instructions(
+                _driver, arguments
+            ),
+            ToolName.ARCHIVE_CONVERSATION.value: lambda: do_archive_conversation(
+                _driver, arguments
+            ),
             ToolName.LIST_MEMORIES.value: lambda: do_list_memories(_driver),
             ToolName.CREATE_MEMORY.value: lambda: do_create_memory(_driver, arguments, on_progress),
             ToolName.DELETE_MEMORY.value: lambda: do_delete_memory(_driver, arguments),
@@ -1459,18 +1497,19 @@ def create_server() -> Server:
         # must be rejected rather than silently executed.
         gate = _tool_gate_env(name)
         if gate is not None and not _env_enabled(gate):
-            raise PermissionError(
-                f"Tool '{name}' is not enabled. Set {gate}=1 to expose it."
-            )
+            raise PermissionError(f"Tool '{name}' is not enabled. Set {gate}=1 to expose it.")
 
         # Tools whose business logic drives ChatGPT chat (and can hit the rate
         # limit). These get transparent retry: a transient "Too many requests"
         # pop-up is dismissed and retried so the agent never sees it. Only a
         # persistent limit surfaces — as a structured error result below.
-        _CHAT_TOOLS = frozenset({
-            ToolName.CHAT_COMPLETION.value, ToolName.CHAT_WITH_GPT.value,
-            ToolName.CREATE_MEMORY.value,  # uses send_and_stream internally
-        })
+        _CHAT_TOOLS = frozenset(
+            {
+                ToolName.CHAT_COMPLETION.value,
+                ToolName.CHAT_WITH_GPT.value,
+                ToolName.CREATE_MEMORY.value,  # uses send_and_stream internally
+            }
+        )
 
         async def _run() -> dict:
             """Execute the handler, with transparent rate-limit retry for chat tools."""
@@ -1497,13 +1536,15 @@ def create_server() -> Server:
             # structuredContent against the tool's outputSchema and this error
             # payload deliberately doesn't match any tool's success schema.
             return mcp_types.CallToolResult(
-                content=[mcp_types.TextContent(
-                    type="text",
-                    text=(
-                        f"ChatGPT rate limit reached. Retry in {e.retry_after}s. "
-                        f"(rate_limit_exceeded, retry_after={e.retry_after})"
-                    ),
-                )],
+                content=[
+                    mcp_types.TextContent(
+                        type="text",
+                        text=(
+                            f"ChatGPT rate limit reached. Retry in {e.retry_after}s. "
+                            f"(rate_limit_exceeded, retry_after={e.retry_after})"
+                        ),
+                    )
+                ],
                 isError=True,
             )
         except AuthExpiredError:
@@ -1514,10 +1555,12 @@ def create_server() -> Server:
             # structuredContent against the tool's outputSchema and this error
             # payload deliberately doesn't match any tool's success schema.
             return mcp_types.CallToolResult(
-                content=[mcp_types.TextContent(
-                    type="text",
-                    text="ChatGPT session expired — re-login required. (auth_expired)",
-                )],
+                content=[
+                    mcp_types.TextContent(
+                        type="text",
+                        text="ChatGPT session expired — re-login required. (auth_expired)",
+                    )
+                ],
                 isError=True,
             )
         except GenerationStuckError as e:
@@ -1525,23 +1568,27 @@ def create_server() -> Server:
             # from a slow generation (which keeps progressing and is allowed the
             # full timeout). Phase + duration in the text for diagnosis.
             return mcp_types.CallToolResult(
-                content=[mcp_types.TextContent(
-                    type="text",
-                    text=(
-                        f"Generation stuck in {e.phase} for {e.stalled_for_s:.0f}s "
-                        f"— no DOM progress. (generation_stuck)"
-                    ),
-                )],
+                content=[
+                    mcp_types.TextContent(
+                        type="text",
+                        text=(
+                            f"Generation stuck in {e.phase} for {e.stalled_for_s:.0f}s "
+                            f"— no DOM progress. (generation_stuck)"
+                        ),
+                    )
+                ],
                 isError=True,
             )
         except LockAcquisitionError:
             # Another process holds the cross-process lock for this Chrome tab
             # and didn't release it within the timeout. The caller should retry.
             return mcp_types.CallToolResult(
-                content=[mcp_types.TextContent(
-                    type="text",
-                    text="Browser busy — another operation in progress. Retry later. (lock_timeout)",
-                )],
+                content=[
+                    mcp_types.TextContent(
+                        type="text",
+                        text="Browser busy — another operation in progress. Retry later. (lock_timeout)",
+                    )
+                ],
                 isError=True,
             )
 
@@ -1804,21 +1851,26 @@ def create_server() -> Server:
 # ═══════════════════════════════════════════════════════════════
 
 
-async def run_mcp(
-    config: Config, transport: str = "stdio", port: int = 8090
-) -> None:
+async def run_mcp(config: Config, transport: str = "stdio", port: int = 8090) -> None:
     """Connect to Chrome and run the MCP server."""
-    global _driver, _config, _lock_cdp_port
+    global _driver, _config, _lock_cdp_port, _breakers
 
     _config = config
     _lock_cdp_port = config.chrome.cdp_port
+
+    # Phase 4 PR2: one MCP-local registry. Injected into MCP's own driver;
+    # auth/composer/CDP failures record here. CHROME_CRASH_LOOP is never
+    # tripped (MCP has no ChromeProcess). No cross-process propagation.
+    _breakers = BreakerRegistry()
 
     _driver = CDPDriver(
         cdp_port=config.chrome.cdp_port,
         tab_mode=config.chatgpt.tab_mode,
         instance_id=TabRegistry.derive_instance_id(
-            cdp_port=config.chrome.cdp_port, server_identity="mcp",
+            cdp_port=config.chrome.cdp_port,
+            server_identity="mcp",
         ),
+        breakers=_breakers,
     )
     try:
         await _driver.connect()
@@ -1847,9 +1899,7 @@ async def run_mcp(
         await _driver.close()
 
 
-async def _run_sse(
-    server: Server, init_options, config: Config, port: int
-) -> None:
+async def _run_sse(server: Server, init_options, config: Config, port: int) -> None:
     """Run MCP server with SSE transport via Starlette + uvicorn.
 
     The MCP library's ``SseServerTransport`` is ASGI-native (built on
@@ -1873,12 +1923,8 @@ async def _run_sse(
     sse = SseServerTransport("/messages")
 
     async def handle_sse(request):
-        async with sse.connect_sse(
-            request.scope, request.receive, request._send
-        ) as streams:
-            await server.run(
-                streams[0], streams[1], init_options, raise_exceptions=True
-            )
+        async with sse.connect_sse(request.scope, request.receive, request._send) as streams:
+            await server.run(streams[0], streams[1], init_options, raise_exceptions=True)
         return Response()
 
     # handle_post_message is a raw ASGI app (scope, receive, send) that
@@ -1921,12 +1967,8 @@ def main() -> None:
         default="stdio",
         help="Transport layer (default: stdio)",
     )
-    parser.add_argument(
-        "--port", type=int, default=8090, help="SSE port (default: 8090)"
-    )
-    parser.add_argument(
-        "--cdp-port", type=int, help="Chrome CDP port (default: from config)"
-    )
+    parser.add_argument("--port", type=int, default=8090, help="SSE port (default: 8090)")
+    parser.add_argument("--cdp-port", type=int, help="Chrome CDP port (default: from config)")
     parser.add_argument(
         "--log-level",
         default="INFO",
