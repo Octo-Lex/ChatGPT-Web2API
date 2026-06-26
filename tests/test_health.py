@@ -18,11 +18,11 @@ from chatgpt_web2api.api_server import APIServer
 from chatgpt_web2api.config import Config
 
 
-def _make_server(driver_connected: bool = True):
+def _make_server(driver_connected: bool = True, breakers=None):
     """Build an APIServer with a mock driver + chrome probe controlled by params."""
     driver = MagicMock()
     driver.is_connected = driver_connected
-    server = APIServer(Config.load(None), driver)
+    server = APIServer(Config.load(None), driver, breakers=breakers)
     return server
 
 
@@ -135,3 +135,118 @@ async def test_health_includes_breakers_snapshot():
     for entry in breakers.values():
         assert entry["open"] is False
         assert entry["failures_in_window"] == 0
+
+
+# ── PR3: status-policy — open breakers downgrade starting|healthy → degraded ──
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "kind,cooldown",
+    [
+        ("auth_required", 0.0),  # sticky
+        ("composer_send_readiness", 300.0),
+        ("cdp_reconnect", 120.0),
+        ("chrome_crash_loop", 300.0),
+    ],
+)
+async def test_open_breaker_downgrades_healthy_to_degraded(kind, cooldown):
+    """Every BreakerKind, when open, downgrades healthy → degraded (never broken)."""
+    from chatgpt_web2api.breakers import BreakerKind, BreakerRegistry
+
+    reg = BreakerRegistry()
+    # Map the exposure name back to the enum member.
+    bk = next(k for k in BreakerKind if k.value == kind)
+    reg.trip(bk, f"test {kind}", cooldown_s=cooldown)
+
+    server = _make_server(driver_connected=True, breakers=reg)
+    server._request_count = 1
+    server._last_successful_send_at = 12345.0
+    body = await _health_body(server, chrome_running=True)
+    assert body["status"] == "degraded", f"{kind} open should downgrade to degraded"
+    assert body["status"] != "broken"
+
+
+@pytest.mark.asyncio
+async def test_open_breaker_downgrades_starting_to_degraded():
+    """An open breaker also downgrades starting → degraded."""
+    from chatgpt_web2api.breakers import BreakerKind, BreakerRegistry
+
+    reg = BreakerRegistry()
+    reg.trip(BreakerKind.CDP_RECONNECT, "ws down", cooldown_s=60.0)
+
+    server = _make_server(driver_connected=True, breakers=reg)
+    # No requests yet → would normally be "starting".
+    body = await _health_body(server, chrome_running=True)
+    assert body["status"] == "degraded"
+
+
+@pytest.mark.asyncio
+async def test_broken_status_not_overridden_by_open_breaker():
+    """Chrome down (broken) stays broken even with an open breaker — broken is
+    a harder failure than a tripped circuit and must not be masked."""
+    from chatgpt_web2api.breakers import BreakerKind, BreakerRegistry
+
+    reg = BreakerRegistry()
+    reg.trip(BreakerKind.AUTH_EXPIRED, "401", cooldown_s=0)
+
+    server = _make_server(driver_connected=True, breakers=reg)
+    body = await _health_body(server, chrome_running=False)
+    assert body["status"] == "broken"
+
+
+@pytest.mark.asyncio
+async def test_disconnect_degraded_not_worsened_by_open_breaker():
+    """A disconnect-degraded (Chrome up, driver dead) + open breaker stays
+    degraded — the breaker does not make it worse (not broken)."""
+    from chatgpt_web2api.breakers import BreakerKind, BreakerRegistry
+
+    reg = BreakerRegistry()
+    reg.trip(BreakerKind.CHROME_CRASH_LOOP, "crashes", cooldown_s=300.0)
+
+    server = _make_server(driver_connected=False, breakers=reg)
+    body = await _health_body(server, chrome_running=True)
+    assert body["status"] == "degraded"
+
+
+@pytest.mark.asyncio
+async def test_no_open_breakers_remains_healthy():
+    """Regression guard: no open breakers + served → healthy (downgrade does
+    not fire spuriously)."""
+    from chatgpt_web2api.breakers import BreakerRegistry
+
+    reg = BreakerRegistry()
+    server = _make_server(driver_connected=True, breakers=reg)
+    server._request_count = 1
+    server._last_successful_send_at = 12345.0
+    body = await _health_body(server, chrome_running=True)
+    assert body["status"] == "healthy"
+
+
+@pytest.mark.asyncio
+async def test_open_breakers_list_matches_tripped_kinds():
+    """open_breakers is a current-state list of exactly the open kinds."""
+    from chatgpt_web2api.breakers import BreakerKind, BreakerRegistry
+
+    reg = BreakerRegistry()
+    reg.trip(BreakerKind.AUTH_EXPIRED, "401", cooldown_s=0)
+    reg.trip(BreakerKind.CDP_RECONNECT, "ws", cooldown_s=60.0)
+
+    server = _make_server(driver_connected=True, breakers=reg)
+    server._request_count = 1
+    server._last_successful_send_at = 12345.0
+    body = await _health_body(server, chrome_running=True)
+    assert set(body["open_breakers"]) == {"auth_required", "cdp_reconnect"}
+
+
+@pytest.mark.asyncio
+async def test_open_breakers_empty_when_all_closed():
+    """open_breakers is empty when no breaker is tripped."""
+    from chatgpt_web2api.breakers import BreakerRegistry
+
+    reg = BreakerRegistry()
+    server = _make_server(driver_connected=True, breakers=reg)
+    server._request_count = 1
+    server._last_successful_send_at = 12345.0
+    body = await _health_body(server, chrome_running=True)
+    assert body["open_breakers"] == []

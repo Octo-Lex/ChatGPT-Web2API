@@ -86,11 +86,23 @@ class LogConfig:
 
 
 @dataclass
+class EnsureConfig:
+    """Tunables for ``chatgpt-web2api ensure`` reconcile policy.
+
+    Narrow on purpose: only the values ensure reads. Breaker thresholds/windows
+    stay hardcoded (not configurable here)."""
+    degraded_poll_interval_s: float = 2.0
+    degraded_poll_budget_s: float = 20.0
+    breaker_cooldown_grace_s: float = 5.0
+
+
+@dataclass
 class Config:
     chrome: ChromeConfig = field(default_factory=ChromeConfig)
     server: ServerConfig = field(default_factory=ServerConfig)
     chatgpt: ChatGPTConfig = field(default_factory=ChatGPTConfig)
     log: LogConfig = field(default_factory=LogConfig)
+    ensure: EnsureConfig = field(default_factory=EnsureConfig)
 
     @classmethod
     def load(cls, path: str | None = None) -> Config:
@@ -166,6 +178,15 @@ class Config:
         c = data.get("log_file")
         if c:
             self.log.file = c
+        c = data.get("ensure_degraded_poll_interval_s")
+        if c is not None:
+            self.ensure.degraded_poll_interval_s = float(c)
+        c = data.get("ensure_degraded_poll_budget_s")
+        if c is not None:
+            self.ensure.degraded_poll_budget_s = float(c)
+        c = data.get("ensure_breaker_cooldown_grace_s")
+        if c is not None:
+            self.ensure.breaker_cooldown_grace_s = float(c)
 
     def _apply_env(self) -> None:
         _env = os.environ.get
@@ -190,6 +211,12 @@ class Config:
             self.chrome.headless = v.lower() in ("true", "1", "yes")
         if v := _env("W2A_LOG_LEVEL"):
             self.log.level = v
+        if v := _env("W2A_ENSURE_DEGRADED_POLL_INTERVAL_S"):
+            self.ensure.degraded_poll_interval_s = float(v)
+        if v := _env("W2A_ENSURE_DEGRADED_POLL_BUDGET_S"):
+            self.ensure.degraded_poll_budget_s = float(v)
+        if v := _env("W2A_ENSURE_BREAKER_COOLDOWN_GRACE_S"):
+            self.ensure.breaker_cooldown_grace_s = float(v)
 
     def to_dict(self) -> dict:
         return {
@@ -205,4 +232,7 @@ class Config:
             "tab_mode": self.chatgpt.tab_mode,
             "request_timeout": self.server.request_timeout,
             "log_level": self.log.level,
+            "ensure_degraded_poll_interval_s": self.ensure.degraded_poll_interval_s,
+            "ensure_degraded_poll_budget_s": self.ensure.degraded_poll_budget_s,
+            "ensure_breaker_cooldown_grace_s": self.ensure.breaker_cooldown_grace_s,
         }

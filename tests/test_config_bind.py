@@ -117,3 +117,53 @@ def test_bind_safety_error_names_the_override():
     except RuntimeError as e:
         assert "W2A_ALLOW_UNAUTH_REMOTE" in str(e)
 
+
+# ── A3: ensure config tunables (PR3) ───────────────────────────────────
+
+
+def test_ensure_config_defaults_when_absent(tmp_path, monkeypatch):
+    """No ensure_* keys in config → built-in EnsureConfig defaults."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    cfg = Config.load(None)
+    assert cfg.ensure.degraded_poll_interval_s == 2.0
+    assert cfg.ensure.degraded_poll_budget_s == 20.0
+    assert cfg.ensure.breaker_cooldown_grace_s == 5.0
+
+
+def test_ensure_config_loaded_from_file(tmp_path, monkeypatch):
+    """ensure_* keys in a config file populate EnsureConfig."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    cfg_file = tmp_path / "cfg.json"
+    cfg_file.write_text(json.dumps({
+        "ensure_degraded_poll_interval_s": 1.5,
+        "ensure_degraded_poll_budget_s": 7.0,
+        "ensure_breaker_cooldown_grace_s": 3.0,
+    }))
+    cfg = Config.load(str(cfg_file))
+    assert cfg.ensure.degraded_poll_interval_s == 1.5
+    assert cfg.ensure.degraded_poll_budget_s == 7.0
+    assert cfg.ensure.breaker_cooldown_grace_s == 3.0
+
+
+def test_ensure_config_env_overrides(monkeypatch, tmp_path):
+    """W2A_ENSURE_* env vars override config + defaults."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.setenv("W2A_ENSURE_DEGRADED_POLL_BUDGET_S", "9.0")
+    monkeypatch.setenv("W2A_ENSURE_BREAKER_COOLDOWN_GRACE_S", "2.0")
+    cfg = Config.load(None)
+    assert cfg.ensure.degraded_poll_budget_s == 9.0
+    assert cfg.ensure.breaker_cooldown_grace_s == 2.0
+
+
+def test_ensure_config_to_dict_roundtrip():
+    """to_dict serializes the ensure tunables (flat keys)."""
+    cfg = Config()
+    cfg.ensure.degraded_poll_budget_s = 11.0
+    d = cfg.to_dict()
+    assert d["ensure_degraded_poll_interval_s"] == 2.0
+    assert d["ensure_degraded_poll_budget_s"] == 11.0
+    assert d["ensure_breaker_cooldown_grace_s"] == 5.0
+

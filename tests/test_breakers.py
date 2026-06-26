@@ -55,6 +55,7 @@ def test_snapshot_closed_initially():
         assert entry["reason"] is None
         assert entry["tripped_at"] is None
         assert entry["cooldown_until"] is None
+        assert entry["cooldown_seconds_remaining"] is None
         assert entry["failures_in_window"] == 0
 
 
@@ -185,6 +186,41 @@ def test_trip_records_reason_and_tripped_at(monkeypatch):
     assert snap["tripped_at"] == 500.0
     assert snap["cooldown_until"] == 530.0
     assert snap["open"] is True
+
+
+def test_snapshot_cooldown_seconds_remaining_counts_down(monkeypatch):
+    """cooldown_seconds_remaining is a duration (not a monotonic timestamp) that
+    decreases as the clock advances and hits 0.0 once past cooldown (half-open).
+    A separate process like ensure.py can reason about it without comparing
+    monotonic clocks across the boundary."""
+    advance = _install_clock(monkeypatch, start=1000.0)
+    reg = BreakerRegistry()
+
+    reg.trip(BreakerKind.CDP_RECONNECT, "ws closed", cooldown_s=60.0)
+    snap = reg.snapshot()["cdp_reconnect"]
+    assert snap["open"] is True
+    assert snap["cooldown_seconds_remaining"] == 60.0
+
+    advance(20.0)  # 40s left
+    assert reg.snapshot()["cdp_reconnect"]["cooldown_seconds_remaining"] == 40.0
+
+    advance(40.0)  # exactly past cooldown → half-open, floored to 0.0
+    snap = reg.snapshot()["cdp_reconnect"]
+    assert snap["cooldown_seconds_remaining"] == 0.0
+    assert snap["open"] is False
+
+
+def test_snapshot_auth_trip_cooldown_seconds_remaining_is_none(monkeypatch):
+    """A sticky (indefinite) auth trip has cooldown_seconds_remaining == None —
+    the same value a CLOSED breaker yields. Callers must infer auth from
+    kind=='auth_required' & open, never from cooldown_seconds_remaining is None."""
+    _install_clock(monkeypatch)
+    reg = BreakerRegistry()
+
+    reg.trip(BreakerKind.AUTH_EXPIRED, "401", cooldown_s=0)
+    snap = reg.snapshot()["auth_required"]
+    assert snap["open"] is True
+    assert snap["cooldown_seconds_remaining"] is None
 
 
 def test_reset_clears_a_tripped_breaker():

@@ -165,7 +165,8 @@ def main() -> None:
         )
         ensure_parser = subparsers.add_parser(
             "ensure",
-            help="Point-in-time reconcile: make REST + SSE healthy, then exit (for ZCode hooks)",
+            help="Point-in-time reconcile: make REST + SSE healthy, then exit (for ZCode hooks). "
+            "Exit codes: 0 ready, 1 reconcile failure, 2 auth/login needed.",
         )
         ensure_parser.add_argument(
             "--rest-port", type=int, default=8080, help="REST API port to reconcile (default: 8080)"

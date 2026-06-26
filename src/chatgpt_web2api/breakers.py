@@ -202,8 +202,22 @@ class BreakerRegistry:
     def snapshot(self) -> dict[str, dict]:
         """JSON-serializable view of all breakers. Every kind is always present
         (even when untouched) so the ``/health`` shape is stable for consumers
-        like ``ensure.py`` that branch on it."""
+        like ``ensure.py`` that branch on it.
+
+        ``cooldown_seconds_remaining`` is a server-side-computed *duration*
+        (not an opaque ``time.monotonic()`` timestamp) so a separate process
+        such as ``ensure.py`` can reason about cooldown without comparing
+        monotonic clocks across the process boundary:
+
+          - ``None``    → closed breaker, OR sticky/indefinite (e.g. auth_required)
+          - positive    → seconds remaining for a currently-open timed trip
+          - ``0.0``     → past cooldown (half-open window)
+
+        Because ``None`` is overloaded, callers must infer an auth condition
+        from ``kind == "auth_required" and entry["open"]``, never from
+        ``cooldown_seconds_remaining is None``."""
         out: dict[str, dict] = {}
+        now = time.monotonic()
         for kind in BreakerKind:
             state = self._states[kind]
             self._prune(kind, state)
@@ -212,6 +226,11 @@ class BreakerRegistry:
                 "reason": state.reason,
                 "tripped_at": state.tripped_at,
                 "cooldown_until": state.cooldown_until,
+                "cooldown_seconds_remaining": (
+                    max(0.0, state.cooldown_until - now)
+                    if state.cooldown_until is not None
+                    else None
+                ),
                 "failures_in_window": len(state.recent_failures),
             }
         return out

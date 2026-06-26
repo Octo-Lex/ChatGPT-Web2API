@@ -11,8 +11,12 @@ Pinned design (ROADMAP Phase 3):
     reconnect — give it 20s of polling before bouncing the browser)
   - lock-protected so concurrent ``ensure`` runs don't double-launch
 
-Exit codes: 0 when both REST and SSE are ready, nonzero with a diagnostic
-otherwise.
+Exit codes:
+  - 0: REST and SSE are ready
+  - 1: generic reconcile failure (REST/SSE could not be made ready)
+  - 2: auth/login needed — REST degraded because the ``auth_required`` breaker
+       is open. REST is NOT restarted and SSE is NOT reconciled in this case;
+       a human re-auth is required.
 """
 
 from __future__ import annotations
@@ -27,6 +31,7 @@ import subprocess
 import sys
 import time
 import urllib.request
+from dataclasses import dataclass
 from pathlib import Path
 
 from mcp import ClientSession
@@ -38,15 +43,102 @@ logger = logging.getLogger(__name__)
 
 # Bounded wait for REST to resolve starting/degraded before we act.
 _REST_HEALTHY_TIMEOUT = 30.0
-# Degraded-REST grace window: poll every 2s for up to 20s before restarting.
-_DEGRADED_POLL_INTERVAL = 2.0
-_DEGRADED_POLL_BUDGET = 20.0
 # Startup lock: bounded contention wait.
 _LOCK_TIMEOUT = 10.0
 _LOCK_CONTENTION_RECHECK_INTERVAL = 3.0
 _LOCK_CONTENTION_RECHECK_TRIES = 3
 # SSE readiness: TCP preflight then real MCP handshake.
 _SSE_VERIFY_TIMEOUT = 15.0
+
+
+# Default ensure-policy tunables. Overridable via the ``ensure`` config section
+# / ``W2A_ENSURE_*`` env (see EnsureConfig). Module constants stay as the
+# built-in defaults used when no config is loaded.
+_DEFAULT_DEGRADED_POLL_INTERVAL = 2.0
+_DEFAULT_DEGRADED_POLL_BUDGET = 20.0
+_DEFAULT_BREAKER_COOLDOWN_GRACE = 5.0
+
+
+@dataclass(frozen=True)
+class EnsurePolicy:
+    """Ensure-side reconcile tunables, sourced from ``EnsureConfig``.
+
+    Kept separate from ``Config`` so the reconcile logic depends on a tiny
+    frozen value object rather than the whole config tree."""
+
+    degraded_poll_interval_s: float = _DEFAULT_DEGRADED_POLL_INTERVAL
+    degraded_poll_budget_s: float = _DEFAULT_DEGRADED_POLL_BUDGET
+    breaker_cooldown_grace_s: float = _DEFAULT_BREAKER_COOLDOWN_GRACE
+
+
+@dataclass(frozen=True)
+class DegradedBreakerState:
+    """Why REST is degraded, per the ``/health`` breaker snapshot.
+
+    - ``auth_open``: the sticky ``auth_required`` breaker is open (needs login).
+    - ``timed_open_kind``: a timed breaker (composer/cdp/chrome) is open.
+    - ``cooldown_remaining_s``: seconds left on that timed trip; ``None`` means
+      the value was missing/malformed (treat as legacy degraded).
+    """
+
+    auth_open: bool = False
+    timed_open_kind: str | None = None
+    cooldown_remaining_s: float | None = None
+
+
+@dataclass(frozen=True)
+class RestReconcileResult:
+    """Outcome of ``_reconcile_rest``. ``auth_needed`` short-circuits SSE."""
+
+    ok: bool
+    auth_needed: bool = False
+
+
+def _classify_degraded_breakers(breakers: dict) -> DegradedBreakerState:
+    """Classify a degraded-REST cause from the ``/health`` breaker snapshot.
+
+    Returns the first open breaker encountered. Auth is identified by
+    ``kind == "auth_required"`` — NEVER by ``cooldown_seconds_remaining is None``
+    (that field is overloaded: None also means a closed breaker). Any non-auth
+    open breaker is reported as a timed trip with its remaining cooldown.
+
+    Missing/malformed ``cooldown_seconds_remaining`` yields
+    ``cooldown_remaining_s=None``; the caller treats that as legacy degraded
+    behavior (no immediate restart). Health JSON is internal, but a partial
+    shape (older REST, hand-edited fixture) should fall back gracefully rather
+    than crash ``ensure``.
+    """
+    for kind, entry in breakers.items():
+        if not entry.get("open"):
+            continue
+        if kind == "auth_required":
+            return DegradedBreakerState(auth_open=True)
+        remaining = entry.get("cooldown_seconds_remaining")
+        try:
+            cooldown = float(remaining) if remaining is not None else None
+        except (TypeError, ValueError):
+            cooldown = None
+        return DegradedBreakerState(timed_open_kind=kind, cooldown_remaining_s=cooldown)
+    return DegradedBreakerState()
+
+
+def _load_ensure_policy(config_path: str | None) -> EnsurePolicy:
+    """Load the ensure-policy tunables from config. Reads ONLY ``cfg.ensure`` —
+    never lets ``cfg.server.port`` / ``cfg.chrome.cdp_port`` override the
+    explicit ``run_ensure`` port arguments (those remain authoritative). Falls
+    back to module defaults if config loading fails or the section is absent."""
+    try:
+        from chatgpt_web2api.config import Config
+
+        cfg = Config.load(config_path)
+        return EnsurePolicy(
+            degraded_poll_interval_s=cfg.ensure.degraded_poll_interval_s,
+            degraded_poll_budget_s=cfg.ensure.degraded_poll_budget_s,
+            breaker_cooldown_grace_s=cfg.ensure.breaker_cooldown_grace_s,
+        )
+    except Exception as e:
+        logger.debug("ensure config load failed (%s) — using defaults", e)
+        return EnsurePolicy()
 
 
 class _StartupLock:
@@ -407,43 +499,171 @@ async def _wait_rest_ready(rest_port: int, timeout: float) -> bool:
 
 
 async def _reconcile_rest(
-    rest_port: int, cdp_port: int, config_path: str | None, log_level: str | None
-) -> bool:
-    """Apply the degraded-REST policy and wait for ready. Returns True when
-    REST is ready for ensure, False if it can't be made ready."""
+    rest_port: int,
+    cdp_port: int,
+    config_path: str | None,
+    log_level: str | None,
+    policy: EnsurePolicy,
+) -> RestReconcileResult:
+    """Apply the degraded-REST policy and wait for ready.
+
+    Returns ``RestReconcileResult(ok=True)`` when REST is ready for ensure,
+    ``ok=False`` otherwise. ``auth_needed=True`` signals the sticky
+    ``auth_required`` breaker is open — REST must NOT be restarted and SSE must
+    NOT be reconciled; a human re-auth is required (``run_ensure`` returns 2)."""
     h = _rest_health(rest_port)
     if h is None:
         logger.info("REST missing — starting")
         _launch_detached(_build_rest_cmd(rest_port, cdp_port, config_path, log_level))
-        return await _wait_rest_ready(rest_port, _REST_HEALTHY_TIMEOUT)
+        ok = await _wait_rest_ready(rest_port, _REST_HEALTHY_TIMEOUT)
+        return RestReconcileResult(ok=ok)
 
     status = h.get("status", "broken")
     if status in ("healthy", "starting") and _rest_ready_for_ensure(h):
         logger.info("REST ready (status=%s)", status)
-        return True
+        return RestReconcileResult(ok=True)
 
     if status == "broken":
         logger.info("REST broken (Chrome down) — restarting")
-        return await _restart_rest(rest_port, cdp_port, config_path, log_level)
+        ok = await _restart_rest(rest_port, cdp_port, config_path, log_level)
+        return RestReconcileResult(ok=ok)
 
     if status == "degraded":
-        # PINNED: degraded may be a transient CDP reconnect. Wait before bouncing.
-        logger.info("REST degraded — waiting up to %.0fs before restart", _DEGRADED_POLL_BUDGET)
-        deadline = time.monotonic() + _DEGRADED_POLL_BUDGET
-        while time.monotonic() < deadline:
-            await asyncio.sleep(_DEGRADED_POLL_INTERVAL)
-            h = _rest_health(rest_port)
-            if _rest_ready_for_ensure(h):
-                logger.info("REST recovered from degraded/starting")
-                return True
-            if h and h.get("status") == "broken":
-                break  # fall through to restart
-        logger.info("REST still degraded after %.0fs — restarting", _DEGRADED_POLL_BUDGET)
-        return await _restart_rest(rest_port, cdp_port, config_path, log_level)
+        return await _reconcile_degraded(rest_port, cdp_port, config_path, log_level, policy, h)
 
     # starting without full connectivity — wait for it to resolve
     logger.info("REST starting (not fully connected) — waiting")
-    return await _wait_rest_ready(rest_port, _REST_HEALTHY_TIMEOUT)
+    ok = await _wait_rest_ready(rest_port, _REST_HEALTHY_TIMEOUT)
+    return RestReconcileResult(ok=ok)
+
+
+async def _reconcile_degraded(
+    rest_port: int,
+    cdp_port: int,
+    config_path: str | None,
+    log_level: str | None,
+    policy: EnsurePolicy,
+    h: dict,
+) -> RestReconcileResult:
+    """Breaker-aware degraded-REST reconcile.
+
+    Dispatch on the ``/health`` breaker snapshot (read fresh each poll):
+
+      - ``auth_required`` open → login needed. Do NOT restart, do NOT poll.
+        Return ``auth_needed`` immediately.
+      - a timed breaker open with a known cooldown → wait up to
+        ``cooldown + grace`` for it to half-open/recover before restarting.
+      - a timed breaker open with an unknown/missing cooldown (legacy/malformed
+        health) OR no open breaker → legacy degraded behavior: poll the existing
+        ``degraded_poll_budget_s`` window, then restart.
+
+    A timed breaker that is still open past ``cooldown + grace`` is stuck
+    (half-open recovery isn't progressing) → restart. At the exact cooldown
+    boundary (``cooldown_seconds_remaining <= 0`` but still open) we re-fetch
+    health once before restarting, to avoid racing a recovery in flight.
+    """
+    cls = _classify_degraded_breakers(h.get("breakers", {}))
+
+    # Auth: sticky breaker, needs human login. Never restart for this.
+    if cls.auth_open:
+        logger.warning(
+            "REST degraded: auth_required breaker open — login needed "
+            "(manual re-auth required); not restarting REST"
+        )
+        return RestReconcileResult(ok=False, auth_needed=True)
+
+    # Timed breaker with a known cooldown: wait for it to recover.
+    if cls.timed_open_kind is not None and cls.cooldown_remaining_s is not None:
+        return await _wait_timed_breaker(
+            rest_port, cdp_port, config_path, log_level, policy, cls
+        )
+
+    # Legacy degraded: no open breaker info (transient CDP reconnect, older
+    # REST, or malformed snapshot). Poll the standard budget before bouncing.
+    logger.info(
+        "REST degraded — waiting up to %.0fs before restart", policy.degraded_poll_budget_s
+    )
+    deadline = time.monotonic() + policy.degraded_poll_budget_s
+    while time.monotonic() < deadline:
+        await asyncio.sleep(policy.degraded_poll_interval_s)
+        h = _rest_health(rest_port)
+        if _rest_ready_for_ensure(h):
+            logger.info("REST recovered from degraded")
+            return RestReconcileResult(ok=True)
+        if h and h.get("status") == "broken":
+            break  # fall through to restart
+        # An auth breaker may open mid-poll (e.g. session lapsed during wait).
+        cls = _classify_degraded_breakers((h or {}).get("breakers", {}))
+        if cls.auth_open:
+            logger.warning(
+                "REST degraded: auth_required breaker open — login needed; not restarting"
+            )
+            return RestReconcileResult(ok=False, auth_needed=True)
+    logger.info("REST still degraded after %.0fs — restarting", policy.degraded_poll_budget_s)
+    ok = await _restart_rest(rest_port, cdp_port, config_path, log_level)
+    return RestReconcileResult(ok=ok)
+
+
+async def _wait_timed_breaker(
+    rest_port: int,
+    cdp_port: int,
+    config_path: str | None,
+    log_level: str | None,
+    policy: EnsurePolicy,
+    cls: DegradedBreakerState,
+) -> RestReconcileResult:
+    """Wait for a timed breaker to half-open/recover, then fall back to restart.
+
+    Deadline is ``cooldown_remaining + grace``. On each tick: recovered → ok;
+    status ``broken`` → restart immediately; still open at ``cooldown<=0`` →
+    re-fetch health once (a recovery may be in flight at the boundary) and only
+    restart if it is still open after that re-fetch.
+    """
+    cooldown = cls.cooldown_remaining_s or 0.0
+    budget = cooldown + policy.breaker_cooldown_grace_s
+    logger.info(
+        "REST degraded: timed breaker '%s' open — waiting up to %.1fs "
+        "(cooldown %.1fs + grace %.1fs) for recovery",
+        cls.timed_open_kind,
+        budget,
+        cooldown,
+        policy.breaker_cooldown_grace_s,
+    )
+    deadline = time.monotonic() + budget
+    while time.monotonic() < deadline:
+        await asyncio.sleep(policy.degraded_poll_interval_s)
+        h = _rest_health(rest_port)
+        if _rest_ready_for_ensure(h):
+            logger.info("REST recovered from degraded (breaker closed)")
+            return RestReconcileResult(ok=True)
+        if h and h.get("status") == "broken":
+            break  # fall through to restart
+        cur = _classify_degraded_breakers((h or {}).get("breakers", {}))
+        if cur.auth_open:
+            logger.warning(
+                "REST degraded: auth_required breaker open — login needed; not restarting"
+            )
+            return RestReconcileResult(ok=False, auth_needed=True)
+        remaining = cur.cooldown_remaining_s
+        if (
+            cur.timed_open_kind is not None
+            and remaining is not None
+            and remaining <= 0
+        ):
+            # Boundary: cooldown just elapsed and a half-open probe may be in
+            # flight. Re-fetch once before deciding to restart.
+            logger.info("Timed breaker at cooldown boundary — re-fetching health once")
+            h2 = _rest_health(rest_port)
+            if _rest_ready_for_ensure(h2):
+                return RestReconcileResult(ok=True)
+            cur2 = _classify_degraded_breakers((h2 or {}).get("breakers", {}))
+            if not cur2.timed_open_kind and not cur2.auth_open:
+                # Breaker cleared on the re-fetch — recovered.
+                return RestReconcileResult(ok=True)
+            break  # still open → restart
+    logger.info("Timed breaker still open past cooldown+grace — restarting")
+    ok = await _restart_rest(rest_port, cdp_port, config_path, log_level)
+    return RestReconcileResult(ok=ok)
 
 
 async def _reconcile_sse(
@@ -486,7 +706,17 @@ async def run_ensure(
     config_path: str | None = None,
     log_level: str | None = None,
 ) -> int:
-    """Point-in-time reconcile of REST + SSE. Returns 0 on ready, nonzero on failure."""
+    """Point-in-time reconcile of REST + SSE.
+
+    Exit codes:
+      - 0: REST + SSE ready
+      - 1: generic reconcile failure
+      - 2: auth/login needed (auth_required breaker open; REST not restarted,
+           SSE not reconciled)
+    """
+    # Ensure-policy tunables come from config (cfg.ensure ONLY); explicit
+    # run_ensure port args remain authoritative and are never overridden.
+    policy = _load_ensure_policy(config_path)
     lock = _StartupLock(sse_port)
     try:
         await lock.__aenter__()
@@ -496,11 +726,20 @@ async def run_ensure(
         logger.info("Startup lock held — waiting for another ensure to finish")
         for _ in range(_LOCK_CONTENTION_RECHECK_TRIES):
             await asyncio.sleep(_LOCK_CONTENTION_RECHECK_INTERVAL)
-            rest_ok = _rest_ready_for_ensure(_rest_health(rest_port))
+            h = _rest_health(rest_port)
+            rest_ok = _rest_ready_for_ensure(h)
             sse_ok = _sse_tcp_up(sse_port) and await _sse_verify(sse_port)
             if rest_ok and sse_ok:
                 print("REST + SSE ready (another ensure succeeded)")
                 return 0
+            # Surface the auth case distinctly even under contention.
+            if h and h.get("status") == "degraded":
+                if _classify_degraded_breakers(h.get("breakers", {})).auth_open:
+                    print(
+                        "REST degraded: auth_required breaker open — login needed.",
+                        file=sys.stderr,
+                    )
+                    return 2
         print(
             "ERROR: another ensure is running and services are still not ready.",
             file=sys.stderr,
@@ -508,7 +747,15 @@ async def run_ensure(
         return 1
 
     try:
-        if not await _reconcile_rest(rest_port, cdp_port, config_path, log_level):
+        result = await _reconcile_rest(rest_port, cdp_port, config_path, log_level, policy)
+        if not result.ok:
+            if result.auth_needed:
+                # Auth needed: do NOT reconcile SSE — a login is required first.
+                print(
+                    "REST degraded: auth_required breaker open — login needed.",
+                    file=sys.stderr,
+                )
+                return 2
             print("ERROR: REST did not become healthy.", file=sys.stderr)
             return 1
         if not await _reconcile_sse(sse_port, cdp_port, config_path, log_level):

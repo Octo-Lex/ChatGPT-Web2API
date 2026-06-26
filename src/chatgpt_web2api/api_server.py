@@ -158,6 +158,18 @@ class APIServer:
         else:
             status = "healthy"
 
+        # An open breaker can only DOWNGRADE starting|healthy -> degraded. It
+        # must never override "broken" (Chrome down is a harder failure than a
+        # tripped circuit) and never force "broken" — auth_required is serious,
+        # but "broken" invites a destructive supervisor restart, while
+        # "degraded" correctly signals "up but refusing some/all traffic". A
+        # disconnect-degraded stays degraded (not worse).
+        if status in ("starting", "healthy") and self._breakers.first_open() is not None:
+            status = "degraded"
+
+        # Current-state summary, distinct from the historical/latching last_error.
+        open_kinds = [k.value for k in BreakerKind if self._breakers.is_open(k)]
+
         return web.json_response(
             {
                 "status": status,
@@ -168,6 +180,7 @@ class APIServer:
                 "started_at": self._started_at,
                 "last_successful_send_at": self._last_successful_send_at,
                 "last_error": self._last_error,
+                "open_breakers": open_kinds,
                 "breakers": self._breakers.snapshot(),
             }
         )

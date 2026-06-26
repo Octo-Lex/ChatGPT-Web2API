@@ -9,5 +9,8 @@
   "default_project_id": null,
   "api_keys": [],
   "request_timeout": 120,
-  "log_level": "INFO"
+  "log_level": "INFO",
+  "ensure_degraded_poll_interval_s": 2.0,
+  "ensure_degraded_poll_budget_s": 20.0,
+  "ensure_breaker_cooldown_grace_s": 5.0
 }
