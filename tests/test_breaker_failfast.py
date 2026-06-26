@@ -383,11 +383,15 @@ async def test_rest_auth_recovery_fails_still_fail_fasts():
 async def test_driver_recover_auth_resets_on_successful_refresh(monkeypatch):
     """driver.recover_auth() calls _refresh_token and resets AUTH_EXPIRED on
     success; on failure leaves the breaker open."""
+    from chatgpt_web2api.backend_client import BackendClient
     from chatgpt_web2api.cdp_driver import CDPDriver
 
     driver = CDPDriver.__new__(CDPDriver)
     driver._breakers = BreakerRegistry()
     driver._access_token = ""
+    # Phase 5 PR1: recover_auth is delegated to BackendClient. Wire it the
+    # way CDPDriver.__init__ would (this test bypasses __init__ via __new__).
+    driver._backend_client = BackendClient(driver)
 
     # Success path: _refresh_token returns (non-empty token) → reset.
     driver._breakers.trip(BreakerKind.AUTH_EXPIRED, "401", cooldown_s=0)
