@@ -1,15 +1,19 @@
-"""Tests for the non-rate-limit breaker registry (Phase 4, PR1).
+"""Tests for the non-rate-limit breaker registry (Phase 4).
 
 Pure unit tests — the registry is pure logic (stdlib only), so no mocking of
 subprocesses or drivers is needed. A virtual clock drives cooldown/window math
 the same way ``tests/test_ensure.py`` does.
 
-PR1 is behavior-free: these tests pin the registry's contract so PR2's signal
-wiring has a stable foundation to call into.
+PR1 pinned the plumbing contract; PR2 activates auto-trip + half-open recovery.
+These tests cover both the inherited PR1 invariants and the new PR2 behavior.
 """
 
 import chatgpt_web2api.breakers as breakers_mod
-from chatgpt_web2api.breakers import BreakerKind, BreakerRegistry
+from chatgpt_web2api.breakers import (
+    BreakerKind,
+    BreakerRegistry,
+    CircuitOpenError,
+)
 
 
 def _install_clock(monkeypatch, start: float = 1000.0):
@@ -194,6 +198,144 @@ def test_reset_clears_a_tripped_breaker():
     assert snap["open"] is False
     assert snap["reason"] is None
     assert snap["tripped_at"] is None
+
+
+# ── PR2: auto-trip, half-open recovery, fail-fast ─────────────────────
+
+
+def test_record_failure_auto_trips_per_kind_threshold(monkeypatch):
+    """Each kind trips at its own threshold; kind isolation holds — failures of
+    one kind never trip another."""
+    _install_clock(monkeypatch)
+    reg = BreakerRegistry()
+
+    # COMPOSER threshold is 3; 2 stays closed.
+    reg.record_failure(BreakerKind.COMPOSER_SEND_READINESS)
+    reg.record_failure(BreakerKind.COMPOSER_SEND_READINESS)
+    assert reg.is_open(BreakerKind.COMPOSER_SEND_READINESS) is False
+    # 3rd trips it.
+    reg.record_failure(BreakerKind.COMPOSER_SEND_READINESS)
+    assert reg.is_open(BreakerKind.COMPOSER_SEND_READINESS) is True
+
+    # CDP threshold is 5 — composer failures did not bleed into CDP.
+    assert reg.is_open(BreakerKind.CDP_RECONNECT) is False
+
+
+def test_auth_trip_is_immediate_and_indefinite(monkeypatch):
+    """Auth uses explicit trip() (not record_failure) and stays open
+    indefinitely — no rolling window, no half-open recovery."""
+    advance = _install_clock(monkeypatch)
+    reg = BreakerRegistry()
+
+    reg.trip(BreakerKind.AUTH_EXPIRED, "HTTP 401")
+    assert reg.is_open(BreakerKind.AUTH_EXPIRED) is True
+
+    advance(99999.0)
+    assert reg.is_open(BreakerKind.AUTH_EXPIRED) is True  # never half-opens
+
+
+# ── record_success 4-case matrix ──────────────────────────────────────
+
+
+def test_record_success_closed_clears_failures_only(monkeypatch):
+    """Case 1: a CLOSED breaker + success → clears failures, stays closed."""
+    _install_clock(monkeypatch)
+    reg = BreakerRegistry()
+    # 2 failures (below threshold 3), still closed.
+    reg.record_failure(BreakerKind.COMPOSER_SEND_READINESS)
+    reg.record_failure(BreakerKind.COMPOSER_SEND_READINESS)
+    assert reg.snapshot()["composer_send_readiness"]["failures_in_window"] == 2
+
+    reg.record_success(BreakerKind.COMPOSER_SEND_READINESS)
+
+    snap = reg.snapshot()["composer_send_readiness"]
+    assert snap["failures_in_window"] == 0
+    assert snap["open"] is False
+    assert snap["reason"] is None  # never tripped
+
+
+def test_record_success_within_cooldown_does_not_reset(monkeypatch):
+    """Case 2: open TIMED breaker still within cooldown + success → does NOT
+    reset. The breaker stays tripped; only failures clear."""
+    advance = _install_clock(monkeypatch)
+    reg = BreakerRegistry()
+
+    reg.trip(BreakerKind.COMPOSER_SEND_READINESS, "no composer", cooldown_s=300.0)
+    assert reg.is_open(BreakerKind.COMPOSER_SEND_READINESS) is True
+
+    advance(100.0)  # within the 300s cooldown
+    reg.record_success(BreakerKind.COMPOSER_SEND_READINESS)
+
+    assert reg.is_open(BreakerKind.COMPOSER_SEND_READINESS) is True
+    snap = reg.snapshot()["composer_send_readiness"]
+    assert snap["open"] is True
+    assert snap["reason"] == "no composer"  # trip state preserved
+
+
+def test_record_success_after_cooldown_resets_half_open(monkeypatch):
+    """Case 3: open TIMED breaker past cooldown (half-open) + success → RESETS
+    to closed. This is the recovery path: one successful trial closes it."""
+    advance = _install_clock(monkeypatch)
+    reg = BreakerRegistry()
+
+    reg.trip(BreakerKind.CDP_RECONNECT, "ws closed", cooldown_s=120.0)
+    assert reg.is_open(BreakerKind.CDP_RECONNECT) is True
+
+    advance(121.0)  # past the 120s cooldown → half-open
+    assert reg.is_open(BreakerKind.CDP_RECONNECT) is False  # half-open = not open
+
+    reg.record_success(BreakerKind.CDP_RECONNECT)
+
+    snap = reg.snapshot()["cdp_reconnect"]
+    assert snap["open"] is False
+    assert snap["reason"] is None  # fully reset
+    assert snap["tripped_at"] is None
+
+
+def test_record_success_indefinite_auth_does_not_reset(monkeypatch):
+    """Case 4: open INDEFINITE (auth) breaker + success → does NOT reset. Auth
+    only recovers via explicit reset(), never via record_success."""
+    advance = _install_clock(monkeypatch)
+    reg = BreakerRegistry()
+
+    reg.trip(BreakerKind.AUTH_EXPIRED, "401", cooldown_s=0)
+    assert reg.is_open(BreakerKind.AUTH_EXPIRED) is True
+
+    advance(99999.0)
+    reg.record_success(BreakerKind.AUTH_EXPIRED)
+
+    assert reg.is_open(BreakerKind.AUTH_EXPIRED) is True
+    snap = reg.snapshot()["auth_required"]
+    assert snap["open"] is True
+    assert snap["reason"] == "401"
+
+
+# ── first_open + CircuitOpenError ─────────────────────────────────────
+
+
+def test_first_open_returns_none_when_all_closed():
+    """No open breakers → first_open returns None."""
+    reg = BreakerRegistry()
+    assert reg.first_open() is None
+
+
+def test_first_open_returns_first_open_kind(monkeypatch):
+    """first_open returns the first open kind in BreakerKind order; callers
+    raise CircuitOpenError themselves (registry stays read-only)."""
+    _install_clock(monkeypatch)
+    reg = BreakerRegistry()
+    reg.trip(BreakerKind.CDP_RECONNECT, "ws closed", cooldown_s=60.0)
+
+    kind = reg.first_open()
+    assert kind is BreakerKind.CDP_RECONNECT
+
+
+def test_circuit_open_error_carries_kind():
+    """CircuitOpenError carries the offending kind and renders kind.value."""
+    err = CircuitOpenError(BreakerKind.COMPOSER_SEND_READINESS)
+    assert err.kind is BreakerKind.COMPOSER_SEND_READINESS
+    assert "composer_send_readiness" in str(err)
+    assert isinstance(err, RuntimeError)
 
 
 def test_is_open_false_for_never_tripped():

@@ -278,18 +278,31 @@ change first, then wire the real failure signals in a second PR.
   `/health` always reports all breakers closed. This proves the plumbing
   risk-free.
 - **PR2 — wire failure signals + fail-fast.** Adds the typed exceptions the
-  composer/CDP paths need (they currently raise bare `RuntimeError`, so a
-  type-keyed breaker can't distinguish them), calls `record_failure`/`trip` at
-  the detection sites (`AuthExpiredError` at `cdp_driver.py:2046`/`:2207`,
-  composer at `_ensure_send_ready`/`type_message`/`click_send`, CDP reconnect at
-  `reconnect()`, Chrome at `chrome.py:restart()`), enforces the thresholds
+  composer/CDP paths need (`SendReadinessError`, `CDPReconnectError` — they
+  previously raised bare `RuntimeError`, so a type-keyed breaker couldn't
+  distinguish them), calls `record_failure`/`trip` at the detection sites
+  (`AuthExpiredError` at `cdp_driver.py:2046`/`:2207` uses explicit `trip()`;
+  composer at `_ensure_send_ready`/`type_message`/`click_send` and CDP reconnect
+  at `reconnect()` use `record_failure` with auto-trip; Chrome at
+  `chrome.py:restart()` records `CHROME_CRASH_LOOP`), enforces the thresholds
   above, adds REST fail-fast (`_error_response` 503 `circuit_open`) + MCP
-  `(circuit_open)` result, decides whether an open breaker forces `/health`
-  `status` to `degraded`, and wires config tunables (`W2A_BREAKER_*`).
+  `(circuit_open, kind=...)` result, and wires half-open recovery
+  (`record_success` after a confirmed send / successful reconnect; auth stays
+  indefinite until explicit `reset()`). The registry is per-process
+  (driver-owned via DI): REST shares one across Chrome + driver + server; MCP
+  has its own for its driver. `CircuitOpenError` lives in `breakers.py` (not the
+  driver) since it is a control-plane preflight signal, not a driver failure.
+- **PR3 — `/health` status policy + config tunables (deferred).** PR2 ships the
+  `breakers` snapshot but does NOT change the `/health` status string (an open
+  breaker does not yet flip `healthy` → `degraded`) and does NOT add config
+  tunables (`W2A_BREAKER_*`). Both are deferred until the PR2 behavior is proven
+  in operation; the policy constants stay in `breakers.py` until real-world
+  tuning data shows the defaults need adjustment.
 
 ```
 PR1  →  registry + snapshot (no behavior change)
-PR2  →  signals + typed exceptions + fail-fast + status policy + config
+PR2  →  signals + typed exceptions + fail-fast + half-open recovery
+PR3  →  status policy (degraded on open breaker) + config tunables
 ```
 
 ---
