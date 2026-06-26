@@ -19,6 +19,7 @@ import time
 import urllib.request
 from pathlib import Path
 
+from .breakers import BreakerKind, BreakerRegistry
 from .config import Config
 
 logger = logging.getLogger(__name__)
@@ -27,13 +28,19 @@ logger = logging.getLogger(__name__)
 class ChromeProcess:
     """Manages a Chrome subprocess with CDP access."""
 
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, breakers: BreakerRegistry | None = None) -> None:
         self._cfg = config.chrome
         self._process: subprocess.Popen | None = None
         self._monitor_task: asyncio.Task | None = None
         self._healthy = False
         self._started_at: float = 0
         self._restart_count = 0
+        # Phase 4 PR2: optional breaker registry. When set, each restart records
+        # a CHROME_CRASH_LOOP failure (3-in-300s trips it). None = back-compat.
+        # No record_success here — clearing the rolling crash history on every
+        # restart would defeat the 3-in-300s policy; recovery is cooldown/half-
+        # open only.
+        self._breakers = breakers
 
     # ── Public API ────────────────────────────────────────────
 
@@ -57,6 +64,8 @@ class ChromeProcess:
         logger.warning("Restarting Chrome (restart #%d)", self._restart_count + 1)
         await self._kill()
         self._restart_count += 1
+        if self._breakers:
+            self._breakers.record_failure(BreakerKind.CHROME_CRASH_LOOP)
         await self._launch()
         await self._wait_for_cdp(timeout=30)
 
@@ -81,9 +90,7 @@ class ChromeProcess:
     def get_page_targets(self) -> list[dict]:
         """Get all page targets from CDP."""
         try:
-            req = urllib.request.Request(
-                f"http://127.0.0.1:{self._cfg.cdp_port}/json/list"
-            )
+            req = urllib.request.Request(f"http://127.0.0.1:{self._cfg.cdp_port}/json/list")
             with urllib.request.urlopen(req, timeout=5) as resp:
                 return json.loads(resp.read())
         except Exception:
@@ -167,9 +174,7 @@ class ChromeProcess:
     async def _cdp_alive(self) -> bool:
         """Check if CDP is responding."""
         try:
-            req = urllib.request.Request(
-                f"http://127.0.0.1:{self._cfg.cdp_port}/json/version"
-            )
+            req = urllib.request.Request(f"http://127.0.0.1:{self._cfg.cdp_port}/json/version")
             with urllib.request.urlopen(req, timeout=3) as resp:
                 return resp.status == 200
         except Exception:
@@ -200,7 +205,9 @@ class ChromeProcess:
                     self._healthy = alive
                     if not alive:
                         if self._cfg.restart_on_crash:
-                            logger.warning("Chrome died — restarting (attempt #%d)...", self._restart_count + 1)
+                            logger.warning(
+                                "Chrome died — restarting (attempt #%d)...", self._restart_count + 1
+                            )
                             try:
                                 await self.restart()
                                 logger.info("Chrome restarted successfully")
