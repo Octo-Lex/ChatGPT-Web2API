@@ -110,23 +110,27 @@ def test_chrome_crash_loop_uses_300s_window(monkeypatch):
     assert snap["cdp_reconnect"]["failures_in_window"] == 2
 
 
-def test_record_failure_does_not_auto_trip():
-    """PR1 contract: record_failure only counts — reaching a threshold does NOT
-    open the breaker. Auto-trip is a PR2 policy decision."""
+def test_record_failure_auto_trips_at_threshold():
+    """PR2 contract: record_failure auto-trips once the per-kind threshold is
+    met within the rolling window. Below the threshold it stays closed."""
     reg = BreakerRegistry()
-    # CDP threshold is 5; record 10 — still must not trip in PR1.
-    for _ in range(10):
+    # CDP threshold is 5; 4 stays closed.
+    for _ in range(4):
         reg.record_failure(BreakerKind.CDP_RECONNECT)
     assert reg.is_open(BreakerKind.CDP_RECONNECT) is False
+    # The 5th trips it.
+    reg.record_failure(BreakerKind.CDP_RECONNECT)
+    assert reg.is_open(BreakerKind.CDP_RECONNECT) is True
 
 
 def test_record_success_clears_failure_history():
-    """A success clears the failure run for that kind (but does not close an
-    explicitly-tripped breaker — that's reset's job)."""
+    """A success clears the failure run for that kind (but does not close a
+    breaker still within its cooldown — see test_record_success_matrix)."""
     reg = BreakerRegistry()
-    for _ in range(4):
+    # 2 failures: below the chrome_crash_loop threshold of 3, so still closed.
+    for _ in range(2):
         reg.record_failure(BreakerKind.CHROME_CRASH_LOOP)
-    assert reg.snapshot()["chrome_crash_loop"]["failures_in_window"] == 4
+    assert reg.snapshot()["chrome_crash_loop"]["failures_in_window"] == 2
 
     reg.record_success(BreakerKind.CHROME_CRASH_LOOP)
     assert reg.snapshot()["chrome_crash_loop"]["failures_in_window"] == 0

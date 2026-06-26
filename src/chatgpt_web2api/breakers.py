@@ -9,23 +9,30 @@ no coherent story for today (rate-limit retry is already handled by
   - ``cdp_reconnect``           — CDP websocket reconnect failures
   - ``chrome_crash_loop``       — Chrome restart loop
 
-PR1 is infrastructure-only: the registry exists and is snapshotted into
-``/health``, but **nothing records failures or trips a breaker yet**, so every
-breaker always reports closed. This proves the plumbing with zero behavior
-change. PR2 wires the real failure signals (and the typed exceptions the
-composer/CDP paths need, since they currently raise bare ``RuntimeError``).
+PR1 landed the registry and its ``/health`` snapshot. PR2 (this module's
+current contract) makes it live: ``record_failure`` auto-trips a breaker once
+its per-kind threshold is met, ``record_success`` implements half-open
+recovery (a successful trial after cooldown closes the breaker), and
+``first_open`` drives the REST/MCP fail-fast surface via ``CircuitOpenError``.
+
+The signal wiring lives at the call sites: the driver records composer/CDP
+failures with typed exceptions (``SendReadinessError`` / ``CDPReconnectError``)
+and trips auth explicitly (``AuthExpiredError`` → ``trip(AUTH_EXPIRED)``);
+``ChromeProcess`` records crash-loop restarts. The registry itself stays
+pure logic — no I/O, no locks.
 
 Design notes:
   - ``BreakerKind`` is a ``str`` enum so ``.value`` serializes straight into
     the ``/health`` JSON without an extra mapping layer.
   - Timestamps are ``time.monotonic()`` (not wall-clock) so cooldown math is
     immune to system clock changes and unit tests can drive a virtual clock.
-  - Thresholds are encoded as defaults but ``record_failure`` does NOT auto-trip
-    on reaching a threshold in PR1 — that policy belongs in PR2 alongside the
-    signal wiring. PR1 only counts; ``trip()`` is the explicit, caller-driven
-    path. This keeps PR1 genuinely behavior-free.
+  - Auto-trip fires from explicit ``BreakerKind`` calls only — never from a
+    catch-all ``RuntimeError``. The auth path uses explicit ``trip()`` rather
+    than ``record_failure()``, because auth is a single-shot "needs human
+    login" condition, not a rolling-window failure count.
   - Single-process async server: no locks, matching ``APIServer``'s own
-    unsynchronized counters (``_request_count``, ``_last_error``).
+    unsynchronized counters (``_request_count``, ``_last_error``). Each process
+    (REST, MCP) owns its own registry; there is no cross-process propagation.
 """
 
 from __future__ import annotations
@@ -46,6 +53,21 @@ class BreakerKind(StrEnum):
     CHROME_CRASH_LOOP = "chrome_crash_loop"
 
 
+class CircuitOpenError(RuntimeError):
+    """Raised by the REST/MCP fail-fast preflight when a breaker is open.
+
+    Carries the offending ``BreakerKind`` so the error-response layer can name
+    it (using ``kind.value``) without re-interrogating the registry. Lives in
+    this module — not ``cdp_driver.py`` — because it is a control-plane
+    fail-fast signal raised *before* the driver is touched, not a driver
+    failure.
+    """
+
+    def __init__(self, kind: BreakerKind) -> None:
+        self.kind = kind
+        super().__init__(f"Circuit open for {kind.value}")
+
+
 @dataclass
 class BreakerState:
     """Mutable per-kind state. Not part of the public snapshot shape; the
@@ -61,7 +83,9 @@ class BreakerState:
 # ROADMAP Phase 4 policies per kind. The window differs by class — notably
 # ``CHROME_CRASH_LOOP`` is 3 restarts in **5 min** (300s), not the 2 min window
 # the other three classes use — so the window must be per-kind, not global.
-# PR1 records these but does not auto-trip on them — PR2 enforces them.
+# ``record_failure`` auto-trips once ``threshold`` failures land within
+# ``window_s``; ``cooldown_s`` then governs the half-open recovery window
+# (``None`` = indefinite, used only for auth, which trip()s explicitly).
 @dataclass(frozen=True)
 class BreakerPolicy:
     """Per-kind failure policy: how many failures, in what window, trip a
@@ -87,11 +111,13 @@ _DEFAULT_POLICIES: dict[BreakerKind, BreakerPolicy] = {
 
 @dataclass
 class BreakerRegistry:
-    """Tracks failure history and explicit trip state for each ``BreakerKind``.
+    """Tracks failure history and trip state for each ``BreakerKind``.
 
-    PR1 contract: ``record_failure`` counts (no auto-trip); ``trip`` opens a
-    breaker explicitly; ``is_open`` / ``snapshot`` read state. Callers in PR2
-    will decide when to trip based on the thresholds below.
+    ``record_failure`` counts within the per-kind rolling window and auto-trips
+    once the threshold is met. ``record_success`` clears failures and, if the
+    breaker is past its cooldown (half-open), closes it — so a successful
+    trial recovers the breaker. ``trip`` opens a breaker explicitly (used by
+    the auth path). ``first_open`` drives the REST/MCP fail-fast preflight.
     """
 
     _policies: dict[BreakerKind, BreakerPolicy] = field(
@@ -105,18 +131,27 @@ class BreakerRegistry:
     # ── recording ────────────────────────────────────────────────────────
 
     def record_failure(self, kind: BreakerKind) -> None:
-        """Append a failure timestamp and prune the rolling window. Does NOT
-        auto-trip in PR1 — threshold enforcement is a PR2 policy decision."""
+        """Append a failure timestamp, prune the rolling window, and auto-trip
+        if the per-kind threshold is met. The auth path does NOT use this — it
+        calls ``trip()`` directly, because auth is a single-shot condition, not
+        a rolling count."""
         state = self._states[kind]
         state.recent_failures.append(time.monotonic())
         self._prune(kind, state)
+        self._maybe_auto_trip(kind, state)
 
     def record_success(self, kind: BreakerKind) -> None:
-        """Record a success. In PR1 this is a no-op beyond clearing the failure
-        history for the kind — a successful operation means the failure run is
-        over. Does NOT auto-close an explicitly-tripped breaker (PR2 policy)."""
+        """Record a success. Clears the kind's failure history, and — if the
+        breaker is tripped but past its cooldown (half-open) — closes it. This
+        is the recovery path: one successful trial after cooldown recovers the
+        breaker. A breaker still within cooldown, or an indefinite (auth) trip,
+        is NOT reset by a success (its ``tripped`` flag stays set; only the
+        failure history clears)."""
         state = self._states[kind]
         state.recent_failures.clear()
+        if state.tripped and state.cooldown_until is not None:
+            if time.monotonic() >= state.cooldown_until:
+                self._states[kind] = BreakerState()
 
     def trip(self, kind: BreakerKind, reason: str, *, cooldown_s: float = 0.0) -> None:
         """Explicitly open a breaker.
@@ -155,6 +190,15 @@ class BreakerRegistry:
             return True
         return time.monotonic() < state.cooldown_until
 
+    def first_open(self) -> BreakerKind | None:
+        """Return the first currently-open breaker kind, or ``None`` if all are
+        closed/half-open. Callers (REST/MCP preflight) raise ``CircuitOpenError``
+        themselves — the registry stays read-only here."""
+        for kind in BreakerKind:
+            if self.is_open(kind):
+                return kind
+        return None
+
     def snapshot(self) -> dict[str, dict]:
         """JSON-serializable view of all breakers. Every kind is always present
         (even when untouched) so the ``/health`` shape is stable for consumers
@@ -173,6 +217,20 @@ class BreakerRegistry:
         return out
 
     # ── internal ─────────────────────────────────────────────────────────
+
+    def _maybe_auto_trip(self, kind: BreakerKind, state: BreakerState) -> None:
+        """Trip the breaker if the in-window failure count meets the per-kind
+        threshold. Uses the policy's cooldown (timed for composer/CDP/crash;
+        ``None``/indefinite only for auth, which trip()s explicitly anyway)."""
+        policy = self._policies[kind]
+        if len(state.recent_failures) < policy.threshold:
+            return
+        # Already-open within cooldown: refresh the trip so the cooldown
+        # restarts from the latest failure burst (sustained failures extend
+        # the open window rather than letting it lapse mid-storm).
+        reason = f"{policy.threshold} failures in {policy.window_s:.0f}s window"
+        cooldown = policy.cooldown_s if policy.cooldown_s is not None else 0.0
+        self.trip(kind, reason, cooldown_s=cooldown)
 
     def _prune(self, kind: BreakerKind, state: BreakerState) -> None:
         """Drop failure timestamps older than the kind's rolling window and cap
