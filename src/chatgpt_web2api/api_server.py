@@ -17,7 +17,7 @@ import uuid
 
 from aiohttp import web
 
-from .breakers import BreakerRegistry
+from .breakers import BreakerRegistry, CircuitOpenError
 from .cdp_driver import (
     AuthExpiredError,
     CDPDriver,
@@ -303,8 +303,17 @@ class APIServer:
         )
 
         # Serialize — cross-process lock so MCP + REST don't corrupt each other
-        async with CrossProcessLock(cdp_port=self._cdp_port):
-            try:
+        try:
+            # Circuit-open fail-fast (Phase 4 PR2): refuse before touching Chrome
+            # if a breaker is open. Placed inside the try so it flows through
+            # the except below → _error_response + _last_error, consistent with
+            # every other failure path. Checked before acquiring the lock so a
+            # process that already knows it will refuse doesn't block on the
+            # browser lock.
+            if open_kind := self._breakers.first_open():
+                raise CircuitOpenError(open_kind)
+
+            async with CrossProcessLock(cdp_port=self._cdp_port):
                 # Select model if specified (non-fatal on failure)
                 if model_slug and model_slug != "auto":
                     selected = await self._driver.select_model(model_slug)
@@ -341,10 +350,10 @@ class APIServer:
                 else:
                     return await self._full_response(request, model_slug, full_text, timeout)
 
-            except Exception as e:
-                logger.error("Chat error: %s", e, exc_info=True)
-                self._last_error = f"{type(e).__name__}: {e}"
-                return self._error_response(e)
+        except Exception as e:
+            logger.error("Chat error: %s", e, exc_info=True)
+            self._last_error = f"{type(e).__name__}: {e}"
+            return self._error_response(e)
 
     # ── Error mapping ─────────────────────────────────────────
 
@@ -410,6 +419,20 @@ class APIServer:
                         "type": "server_error",
                         "param": None,
                         "code": "lock_timeout",
+                    }
+                },
+                status=503,
+            )
+        if isinstance(exc, CircuitOpenError):
+            return web.json_response(
+                {
+                    "error": {
+                        "message": (
+                            f"Circuit open for {exc.kind.value} — cooling down. Retry later."
+                        ),
+                        "type": "server_error",
+                        "param": None,
+                        "code": "circuit_open",
                     }
                 },
                 status=503,
@@ -504,6 +527,14 @@ class APIServer:
         except RateLimitError:
             # Persistent at pre-flight: still pre-prepare, so send a clean 429.
             raise
+
+        # Circuit-open fail-fast (Phase 4 PR2): second check, after navigation
+        # and rate-limit preflight but still before prepare() commits HTTP 200.
+        # A breaker may have opened during model selection/navigation since the
+        # pre-lock check in _handle_chat. After prepare() no status change is
+        # possible, so this must stay pre-prepare.
+        if open_kind := self._breakers.first_open():
+            raise CircuitOpenError(open_kind)
 
         resp = web.StreamResponse()
         resp.content_type = "text/event-stream"

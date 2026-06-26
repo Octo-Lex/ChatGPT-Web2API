@@ -42,7 +42,7 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from pydantic import BaseModel, Field
 
-from .breakers import BreakerRegistry
+from .breakers import BreakerRegistry, CircuitOpenError
 from .cdp_driver import (
     AuthExpiredError,
     CDPDriver,
@@ -1513,6 +1513,11 @@ def create_server() -> Server:
 
         async def _run() -> dict:
             """Execute the handler, with transparent rate-limit retry for chat tools."""
+            # Circuit-open fail-fast (Phase 4 PR2): refuse before driving Chrome
+            # if a breaker is open on this process's driver. Checked here so it
+            # covers both chat and non-chat tools.
+            if _breakers is not None and (open_kind := _breakers.first_open()):
+                raise CircuitOpenError(open_kind)
             if name in _CHAT_TOOLS:
                 # on_progress is the same callback the lambda captures and
                 # passes into the business function; here it's also used by
@@ -1542,6 +1547,22 @@ def create_server() -> Server:
                         text=(
                             f"ChatGPT rate limit reached. Retry in {e.retry_after}s. "
                             f"(rate_limit_exceeded, retry_after={e.retry_after})"
+                        ),
+                    )
+                ],
+                isError=True,
+            )
+        except CircuitOpenError as e:
+            # A breaker is open on this process's driver — refuse fast with a
+            # structured error so the agent knows to back off. Mirrors the
+            # RateLimitError shape: isError=True, text only, machine token.
+            return mcp_types.CallToolResult(
+                content=[
+                    mcp_types.TextContent(
+                        type="text",
+                        text=(
+                            f"Circuit open for {e.kind.value} — cooling down. "
+                            f"Retry later. (circuit_open, kind={e.kind.value})"
                         ),
                     )
                 ],
