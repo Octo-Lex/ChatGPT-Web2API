@@ -9,28 +9,8 @@ A live integration test surfaced it; these tests guard the fix.
 """
 
 import json
-from unittest.mock import MagicMock
 
 import pytest
-
-
-def _capture_generated_expr(monkeypatch):
-    """Return the JS expression that _js_with_data would send to CDP.
-
-    We intercept ``CDPDriver._js`` to capture the assembled expression so we
-    can assert on its structure (IIFE scoping) without a live browser.
-    """
-
-    captured: dict = {}
-
-    async def fake_js(expr, timeout=15):
-        captured["expr"] = expr
-        return ""
-
-    driver = MagicMock()
-    driver._js = fake_js
-    return driver, captured
-
 
 # ── The fix: __D must be block-scoped, not global ─────────────
 
@@ -44,16 +24,14 @@ async def test_js_with_data_does_not_declare_global___D():
     (IIFE) so __D is local.
     """
     from chatgpt_web2api.cdp_driver import CDPDriver
-    driver = MagicMock()
+    driver = CDPDriver(cdp_port=9222)
     captured = {}
     async def fake_js(expr, timeout=15):
         captured["expr"] = expr
         return "ok"
     driver._js = fake_js
 
-    await CDPDriver._js_with_data(
-        driver, "return __D.x;", {"x": 1}
-    )
+    await driver._js_with_data("return __D.x;", {"x": 1})
 
     expr = captured["expr"]
     # The dangerous form: a top-level "const __D = ..." declaration.
@@ -81,7 +59,7 @@ async def test_js_with_data_still_passes_data_through():
     and the body text is preserved.
     """
     from chatgpt_web2api.cdp_driver import CDPDriver
-    driver = MagicMock()
+    driver = CDPDriver(cdp_port=9222)
     captured = {}
     async def fake_js(expr, timeout=15):
         captured["expr"] = expr
@@ -89,7 +67,7 @@ async def test_js_with_data_still_passes_data_through():
     driver._js = fake_js
 
     payload = {"token": "abc123", "conv_id": "xyz"}
-    await CDPDriver._js_with_data(driver, "__D.token + __D.conv_id", payload)
+    await driver._js_with_data("__D.token + __D.conv_id", payload)
 
     expr = captured["expr"]
     # The data must be embedded (json-serialized) somewhere in the expression
@@ -102,10 +80,10 @@ async def test_js_with_data_still_passes_data_through():
 async def test_js_with_data_returns_driver_value():
     """The return value of _js_with_data is whatever _js returns."""
     from chatgpt_web2api.cdp_driver import CDPDriver
-    driver = MagicMock()
+    driver = CDPDriver(cdp_port=9222)
     async def fake_js(expr, timeout=15):
         return "RESULT"
     driver._js = fake_js
 
-    out = await CDPDriver._js_with_data(driver, "1", {"a": 1})
+    out = await driver._js_with_data("1", {"a": 1})
     assert out == "RESULT"

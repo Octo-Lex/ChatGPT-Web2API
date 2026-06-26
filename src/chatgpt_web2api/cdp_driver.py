@@ -336,6 +336,12 @@ class CDPDriver:
         from .backend_client import BackendClient
 
         self._backend_client = BackendClient(self)
+        # Phase 5 PR2: CDP wire primitives extracted into CDPTransport. Lazy
+        # import for the same reason; the transport reaches through this driver
+        # for _ws/_msg_id/_pending and calls back into reconnect() on socket death.
+        from .cdp_transport import CDPTransport
+
+        self._transport = CDPTransport(self)
 
     async def connect(self) -> None:
         """Connect to Chrome's CDP and authenticate.
@@ -845,187 +851,59 @@ class CDPDriver:
     async def _reader_loop(self) -> None:
         """Background reader: sole consumer of self._ws.recv().
 
-        Routes each incoming CDP message to the matching pending Future by id.
-        Messages without an id (CDP events like Page.frameNavigated) are logged
-        at DEBUG and discarded — no caller subscribes to events today, but the
-        hook is here for future navigation-ready detection.
-
-        On ConnectionClosed, fails all pending futures so callers don't hang.
+        Delegated to CDPTransport (Phase 5 PR2 extraction). Preserved exactly:
+        sole ``_ws.recv()`` consumer, routes responses to ``_pending`` by id,
+        fails all pending futures on socket close.
         """
-        try:
-            while True:
-                raw = await self._ws.recv()
-                try:
-                    msg = json.loads(raw)
-                except (json.JSONDecodeError, TypeError):
-                    logger.debug("CDP reader: unparseable frame, discarding")
-                    continue
-                mid = msg.get("id")
-                if mid is None:
-                    # Unsolicited CDP event — no caller subscribes yet.
-                    logger.debug("CDP event: %s", msg.get("method", "?"))
-                    continue
-                fut = self._pending.pop(mid, None)
-                if fut and not fut.done():
-                    fut.set_result(msg)
-                else:
-                    logger.debug("CDP reader: response for unknown/stale id %s", mid)
-        except Exception as e:
-            # Socket closed or errored — fail all pending callers so they
-            # don't hang waiting for a response that will never arrive.
-            logger.warning("CDP reader loop ended: %s", e)
-            for mid, fut in list(self._pending.items()):
-                if not fut.done():
-                    fut.set_exception(e)
+        await self._transport._reader_loop()
 
     async def _cdp(
         self, method: str, params: dict = None, timeout: float = 15, _retry: bool = True
     ) -> dict:
         """Send a CDP command and await its response.
 
-        Uses the background reader + id-keyed Future table (#7 fix) so
-        concurrent _cdp calls each receive their own response without
-        cross-eating each other's frames.
-
-        Auto-reconnect: if the underlying WebSocket is dead (ConnectionClosed
-        on send — the ``no close frame`` case), attempt ONE ``reconnect()``
-        then retry the call. Without this, a single mid-session socket drop
-        permanently bricks a long-running bridge: ``reconnect()`` exists but
-        nothing wired it in, so every subsequent call re-raised the dead
-        socket error forever. ``_retry`` guards against recursion: a call that
-        fails again after reconnect propagates instead of looping.
+        Delegated to CDPTransport (Phase 5 PR2 extraction). Preserved exactly:
+        id-keyed future routing, one reconnect-and-retry through
+        ``self.reconnect()`` on socket death (Layer-2 breaker semantics stay
+        there), ``_retry`` recursion guard.
         """
-        self._msg_id += 1
-        mid = self._msg_id
-        fut: asyncio.Future = asyncio.get_event_loop().create_future()
-        self._pending[mid] = fut
-        try:
-            await self._ws.send(json.dumps({"id": mid, "method": method, "params": params or {}}))
-        except Exception as e:
-            self._pending.pop(mid, None)
-            if _retry and self._should_reconnect(e):
-                logger.warning("CDP send failed (%s); reconnecting and retrying once", e)
-                await self.reconnect()
-                return await self._cdp(method, params, timeout, _retry=False)
-            raise
-        try:
-            return await asyncio.wait_for(fut, timeout)
-        except TimeoutError:
-            self._pending.pop(mid, None)
-            raise TimeoutError(f"CDP timeout: {method}")
+        return await self._transport._cdp(method, params, timeout, _retry)
 
     @staticmethod
     def _should_reconnect(exc: Exception) -> bool:
-        """True for errors that mean the WebSocket is dead/tearing down.
+        """True for socket-death signatures; False otherwise.
 
-        ConnectionClosed (and its subclasses) and the ``no close frame``
-        InvalidState are the socket-death signatures; everything else
-        (TimeoutError, application errors) must NOT trigger a reconnect.
-        """
-        # websockets.ConnectionClosed + subclasses (ConnectionClosedError,
-        # ConnectionClosedOK). Imported lazily so a missing/renamed class in
-        # other websockets versions degrades to a name check instead of ImportError.
-        name = type(exc).__name__
-        if name in {"ConnectionClosed", "ConnectionClosedError", "ConnectionClosedOK"}:
-            return True
-        msg = str(exc).lower()
-        return "no close frame" in msg or "connection closed" in msg
+        Delegated to CDPTransport (Phase 5 PR2 extraction). Pure classifier,
+        no state."""
+        from .cdp_transport import CDPTransport
+
+        return CDPTransport._should_reconnect(exc)
 
     async def _js(self, expr: str, timeout: float = 15) -> str:
-        resp = await self._cdp(
-            "Runtime.evaluate",
-            {
-                "expression": expr,
-                "awaitPromise": True,
-                "returnByValue": True,
-                "timeout": int(timeout * 1000),
-            },
-            timeout=timeout,
-        )
-        return resp.get("result", {}).get("result", {}).get("value", "")
+        """Soft ``Runtime.evaluate`` — returns "" on failure.
+
+        Delegated to CDPTransport (Phase 5 PR2 extraction)."""
+        return await self._transport._js(expr, timeout)
 
     async def _js_with_data(self, expr_template: str, data: dict, timeout: float = 15) -> str:
-        """Evaluate JS with safely injected data variables.
+        """Evaluate JS with safely injected ``__D`` data variables (soft).
 
-        Injects *data* as the ``__D`` argument of an async IIFE so the
-        templates can reference ``__D.keyName`` for any key.  The data is
-        passed as a JSON-serialized call argument (never string-concatenated
-        into the body), which eliminates injection vectors entirely.
-
-        Earlier versions emitted a top-level ``const __D = ...;``, which
-        collides with the global ``__D`` that chatgpt.com's own page defines
-        and raised ``SyntaxError: Identifier '__D' has already been
-        declared`` — silently returning empty for every
-        memory/project/conversation read.  Passing ``__D`` as a function
-        parameter sidesteps the collision completely: there is no
-        declaration to conflict, and the parameter shadows the global
-        within the IIFE's scope.
-
-        *expr_template* is evaluated as an expression in a position where
-        its return value becomes the IIFE's result, so existing templates
-        (which are self-invoking like ``(async () => {...})()``) keep
-        working unchanged.
-        """
-        # Pass __D as an argument. Using `void ` makes `__D=>(...)` an
-        # arrow expression body, so the template's value is returned.
-        wrapped = f"( (__D) => ({expr_template}) )({json.dumps(data)})"
-        return await self._js(wrapped, timeout=timeout)
+        Delegated to CDPTransport (Phase 5 PR2 extraction)."""
+        return await self._transport._js_with_data(expr_template, data, timeout)
 
     async def _js_strict(self, expr: str, timeout: float = 15) -> str:
-        """Strict JS evaluation — raises CDPJSError on failure instead of "".
+        """Strict ``Runtime.evaluate`` — raises CDPJSError on failure.
 
-        Inspects the CDP response for:
-        - ``error`` (CDP-level error, e.g. execution context destroyed)
-        - ``exceptionDetails`` (JS threw an exception)
-        - missing ``result.result`` (undefined return, type mismatch)
-
-        On any of these, raises CDPJSError with the detail. On success,
-        returns the value string (same as _js).
-
-        Callers that already handle exceptions benefit immediately. Callers
-        that depend on the ""-on-error contract must wrap in try/except.
-        """
-        resp = await self._cdp(
-            "Runtime.evaluate",
-            {
-                "expression": expr,
-                "awaitPromise": True,
-                "returnByValue": True,
-                "timeout": int(timeout * 1000),
-            },
-            timeout=timeout,
-        )
-        # CDP-level error (e.g. "Execution context was destroyed")
-        if "error" in resp:
-            err = resp["error"]
-            raise CDPJSError(
-                f"CDP error evaluating JS: {err.get('message', err)}",
-                details=err,
-            )
-        result = resp.get("result", {})
-        # JS exception
-        if result.get("exceptionDetails"):
-            exd = result["exceptionDetails"]
-            exc_text = exd.get("exception", {}).get("description", "") or exd.get("text", "")
-            raise CDPJSError(
-                f"JS exception: {exc_text[:500]}",
-                details=exd,
-            )
-        inner = result.get("result", {})
-        # Undefined or unserializable return
-        if inner.get("type") in ("undefined",) or "value" not in inner:
-            raise CDPJSError(
-                f"JS returned {inner.get('type', 'unknown')} (no value)",
-                details={"type": inner.get("type")},
-            )
-        return inner.get("value", "")
+        Delegated to CDPTransport (Phase 5 PR2 extraction)."""
+        return await self._transport._js_strict(expr, timeout)
 
     async def _js_with_data_strict(
         self, expr_template: str, data: dict, timeout: float = 15
     ) -> str:
-        """Strict variant of _js_with_data — raises CDPJSError on failure."""
-        wrapped = f"( (__D) => ({expr_template}) )({json.dumps(data)})"
-        return await self._js_strict(wrapped, timeout=timeout)
+        """Strict variant of _js_with_data — raises CDPJSError on failure.
+
+        Delegated to CDPTransport (Phase 5 PR2 extraction)."""
+        return await self._transport._js_with_data_strict(expr_template, data, timeout)
 
     # ── Model Selection ───────────────────────────────────────
 
