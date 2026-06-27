@@ -37,12 +37,13 @@ Two supervisor styles are supported:
 | Style | What it supervises | Restarts | Best for |
 |-------|--------------------|----------|----------|
 | **`ensure` on a timer** | nothing long-lived; reconcile on schedule | re-run `ensure` every N minutes | ZCode-adjacent, lightweight |
-| **`start` as a service** | the long-lived REST + MCP process | restart the process on crash | classic always-on server |
+| **`start` + `chatgpt-web2api-mcp` as services** | two long-lived processes: REST (owns Chrome) and MCP/SSE | restart each process on crash | classic always-on server |
 
 The **timer** style mirrors the ZCode hook model and needs no long-lived Python
-process. The **service** style runs `chatgpt-web2api start` directly and lets
-the supervisor own restart policy. Pick one; do not run both against the same
-ports/profile.
+process — `ensure` spawns the REST and MCP/SSE children detached, then exits.
+The **service** style runs the REST (`start`) and MCP/SSE (`chatgpt-web2api-mcp`)
+processes directly as **two separate units** and lets the supervisor own each
+one's restart policy. Pick one; do not run both against the same ports/profile.
 
 ---
 
@@ -89,6 +90,13 @@ Type=oneshot
 ExecStart=%h/.local/bin/chatgpt-web2api ensure --rest-port 8080 --mcp-sse-port 8090 --cdp-port 9222
 # Exit 2 = auth/login needed; that is not a service failure, do not treat as error
 SuccessExitStatus=0 2
+# CRITICAL: ensure spawns detached REST + MCP/SSE child processes and then exits.
+# systemd's default KillMode=control-group would kill those children when the
+# oneshot unit finishes/stops, defeating the whole point. KillMode=process
+# limits the kill to the ensure process itself, leaving the spawned services
+# running. (Ref: systemd.kill(5).) Do NOT remove this without changing the
+# supervisor model — the children outlive the reconcile on purpose.
+KillMode=process
 Environment=W2A_LOG_LEVEL=INFO
 ```
 
@@ -114,13 +122,19 @@ systemctl --user daemon-reload
 systemctl --user enable --now chatgpt-web2api-ensure.timer
 ```
 
-### Option B: long-lived `start` service (classic always-on)
+### Option B: long-lived services (classic always-on)
 
-`~/.config/systemd/user/chatgpt-web2api.service`:
+REST and MCP/SSE are **two separate processes**: `chatgpt-web2api start` runs
+the REST API only; `chatgpt-web2api-mcp --transport sse` runs the MCP/SSE
+server (it attaches to the REST-owned Chrome over CDP — REST remains the Chrome
+owner). A long-lived deployment runs **both as separate units**, with the MCP/SSE
+unit ordered to start after REST.
+
+`~/.config/systemd/user/chatgpt-web2api.service` (REST):
 
 ```ini
 [Unit]
-Description=ChatGPT-Web2API REST + MCP server
+Description=ChatGPT-Web2API REST server (owns Chrome)
 After=network-online.target
 
 [Service]
@@ -138,6 +152,26 @@ Environment=W2A_LOG_LEVEL=INFO
 WantedBy=default.target
 ```
 
+`~/.config/systemd/user/chatgpt-web2api-mcp.service` (MCP/SSE — separate process):
+
+```ini
+[Unit]
+Description=ChatGPT-Web2API MCP/SSE server (attaches to REST-owned Chrome)
+Requires=chatgpt-web2api.service
+After=chatgpt-web2api.service
+
+[Service]
+Type=simple
+# chatgpt-web2api-mcp is the MCP entrypoint; --transport sse + --port select SSE.
+ExecStart=%h/.local/bin/chatgpt-web2api-mcp --transport sse --port 8090 --cdp-port 9222
+Restart=on-failure
+RestartSec=10
+Environment=W2A_LOG_LEVEL=INFO
+
+[Install]
+WantedBy=default.target
+```
+
 > **Display note:** Chrome runs headed by default. On a headless server you
 > need either Xvfb (`W2A_HEADLESS=false` + a virtual display) or you accept
 > the anti-bot risk of `W2A_HEADLESS=true`. See the Docker section of
@@ -145,8 +179,9 @@ WantedBy=default.target
 
 ```bash
 systemctl --user daemon-reload
-systemctl --user enable --now chatgpt-web2api.service
-journalctl --user -u chatgpt-web2api.service -f   # logs
+systemctl --user enable --now chatgpt-web2api.service chatgpt-web2api-mcp.service
+journalctl --user -u chatgpt-web2api.service -f        # REST logs
+journalctl --user -u chatgpt-web2api-mcp.service -f    # MCP/SSE logs
 ```
 
 For a system-wide service (root-owned Chrome), place the units in
@@ -207,17 +242,76 @@ launchctl start com.chatgpt-web2api.ensure   # trigger once now
 tail -f /tmp/chatgpt-web2api-ensure.log
 ```
 
-### Option B: long-lived `start`
+### Option B: long-lived services
 
-Same structure, but `ProgramArguments` runs `start --port 8080 --cdp-port 9222`,
-set `KeepAlive` instead of `StartInterval`, and drop `RunAtLoad`/`StartInterval`:
+Two plists — REST (`start`) and MCP/SSE (`chatgpt-web2api-mcp --transport sse`),
+mirroring the systemd split. Each runs its own process; REST owns Chrome.
+
+REST — `~/Library/LaunchAgents/com.chatgpt-web2api.rest.plist`:
 
 ```xml
-<key>KeepAlive</key>
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
 <dict>
-    <key>SuccessfulExit</key>
-    <false/>
+    <key>Label</key><string>com.chatgpt-web2api.rest</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/chatgpt-web2api</string>
+        <string>start</string>
+        <string>--port</string><string>8080</string>
+        <string>--cdp-port</string><string>9222</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>W2A_LOG_LEVEL</key><string>INFO</string>
+        <key>PATH</key>
+        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+    </dict>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key>
+    <dict><key>SuccessfulExit</key><false/></dict>
+    <key>StandardOutPath</key><string>/tmp/chatgpt-web2api-rest.log</string>
+    <key>StandardErrorPath</key><string>/tmp/chatgpt-web2api-rest.log</string>
 </dict>
+</plist>
+```
+
+MCP/SSE — `~/Library/LaunchAgents/com.chatgpt-web2api.mcp.plist` (separate process):
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.chatgpt-web2api.mcp</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/chatgpt-web2api-mcp</string>
+        <string>--transport</string><string>sse</string>
+        <string>--port</string><string>8090</string>
+        <string>--cdp-port</string><string>9222</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>W2A_LOG_LEVEL</key><string>INFO</string>
+        <key>PATH</key>
+        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+    </dict>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key>
+    <dict><key>SuccessfulExit</key><false/></dict>
+    <key>StandardOutPath</key><string>/tmp/chatgpt-web2api-mcp.log</string>
+    <key>StandardErrorPath</key><string>/tmp/chatgpt-web2api-mcp.log</string>
+</dict>
+</plist>
+```
+
+```bash
+launchctl load ~/Library/LaunchAgents/com.chatgpt-web2api.rest.plist
+launchctl load ~/Library/LaunchAgents/com.chatgpt-web2api.mcp.plist
 ```
 
 ---
@@ -234,37 +328,57 @@ elevated PowerShell (or use `taskschd.msc`):
 # or your venv's Scripts folder). Example:
 $ensure = "$env:LOCALAPPDATA\Programs\Python\Python312\Scripts\chatgpt-web2api.exe"
 
-$action    = New-ScheduledTaskAction -Execute $ensure `
-              -Argument "ensure --rest-port 8080 --mcp-sse-port 8090 --cdp-port 9222"
-$trigger   = New-ScheduledTaskTrigger -AtLogOn
-$schedule  = New-ScheduledTaskTrigger -Once -At (Get-Date) `
-              -RepetitionInterval (New-TimeSpan -Minutes 5) `
-              -RepetitionDuration (New-TimeSpan -Days 365)
-$settings  = New-ScheduledTaskSettingsSet -StartWhenAvailable -DontStopOnIdleEnd
+# IMPORTANT: Register-ScheduledTask has NO -Environment parameter. To pass env
+# vars to the action, wrap the call in powershell.exe and set them inline.
+$action = New-ScheduledTaskAction `
+    -Execute "powershell.exe" `
+    -Argument "-NoProfile -ExecutionPolicy Bypass -Command `"$env:W2A_LOG_LEVEL='INFO'; & '$ensure' ensure --rest-port 8080 --mcp-sse-port 8090 --cdp-port 9222`""
+$trigger  = New-ScheduledTaskTrigger -AtLogOn
+$schedule = New-ScheduledTaskTrigger -Once -At (Get-Date) `
+    -RepetitionInterval (New-TimeSpan -Minutes 5) `
+    -RepetitionDuration (New-TimeSpan -Days 365)
+$settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -DontStopOnIdleEnd
 
 Register-ScheduledTask -TaskName "ChatGPT-Web2API-Ensure" `
-    -Action $action -Trigger $trigger,$schedule -Settings $settings `
-    -Environment @{ W2A_LOG_LEVEL = "INFO" }
+    -Action $action -Trigger $trigger,$schedule -Settings $settings
 ```
 
 `-AtLogOn` boots the reconcile at sign-in; the 5-minute repetition keeps it
 healthy. Exit code 2 (auth needed) is not an error — Task Scheduler will still
-report success because the process exited 0/2 cleanly; monitor the log instead.
+report success because the wrapped process exits 0/2 cleanly; monitor the log
+instead.
 
-### Option B: NSSM wrapping `start` (long-lived service)
+> If you do not need `W2A_LOG_LEVEL` (the default `INFO` is usually fine), you
+> can skip the `powershell.exe` wrapper and pass the `.exe` directly to
+> `-Execute` with `-Argument "ensure --rest-port 8080 --mcp-sse-port 8090 --cdp-port 9222"`.
+
+### Option B: NSSM wrapping the long-lived services
 
 [NSSM](https://nssm.cc/) wraps any executable as a Windows service with restart
-policy. Install once, then point it at `chatgpt-web2api.exe`:
+policy. REST and MCP/SSE are separate processes, so install **two** NSSM
+services. REST first (it owns Chrome):
 
 ```powershell
-nssm install ChatGPT-Web2API "C:\path\to\chatgpt-web2api.exe" "start --port 8080 --cdp-port 9222"
-nssm set      ChatGPT-Web2API AppEnvironmentExtra "W2A_LOG_LEVEL=INFO"
-nssm set      ChatGPT-Web2API AppStdout "C:\Logs\chatgpt-web2api.out.log"
-nssm set      ChatGPT-Web2API AppStderr "C:\Logs\chatgpt-web2api.err.log"
-nssm set      ChatGPT-Web2API AppRotateFiles 1
-nssm set      ChatGPT-Web2API AppRotateBytes 10485760
-nssm set      ChatGPT-Web2API AppThrottle 30000   # grace before restart-on-failure
-nssm start    ChatGPT-Web2API
+# REST service (owns Chrome)
+nssm install ChatGPT-Web2API-REST "C:\path\to\chatgpt-web2api.exe" "start --port 8080 --cdp-port 9222"
+nssm set      ChatGPT-Web2API-REST AppEnvironmentExtra "W2A_LOG_LEVEL=INFO"
+nssm set      ChatGPT-Web2API-REST AppStdout "C:\Logs\chatgpt-web2api-rest.out.log"
+nssm set      ChatGPT-Web2API-REST AppStderr "C:\Logs\chatgpt-web2api-rest.err.log"
+nssm set      ChatGPT-Web2API-REST AppRotateFiles 1
+nssm set      ChatGPT-Web2API-REST AppRotateBytes 10485760
+nssm set      ChatGPT-Web2API-REST AppThrottle 30000   # grace before restart-on-failure
+nssm start    ChatGPT-Web2API-REST
+
+# MCP/SSE service (attaches to REST-owned Chrome; separate process)
+nssm install ChatGPT-Web2API-MCP "C:\path\to\chatgpt-web2api-mcp.exe" "--transport sse --port 8090 --cdp-port 9222"
+nssm set      ChatGPT-Web2API-MCP AppEnvironmentExtra "W2A_LOG_LEVEL=INFO"
+nssm set      ChatGPT-Web2API-MCP AppDependsOn ChatGPT-Web2API-REST
+nssm set      ChatGPT-Web2API-MCP AppStdout "C:\Logs\chatgpt-web2api-mcp.out.log"
+nssm set      ChatGPT-Web2API-MCP AppStderr "C:\Logs\chatgpt-web2api-mcp.err.log"
+nssm set      ChatGPT-Web2API-MCP AppRotateFiles 1
+nssm set      ChatGPT-Web2API-MCP AppRotateBytes 10485760
+nssm set      ChatGPT-Web2API-MCP AppThrottle 30000
+nssm start    ChatGPT-Web2API-MCP
 ```
 
 > **Session/Desktop note:** ChatGPT-Web2API drives a real Chrome window. A
