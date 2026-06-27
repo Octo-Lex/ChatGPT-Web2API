@@ -317,12 +317,12 @@ Discovered during Phase 4 runtime validation. Each is a separate, small PR — d
 not bundle them into the Phase 5 refactor.
 
 ```text
-A. _fetch_text transient 404 retry
+A. _fetch_text transient 404 retry   ✅ RESOLVED (#23)
    cdp_driver._fetch_text can hit a backend 404 immediately after send, before
-   the just-created conversation is persisted server-side. Treat this as a
-   bounded transient retry, NOT a breaker. Recommended sequence: extract
-   backend_client.py (Phase 5 PR1, no behavior change) FIRST, then fix the 404
-   in the new module so the retry patch is easy to review.
+   the just-created conversation is persisted server-side. Treated as a bounded
+   transient retry (NOT a breaker). Landed in backend_client.py (#22 extraction)
+   via #23 — the recommended sequence (extract first, then fix in the new module)
+   was followed exactly.
 
 B. requests_served semantics
    /health.requests_served currently counts requests accepted/handled, not
@@ -350,29 +350,75 @@ E. BreakerPolicy threshold config
 
 ---
 
-## Phase 5 — Split `cdp_driver.py`
+## Phase 5 — Split `cdp_driver.py`  ✅ COMPLETE 2026-06-27
 
-**Goal:** reduce bug density *after* behavior is stable. `cdp_driver.py` is
-~2800 lines mixing CDP transport, ChatGPT DOM logic, completion detection, token
-fetch, and tab registry.
+**Goal:** reduce bug density *after* behavior is stable. `cdp_driver.py` was
+~2986 lines mixing CDP transport, ChatGPT DOM logic, completion detection, and
+token/session/conversation fetch. **Reduced to 1558 lines** (nearly halved);
+the rest was extracted into focused, singly-responsible modules with **no
+behavior change**. Each extraction was verified by a full test pass, a green CI
+matrix, and a live `"ok"` send against a real ChatGPT account.
 
-### Suggested split
+### Landed PRs
 
 ```text
-cdp_transport.py        CDP websocket / session / reconnect
-chatgpt_dom.py          composer / selectors / send-readiness
-completion_detector.py  Phase-2 / action / end_turn / stall logic
-backend_client.py       token / session / conversation fetch
-tab_registry.py         (already split — validates the pattern)
-driver.py               orchestration facade (stable CDPDriver API)
+#22 backend_client.py   token / session / conversation fetch (+ project/memory CRUD)
+#23 _fetch_text 404 retry   bounded transient-404 retry (follow-up A, in backend_client)
+#24 cdp_transport.py     CDP websocket / session / reconnect primitives
+#25 chatgpt_dom.py       composer / selectors / send-readiness / rate-limit dismiss
+#26 completion_detector.py   Phase-1 appear loop + Phase-2 stream/completion loop
 ```
 
-### Rules
+### Final architecture — hub-and-spoke interception
+
+`CDPDriver` is now an **orchestration facade + interception hub** plus the
+lifecycle/tab-ownership core. The extracted modules (`backend_client`,
+`cdp_transport`, `chatgpt_dom`, `completion_detector`) hold a back-reference
+to the driver and route every transport/state/peer call through
+`self._driver.<method>` — *not* their own implementations. This is deliberate:
+`CDPDriver` remains the single monkeypatch seam, so test patches on
+`driver.X` propagate into the collaborators. This contract is asserted by
+`tests/test_chatgpt_dom.py` and `tests/test_completion_detector.py` and
+documented in each module's docstring.
+
+### Post-extraction audit — remaining delegators are load-bearing
+
+A full import-site audit (every method on `CDPDriver`, across `src/` and
+`tests/`) found **zero delete-safe facade methods**. The remaining
+driver-facing methods are the intentional compatibility/interception seams used
+by collaborator modules and the test suite — they are **not** technical debt in
+this architecture. Keeping them is what made #22–#26 safe. `cdp_driver.py` is
+at its natural floor for the hub-and-spoke design; further line reduction is
+not available without restructuring the interception contract.
+
+### Deferred — Group C lifecycle / tab-ownership (separate initiative)
+
+The only remaining extraction target is the **lifecycle core**: `connect` /
+`reconnect` / `close`, heartbeat (`_heartbeat_loop`, `_live_target_ids`), tab
+ownership (`_create_owned_tab`, `_find_owned_tab_ws`, `_adopt_existing_chatgpt_tab`,
+`_find_page_ws`, `_browser_cdp`), token refresh, and the breaker-policy touch
+points. This is **deferred as a separate high-risk initiative**, not a Phase 5
+continuation. It is the first extraction that simultaneously crosses lifecycle
+ownership, reconnect semantics, heartbeat, the target registry, browser-domain
+CDP, and breaker policy. It should not be started on the momentum of the
+facade-split work; it deserves a fresh "should we do this at all?" decision
+after Phase 5 is closed.
 
 ```text
-no behavior changes in the first split PR
-move tests with modules
-keep the public CDPDriver facade stable (no caller breakage)
+Phase 5 complete. The driver has been reduced to an orchestration/interception
+hub plus lifecycle/tab-ownership core. A post-extraction audit found no
+delete-safe facade methods: the remaining driver-facing methods are intentional
+compatibility and monkeypatch seams used by collaborator modules and tests.
+Further extraction would require moving lifecycle/tab ownership and reconnect
+policy, which is deferred as a separate high-risk initiative.
+```
+
+### Rules (honored)
+
+```text
+no behavior changes in any split PR             ✅
+tests moved/added with modules                  ✅
+public CDPDriver facade kept stable (no caller breakage)  ✅
 ```
 
 ---
@@ -408,7 +454,7 @@ always-on / server users → use OS supervision (this phase)
 2. SSE recommended transport (docs + integration tests)  ✅
 3. ensure command + ZCode hook docs                        ✅
 4. non-rate-limit breaker policy                           ✅ (PR1 #18 / PR2 #19 / PR3 #20)
-5. split cdp_driver.py                                     (next architectural phase)
+5. split cdp_driver.py                                     ✅ (#22–#26; complete 2026-06-27)
 6. optional OS-supervision docs                            (last, docs-only)
 ```
 

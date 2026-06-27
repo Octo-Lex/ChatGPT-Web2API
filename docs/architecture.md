@@ -35,14 +35,34 @@ src/chatgpt_web2api/
 │   ├── Monitor process health
 │   └── Restart on crash
 │
-├── cdp_driver.py      CDP primitives (24 methods)
-│   ├── Browser control: navigate, wait_for_selector, evaluate_js
-│   ├── Input: type_text, click_send, upload_file
-│   ├── Streaming: send_and_stream (DOM poll + API hybrid)
-│   ├── Data: get_conversations, get_conversation_detail
-│   ├── Projects: create_project, get_project_detail
-│   ├── Memory: get_memories, delete_memory
-│   └── Auth: ensure_token, get_access_token
+├── cdp_driver.py      CDPDriver — orchestration facade + interception hub (1558 lines)
+│   ├── Lifecycle/tab ownership: connect, reconnect, close, heartbeat,
+│   │   owned-tab discovery/adoption, token refresh  (Group C — not extracted)
+│   ├── Navigation: select_model, navigate_new_chat/conversation/gpt,
+│   │   ensure_current_conversation
+│   ├── send_and_stream: the high-level send + stream orchestration shell
+│   │   (delegates completion-detection loops to completion_detector.py)
+│   └── Thin delegators: the monkeypatch interception seam — every transport/
+│       DOM/backend call routes back through self._driver.<method> so test
+│       patches on the driver propagate into the collaborators. These are
+│       intentional (see Phase 5 audit in docs/ROADMAP.md), not removable.
+│
+├── backend_client.py      Token / session / conversation fetch + project/memory CRUD
+│   └── Extracted Phase 5 (#22). Holds a driver back-reference; routes CDP via
+│       self._driver._js* and token refresh via self._driver.ensure_token.
+│
+├── cdp_transport.py       CDP websocket / session / reconnect primitives
+│   └── Extracted Phase 5 (#24). Owns _ws/_msg_id/_pending; calls back into
+│       reconnect() on socket death.
+│
+├── chatgpt_dom.py         Composer / selectors / send-readiness / rate-limit dismiss
+│   └── Extracted Phase 5 (#25). Routes transport/breakers/navigation through
+│       self._driver; owns no long-lived state.
+│
+├── completion_detector.py Phase-1 appear loop + Phase-2 stream/completion loop
+│   └── Extracted Phase 5 (#26). Delta-only async sub-generator; the driver
+│       re-yields its chunks. Yields deltas only — never finish_reason, never
+│       writes _current_conv_id.
 │
 ├── api_server.py      OpenAI-compatible HTTP server
 │   ├── POST /v1/chat/completions (streaming + non-streaming)

@@ -30,6 +30,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - The tool surface is now **16 tools** (was 15): added `delete_project` (DELETE `/backend-api/gizmos/{id}`, gated under `W2A_ENABLE_DESTRUCTIVE=1`). The "15 tools" invariant across unit/deep/gating/integration tests updated to 16.
 - `list_tools` now returns the gated surface via the new `build_tools()`; `_build_tools()` (all 16, unfiltered) is retained for tests.
+- **Phase 5 `cdp_driver.py` split — internal refactor, no behavior change.** The ~2986-line monolith was reduced to **1558 lines** by extracting four focused modules while keeping the public `CDPDriver` API byte-stable as an orchestration/interception hub:
+  - `backend_client.py` (#22) — token/session/conversation fetch + project/memory CRUD. Also landed follow-up A: bounded transient-404 retry in `_fetch_text` (#23).
+  - `cdp_transport.py` (#24) — CDP websocket/session/reconnect primitives.
+  - `chatgpt_dom.py` (#25) — composer selectors, send-readiness, typing/send, rate-limit dismiss.
+  - `completion_detector.py` (#26) — Phase-1 assistant-node-appear loop + Phase-2 stream/completion-detection loop (delta-only sub-generator re-yielded by the driver).
+  - `CDPDriver` retains thin delegators as the **monkeypatch interception seam** used by the extracted modules and the test suite — these are intentional, not cruft (a post-extraction audit found zero delete-safe). Lifecycle/tab-ownership/reconnect extraction (Group C) is deferred as a separate high-risk initiative. See `docs/ROADMAP.md` (Phase 5) for the full landing record and rationale.
 
 ## [0.2.0] - 2025-06-06
 
