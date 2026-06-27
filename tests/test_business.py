@@ -135,6 +135,36 @@ async def test_list_conversations(mock_driver):
     assert result["conversations"][0]["id"] == "conv-1"
 
 
+def test_list_conversations_output_schema_accepts_iso_update_time():
+    """list_conversations outputSchema must accept ISO-8601 update_time.
+
+    Regression guard: ChatGPT's /backend-api/conversations emits update_time
+    as an ISO-8601 string (e.g. "2026-06-26T15:38:05.162163Z"), but the schema
+    previously declared it as "number", so every real call failed MCP
+    structured-output validation. The schema must accept number, string, and
+    null so neither real backend data nor fixtures break validation.
+    """
+    import jsonschema
+
+    from chatgpt_web2api.mcp_server import LIST_CONVERSATIONS_OUTPUT
+
+    base = {
+        "conversations": [
+            {"id": "conv-1", "title": "Test Chat", "gizmo_id": None},
+        ]
+    }
+    # Each of these update_time shapes must validate against the schema.
+    for update_time in (
+        "2026-06-26T15:38:05.162163Z",  # ISO-8601 (real ChatGPT data)
+        1700000000,                       # epoch seconds (legacy/fixture)
+        None,                             # missing/null
+    ):
+        payload = json.loads(json.dumps(base))
+        payload["conversations"][0]["update_time"] = update_time
+        # Must not raise — this is the exact validation MCP runs on tool output.
+        jsonschema.validate(payload, LIST_CONVERSATIONS_OUTPUT)
+
+
 # ── do_get_conversation ──────────────────────────────────────
 
 @pytest.mark.asyncio

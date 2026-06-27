@@ -408,9 +408,18 @@ CONVERSATION_ITEM = {
     "properties": {
         "id": {"type": "string", "description": "Conversation UUID"},
         "title": {"type": "string"},
-        "update_time": {"type": "number", "description": "Unix timestamp"},
+        # ChatGPT's /backend-api/conversations emits update_time as an ISO-8601
+        # string (e.g. "2026-06-26T15:38:05.162163Z"); some fixtures/older
+        # payloads use epoch seconds. Accept both plus null/missing so MCP
+        # structured-output validation does not reject real backend data.
+        "update_time": {
+            "type": ["number", "string", "null"],
+            "description": "Backend update timestamp; may be epoch seconds or ISO-8601 string",
+        },
         "gizmo_id": {
-            "type": "string",
+            # Handler emits None for conversations with no project; accept null
+            # alongside the string id so MCP output validation matches reality.
+            "type": ["string", "null"],
             "description": "Project ID if conversation belongs to a project, null otherwise",
         },
     },
