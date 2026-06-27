@@ -187,12 +187,16 @@ def test_has_action_js_walks_depth_8():
     """The JS has_action selector must walk up to depth 8 (was 4) so it
     reaches the action row at ancestor depth 6. This is a structural check
     on the JS source — the depth limit is what the #12 investigation found
-    was too shallow."""
+    was too shallow.
+
+    Phase 5 PR4: the Phase-2 completion-detection JS moved from
+    CDPDriver.send_and_stream into CompletionDetector.stream_until_complete;
+    inspect the detector (the JS's new canonical home)."""
     import inspect
 
-    from chatgpt_web2api.cdp_driver import CDPDriver
+    from chatgpt_web2api.completion_detector import CompletionDetector
 
-    src = inspect.getsource(CDPDriver.send_and_stream)
+    src = inspect.getsource(CompletionDetector.stream_until_complete)
     # The walk loop bound must be 8, not the old 4
     assert "d <= 8" in src, "has_action JS must walk d <= 8 ancestors (was 4)"
     assert "d <= 4" not in src, "old d <= 4 depth limit must be gone"
@@ -204,12 +208,14 @@ def test_has_action_js_walks_depth_8():
 def test_has_action_js_geometry_accepts_above_message():
     """Short answers place the action button ABOVE the message node. The
     geometry gate must accept top >= lastRect.top - 180 (was -8). Structural
-    check on the JS source."""
+    check on the JS source.
+
+    Phase 5 PR4: JS moved to CompletionDetector.stream_until_complete."""
     import inspect
 
-    from chatgpt_web2api.cdp_driver import CDPDriver
+    from chatgpt_web2api.completion_detector import CompletionDetector
 
-    src = inspect.getsource(CDPDriver.send_and_stream)
+    src = inspect.getsource(CompletionDetector.stream_until_complete)
     # The geometry window must be widened to top-180 (the #12 short-answer case)
     assert "lastRect.top - 180" in src, (
         "geometry gate must accept buttons 180px above message (was top - 8)"
