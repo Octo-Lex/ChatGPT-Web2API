@@ -447,6 +447,13 @@ collection, and post-deploy validation (incl. the exact-output `"Reply with
 exactly: ok"` sanity send). Linked from `docs/deployment.md` (Option 5). All
 field names/state values/thresholds verified against source.
 
+✅ **PR3 (#30) — Documentation index.** Added `docs/INDEX.md`: a "which doc
+should I read?" routing table plus grouped listings (operating guides,
+architecture/decisions, reverse-engineering/internals) with one-line purposes
+for every doc in `docs/`. Linked from `README.md` (Documentation section
+refreshed) and `docs/deployment.md` (top pointer). Makes the Phase 6 ops docs
+(os-supervision, runbook) discoverable without adding operational surface.
+
 Docs only — no code:
 
 ```text

@@ -476,8 +476,17 @@ for you to log in.
 
 ## Documentation
 
+**[📋 Full documentation index](docs/INDEX.md)** — start here if you're unsure which doc to read.
+
+Key docs:
+
+- [Deployment Guide](docs/deployment.md) — pip install, Docker, cookie injection, multi-instance, sharing
+- [OS Supervision Guide](docs/os-supervision.md) — systemd / launchd / Task Scheduler / NSSM for always-on deployments
+- [Production Runbook](docs/runbook.md) — health interpretation, failure modes, breaker states, auth recovery, safe restart
+- [API Reference](docs/api-reference.md) — OpenAI-compatible REST endpoints + MCP server surface
+- [Architecture](docs/architecture.md) — codebase structure and the CDPDriver hub-and-spoke module layout
 - [Protocol Reference](docs/protocol-reference.md) — captured ChatGPT web API endpoints
-- [Deployment Guide](docs/deployment.md) — Docker, cookie injection, multi-instance
+- [Roadmap](docs/ROADMAP.md) — phases 1–6, what landed, what's deferred
 - [Contributing](CONTRIBUTING.md) — how to contribute
 - [Changelog](CHANGELOG.md) — version history
 

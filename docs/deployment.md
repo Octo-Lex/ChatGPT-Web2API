@@ -1,5 +1,8 @@
 # ChatGPT-Web2API — Deployment Guide
 
+> Looking for a different doc? See the **[documentation index](INDEX.md)** for a
+> "which doc should I read?" routing table.
+
 Three ways to share this with others, depending on the audience.
 
 ---
