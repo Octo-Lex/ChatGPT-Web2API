@@ -1,0 +1,404 @@
+# Production Runbook
+
+> **Scope:** operating a running `chatgpt-web2api` deployment — interpreting
+> health, diagnosing failure modes, understanding breaker states, recovering
+> auth, collecting logs, and restarting safely. For installation see
+> [deployment.md](deployment.md); for OS-supervisor wiring see
+> [os-supervision.md](os-supervision.md).
+
+All facts below are verified against the source (cited as `file:line` in the
+appendix). Thresholds and field names are exact, not paraphrased — an incident
+is the worst time to discover a guessed state name.
+
+---
+
+## 1. Startup checklist
+
+Before declaring a deployment live, confirm each row:
+
+| # | Check | Command / where | Expected |
+|---|-------|-----------------|----------|
+| 1 | Chrome is reachable on the CDP port | `curl -sf http://127.0.0.1:9222/json/version` | 200 + JSON (browser version) |
+| 2 | REST `/health` returns `healthy` or `starting` | `curl -s http://127.0.0.1:8080/health` | `status` ∈ {`healthy`,`starting`}, `chrome_running=true`, `driver_connected=true` |
+| 3 | No breakers open | `/health` → `open_breakers` | `[]` |
+| 4 | `last_error` is null or explained | `/health` → `last_error` | `null` in steady state |
+| 5 | MCP/SSE handshake succeeds (if MCP used) | `ensure` exits 0; or an MCP client `initialize` + `list_tools` | tools returned, no error |
+| 6 | One real chat send succeeds | POST `/v1/chat/completions` non-stream `"Reply with exactly: ok"` | HTTP 200, content `ok`, `finish_reason=stop` |
+
+Row 6 is the only end-to-end signal — the rest are necessary preconditions.
+A deployment that passes 1–5 but fails 6 is "up but not serving" and must be
+treated as down. See [§3 failure modes](#3-common-failure-modes).
+
+### The reconcile command
+
+```bash
+chatgpt-web2api ensure --rest-port 8080 --mcp-sse-port 8090 --cdp-port 9222
+```
+
+`ensure` is **point-in-time**: it reconciles REST + MCP/SSE to a healthy state
+and exits. It is not a daemon. Exit codes:
+
+| Code | Meaning | Action |
+|------|---------|--------|
+| `0` | REST + SSE ready | nothing |
+| `1` | reconcile failure (REST or SSE could not be made ready) | inspect logs, re-run after fix |
+| `2` | **auth/login needed** (`auth_required` breaker open) | human login required (see [§6](#6-auth-recovery-flow)) |
+
+> ⚠️ `python -m chatgpt_web2api.ensure` does **not** work — the `ensure`
+> submodule has no `__main__` block. Use the console-script subcommand only.
+
+`ensure` launches REST and MCP/SSE as **detached child processes** (POSIX
+`start_new_session=True`; Windows `DETACHED_PROCESS`) so they outlive the
+`ensure` invocation. There is no continuous in-process supervisor — later
+failures require re-running `ensure` or an OS supervisor (see
+[os-supervision.md](os-supervision.md)).
+
+### Startup order & Chrome ownership
+
+- **REST owns Chrome.** REST is launched first; it manages the Chrome process.
+- **MCP/SSE attaches.** MCP/SSE is a separate process that connects to the
+  already-running Chrome over the shared CDP port — it never launches Chrome.
+- `ensure` reconciles REST first; SSE is never reconciled until REST is ready,
+  and if REST needs auth (exit 2) SSE is skipped entirely.
+
+---
+
+## 2. Health interpretation
+
+`GET http://localhost:8080/health` (also served at `/`). No auth required.
+
+### Top-level fields
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `status` | string | Derived state — see states table |
+| `chrome_running` | bool | Live probe to `http://127.0.0.1:<cdp_port>/json/version` returned 200 |
+| `cdp_connected` | bool | Alias of `driver_connected` |
+| `driver_connected` | bool | CDP driver is connected |
+| `requests_served` | int | Chat requests served since REST start |
+| `started_at` | float | REST process start time (epoch seconds; compute uptime as `now - started_at`) |
+| `last_successful_send_at` | float \| null | Epoch of last successful chat send; `null` until first success |
+| `last_error` | string \| null | Latching last error `"<ExcType>: <msg>"` |
+| `open_breakers` | list[string] | `.value` strings of currently-open breakers; `[]` = none open |
+| `breakers` | object | Full per-kind snapshot — see [§5](#5-breaker-states-and-cooldowns) |
+
+> There is **no `uptime` field**. Compute it from `started_at`.
+
+### The `status` field — exact conditions
+
+Status is computed sequentially; earlier branches win. An open breaker can
+only **downgrade** `starting`/`healthy` → `degraded` — it can never upgrade to
+`broken` and never overrides an existing `broken` (Chrome-down is the harder
+failure, and `broken` invites a destructive supervisor restart).
+
+| `status` | Exact condition | Meaning |
+|----------|-----------------|---------|
+| `broken` | `chrome_running == false` | Chrome is down (probe to `/json/version` failed). REST will be restarted by `ensure`. |
+| `degraded` | Chrome up **but** `driver_connected == false`, **OR** a breaker is open overlaying `starting`/`healthy` | Up but refusing some/all traffic. Do **not** restart-loop — see [§7](#7-safe-restart-sequence). |
+| `starting` | Chrome up, driver connected, but no request has ever been served (`requests_served == 0` and `last_successful_send_at is null`) | Cold bootstrap. Give it room; do not restart. |
+| `healthy` | Chrome up, driver connected, and at least one request served or send recorded | Steady state. |
+
+### Triage matrix
+
+| `status` | `chrome_running` | `driver_connected` | breaker open? | `ensure` action |
+|----------|------------------|--------------------|---------------|-----------------|
+| `broken` | false | any | n/a | immediate REST restart |
+| `degraded` (driver dead) | true | false | — | poll up to budget, then restart (unless auth) |
+| `degraded` (breaker trip) | true | true | yes | wait cooldown+grace (timed) / exit 2 (auth) |
+| `starting` | true | true | no | wait up to 30s for connectivity |
+| `healthy` | true | true | no | none |
+
+---
+
+## 3. Common failure modes
+
+Ordered roughly by frequency in practice.
+
+### 3.1 `auth_required` breaker — login expired (exit code 2)
+- **Symptom:** `/health` `open_breakers` contains `"auth_required"`; `ensure`
+  exits **2**; chat requests return HTTP 503 `circuit_open`.
+- **Cause:** ChatGPT session token expired or was invalidated. The REST
+  preflight attempts a token refresh first (`recover_auth`); only if that fails
+  does the breaker stay open.
+- **Fix:** human login — see [§6](#6-auth-recovery-flow). This breaker is
+  **indefinite** (never auto-recovers); only a successful token refresh closes
+  it. `ensure` will **not** restart REST for this — a restart can't fix a
+  login problem.
+
+### 3.2 `chrome_crash_loop` breaker — Chrome won't stay up
+- **Symptom:** `open_breakers` contains `"chrome_crash_loop"`; Chrome restarts
+  repeatedly.
+- **Cause:** 3 Chrome restarts within a 300s window. Usually a resource issue
+  (out of memory, display/Xvfb missing on a headless server), a Chrome profile
+  lock, or an OS update breaking the Chrome binary.
+- **Fix:** check Chrome can launch manually; check display/headless config;
+  clear the Chrome profile lock if stale. Cooldown is 300s — it half-opens
+  after that, and `ensure` restarts REST if still open past `cooldown + grace`.
+
+### 3.3 `cdp_reconnect` breaker — driver lost Chrome
+- **Symptom:** `open_breakers` contains `"cdp_reconnect"`; transient.
+- **Cause:** 5 reconnect failures in 120s. Often a transient CDP socket drop
+  (Chrome update, tab crash, system suspend/resume). Usually self-heals.
+- **Fix:** usually none — cooldown 120s, then a successful reconnect closes it.
+  If it persists, Chrome may be wedged; a `broken` status will follow and
+  `ensure` will restart REST.
+
+### 3.4 `composer_send_readiness` breaker — can't type/send
+- **Symptom:** `open_breakers` contains `"composer_send_readiness"`; sends fail
+  preflight.
+- **Cause:** 3 send-readiness failures in 120s. Typically a ChatGPT DOM change
+  (selector drift) or a transient page state where the composer isn't ready.
+- **Fix:** cooldown 300s; a confirmed successful send closes it. Persistent
+  trips on a stable ChatGPT suggest selector drift — check release notes / DOM.
+
+### 3.5 `status=degraded` with empty `open_breakers`
+- **Symptom:** Chrome up, driver disconnected, no breaker tripped.
+- **Cause:** CDP driver disconnected but not yet tripped (below threshold), or
+  recovering.
+- **Fix:** let `ensure`'s degraded policy run (poll up to ~20s, then restart).
+  **Do not** race it with a faster supervisor restart — see [§7](#7-safe-restart-sequence).
+
+### 3.6 `status=broken`
+- **Symptom:** Chrome not reachable on the CDP port.
+- **Cause:** Chrome crashed, was killed, or the port probe is blocked.
+- **Fix:** `ensure` restarts REST (which relaunches Chrome) immediately. If it
+  loops, you'll land in `chrome_crash_loop` (3.2).
+
+### 3.7 Requests return 503 `circuit_open` but `/health` looks fine
+- **Symptom:** chat 503s with `code: circuit_open`, but `status=healthy`.
+- **Cause:** the breaker opened **between** your `/health` read and the request.
+  Re-read `/health`; `open_breakers` will now be non-empty. This is normal
+  eventual consistency between the health snapshot and a tripped breaker.
+
+---
+
+## 4. The 503 `circuit_open` response
+
+When any breaker is open, chat requests fail fast at the preflight (REST and
+MCP both) rather than queuing against a known-bad backend.
+
+**REST (HTTP):**
+```json
+HTTP 503
+{
+  "error": {
+    "message": "Circuit open for <kind> — cooling down. Retry later.",
+    "type": "server_error",
+    "param": null,
+    "code": "circuit_open"
+  }
+}
+```
+`<kind>` is the breaker's `.value` string (e.g. `auth_required`,
+`composer_send_readiness`).
+
+**MCP (tool result):** `isError: true`, text
+`"Circuit open for <kind> — cooling down. Retry later. (circuit_open, kind=<kind>)"`.
+
+> **Only the first open breaker is reported.** `first_open()` returns breakers
+> in enum order (`auth_required`, `composer_send_readiness`, `cdp_reconnect`,
+> `chrome_crash_loop`). An error naming one breaker does **not** mean others
+> aren't also open — check `/health` `open_breakers` for the full list.
+
+---
+
+## 5. Breaker states and cooldowns
+
+The system tracks exactly **four** breakers. All thresholds/cooldowns are
+**hardcoded** in `breakers.py` — there is **no env override** (do not look for
+`W2A_BREAKER_*`; it does not exist). The only breaker-adjacent env tunable is
+`W2A_ENSURE_BREAKER_COOLDOWN_GRACE_S` (default 5s), which is an `ensure`
+supervisor grace budget, not a breaker cooldown.
+
+### The four breakers
+
+| Kind (`.value`) | Trips on | Threshold / window | Cooldown | Resets on |
+|-----------------|----------|--------------------|----------|-----------|
+| `auth_required` | explicit `trip()` — login page instead of data, or HTTP 401 | single-shot | **indefinite** (`None`) | successful `recover_auth()` token refresh (explicit `reset()`) — **never auto-recovers** |
+| `composer_send_readiness` | send-readiness / send failures | 3 / 120s | 300s | a confirmed successful send (`record_success`) |
+| `cdp_reconnect` | failed CDP reconnects | 5 / 120s | 120s | successful reconnect + token refresh |
+| `chrome_crash_loop` | Chrome restarts | 3 / **300s** | 300s | cooldown half-open only (no `record_success` path) |
+
+### Conceptual states (the code does not use closed/open/half-open as literal names)
+
+- **tripped** — the persistent latch flag is set.
+- **open** — tripped AND still within cooldown (or `cooldown_until is None` for
+  auth). `is_open()` returns true; requests fail-fast.
+- **half-open** — tripped but past cooldown. `is_open()` returns **false**; a
+  successful trial (`record_success`) closes it, a fresh failure burst re-trips.
+- **closed** — fresh state (after `reset()` or successful recovery).
+
+```
+[closed] ──failures≥threshold──► [open] ──cooldown elapses──► [half-open]
+                                   │                              │
+                                   │                          success → [closed]
+                                   │                          failure → [open]
+                                   │
+                          (auth: cooldown_until=None, indefinite)
+                                   │
+                          reset() via recover_auth ──► [closed]
+```
+
+### Reading breakers in `/health`
+
+`open_breakers`: `[]` = nothing currently blocking; non-empty = listed kinds
+are open. The nested `breakers` object gives per-kind detail:
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `open` | bool | `is_open()` result |
+| `reason` | string \| null | why tripped; auto-trips read `"<threshold> failures in <window>s window"` |
+| `tripped_at` | float \| null | **monotonic** timestamp (only comparable within the process) |
+| `cooldown_until` | float \| null | monotonic expiry; `None` for closed or sticky-auth |
+| `cooldown_seconds_remaining` | float \| null | seconds left; **`None` is overloaded** = closed **OR** sticky-auth; `0.0` = half-open |
+| `failures_in_window` | int | failures in the current rolling window |
+
+> **Gotcha:** `cooldown_seconds_remaining == null` does not distinguish "closed"
+> from "sticky auth". Distinguish auth by `kind == "auth_required" && open == true`.
+
+---
+
+## 6. Auth recovery flow
+
+`auth_required` is the one breaker that needs a human. It is indefinite and
+does not self-heal — only a successful token refresh closes it.
+
+### Detection
+- `ensure` exits **2**.
+- `/health` `open_breakers` contains `"auth_required"`.
+- Chat requests return 503 `circuit_open` with kind `auth_required`.
+- The breaker `reason` is `"login page returned instead of data"` or
+  `"HTTP 401 from backend-api"`.
+
+### Automatic recovery attempt (always tried first)
+Every chat-request preflight, on REST and MCP, calls `driver.recover_auth()`
+before raising `CircuitOpenError`. `recover_auth()` probes `/api/auth/session`
+for a fresh token; if it succeeds, it resets the breaker and the request
+proceeds. So a transient token lapse can self-clear on the next request. If the
+session itself is dead, recovery fails and the breaker stays open.
+
+### Manual recovery (when auto-recovery fails)
+1. **Log in to ChatGPT in the Chrome window REST owns.** On a headed
+   deployment, open the visible Chrome and complete login at chatgpt.com. On a
+   headless/remote deployment, use cookie export (see [deployment.md](deployment.md)
+   Option 2) or a headed session to re-establish the session.
+2. **Trigger a token refresh.** Any chat request will invoke `recover_auth()`
+   in preflight; a successful `/api/auth/session` refresh resets the breaker.
+   Or re-run `ensure` — if the session is now valid, it exits 0.
+3. **Confirm** `/health` shows `auth_required` no longer in `open_breakers`.
+
+### What does NOT work
+- **Restarting REST.** `ensure` deliberately does **not** restart REST on
+  `auth_required` (a restart can't fix a login problem; it just relaunches
+  Chrome into the same logged-out state).
+- **Waiting.** The cooldown is `None` (indefinite). It will not time out.
+
+---
+
+## 7. Safe restart sequence
+
+Restarting REST relaunches Chrome, which is destructive: in-flight requests
+are lost, the visible Chrome window flashes closed/reopened, and any unsaved
+page state is gone. Restart only when necessary, and let `ensure` do it.
+
+### Golden rule: restart on process exit, NOT on `degraded`
+
+`ensure` already encodes the correct degraded policy:
+- `broken` → restart immediately.
+- `degraded` (driver dead, no breaker) → poll up to ~20s, then restart.
+- `degraded` (timed breaker) → wait `cooldown + grace`, then restart.
+- `degraded` (`auth_required`) → **do not restart** (exit 2).
+
+A supervisor that restarts faster than `ensure`'s degraded budget will **race**
+it and cause destructive browser flapping. See [os-supervision.md](os-supervision.md)
+"Restart policy".
+
+### When YOU should restart
+1. **`status=broken` that doesn't self-heal** after one `ensure` cycle.
+2. **Chrome is wedged** (CDP port probe fails, `chrome_crash_loop` tripping).
+3. **After a code/config change** that requires a fresh process.
+
+### The safe restart
+```bash
+# 1. Stop gracefully if you can (sends SIGTERM; REST drains).
+#    On systemd:  systemctl --user stop chatgpt-web2api.service
+# 2. Let ensure reconcile (it will cold-start REST + MCP if they're gone).
+chatgpt-web2api ensure --rest-port 8080 --mcp-sse-port 8090 --cdp-port 9222
+# 3. Verify — see §8.
+```
+
+If `ensure` exits 2, **stop and do auth recovery (§6)** — do not loop `ensure`.
+
+---
+
+## 8. Post-deploy / post-restart validation
+
+Run in order; stop at the first failure.
+
+```bash
+# 1. ensure exited 0 (REST + SSE ready) — or re-run it:
+chatgpt-web2api ensure --rest-port 8080 --mcp-sse-port 8090 --cdp-port 9222
+# expect: exit 0, "REST + SSE ready"
+
+# 2. Health
+curl -s http://localhost:8080/health | python -m json.tool
+# expect: status healthy|starting, chrome_running true, driver_connected true,
+#         open_breakers [], last_error null
+
+# 3. One real chat send (end-to-end; exercises the full send + completion path)
+curl -s -X POST http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gpt-4o-mini","stream":false,"messages":[{"role":"user","content":"Reply with exactly: ok"}]}'
+# expect: HTTP 200, content "ok", finish_reason "stop"
+```
+
+> Use **`Reply with exactly: ok`**, not bare `"ok"`. Plain `"ok"` is often
+> interpreted as an acknowledgement cue and returns `"Acknowledged."` — still a
+> valid 200, but not an exact-output sanity check.
+
+Step 3 is the only signal that the composer DOM path, completion detection, and
+backend fetch all work end-to-end. Steps 1–2 are preconditions.
+
+---
+
+## 9. Log collection
+
+`chatgpt-web2api` logs to **stderr** at the configured level. There is no
+built-in log file or rotation — capture via the supervisor's stdout/stderr
+redirection (see [os-supervision.md](os-supervision.md) per-OS sections).
+
+Control verbosity with `W2A_LOG_LEVEL` (`DEBUG`/`INFO`/`WARNING`/`ERROR`;
+default `INFO`):
+
+```bash
+W2A_LOG_LEVEL=DEBUG  # most verbose; use for incident diagnosis
+```
+
+### What to look for in logs during an incident
+- **`Circuit open for <kind>`** — a breaker tripped; cross-reference
+  `/health` `open_breakers`.
+- **`auth_required` / "login page returned instead of data" / "HTTP 401"** —
+  auth expired; see [§6](#6-auth-recovery-flow).
+- **repeated Chrome restart lines** — heading toward `chrome_crash_loop`.
+- **`phase_1_appear` / `phase_2_stream` GenerationStuckError** — completion
+  detection stalled; usually transient, persistent cases suggest DOM drift.
+- **`end_turn fetch failed`** — transient backend fetch error (the DOM
+  action-button fallback covers it; not fatal on its own).
+
+---
+
+## Appendix: source citations
+
+All field names, state values, thresholds, and exit codes above are verified
+against:
+
+- `/health` schema & `status` conditions — `src/chatgpt_web2api/api_server.py:108-186`
+- Breaker kinds, policies, states — `src/chatgpt_web2api/breakers.py:46-109, 133-252`
+- Breaker trip/reset sites — `backend_client.py:187,210-211,344`; `chatgpt_dom.py:173,206,277,418,427`; `cdp_driver.py:592,599`; `chrome.py:40-68`
+- 503 `circuit_open` mapping — `api_server.py:377-397,467-480`; MCP `mcp_server.py:1519-1576`
+- `ensure` exit codes & flow — `ensure.py:14-19,725-790`
+- Degraded polling policy & tunables — `ensure.py:540-689`; `config.py:89-96,181-187,214-219`
+- Detached child launch — `ensure.py:305-316`; REST cmd `:260-280`; SSE cmd `:283-302`
+- Chrome ownership — `ensure.py:8-9` ("REST owns Chrome; SSE attaches and never launches Chrome")
+
+Thresholds are hardcoded in `breakers.py:104-109`; there is no env override.

@@ -161,6 +161,27 @@ package. ZCode users should prefer the `ensure` hook over OS supervision.
 
 ---
 
+## Option 5: Production runbook (operating a running deployment)
+
+For interpreting `/health`, diagnosing failure modes, understanding breaker
+states and cooldowns, recovering auth, collecting logs, and safe restart
+sequences, see the dedicated **[Production Runbook](runbook.md)**. It covers:
+
+- startup checklist + the reconcile command and its exit codes (0/1/2)
+- `/health` field reference and the exact conditions for each `status`
+  (`starting`/`healthy`/`degraded`/`broken`)
+- common failure modes mapped to symptoms and fixes
+- the four breakers (`auth_required`, `composer_send_readiness`,
+  `cdp_reconnect`, `chrome_crash_loop`) with their thresholds/cooldowns
+- the auth-recovery flow (the one breaker that needs a human)
+- the safe restart rule (restart on process exit, not on `degraded`)
+- post-deploy validation including the exact-output `"Reply with exactly: ok"`
+  sanity send
+
+All field names, state values, and thresholds are source-cited.
+
+---
+
 ## Cookie Export Guide (Detailed)
 
 ### Chrome — EditThisCookie

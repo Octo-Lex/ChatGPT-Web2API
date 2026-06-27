@@ -438,6 +438,15 @@ log capture, and the env-var reference. **Docs only** — no supervisor scripts
 installed, no daemonization code, no package entrypoint changes. Linked from
 `docs/deployment.md` (Option 4).
 
+✅ **PR2 (#29) — Production runbook.** Added `docs/runbook.md`: startup
+checklist, `/health` field reference with exact `status` conditions, common
+failure modes mapped to symptoms/fixes, the four breakers with thresholds and
+cooldowns (source-cited, hardcoded — no env override), the auth-recovery flow,
+the safe-restart rule (restart on process exit, not on `degraded`), log
+collection, and post-deploy validation (incl. the exact-output `"Reply with
+exactly: ok"` sanity send). Linked from `docs/deployment.md` (Option 5). All
+field names/state values/thresholds verified against source.
+
 Docs only — no code:
 
 ```text
