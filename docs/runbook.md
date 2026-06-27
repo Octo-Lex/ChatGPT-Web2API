@@ -75,7 +75,7 @@ failures require re-running `ensure` or an OS supervisor (see
 | `chrome_running` | bool | Live probe to `http://127.0.0.1:<cdp_port>/json/version` returned 200 |
 | `cdp_connected` | bool | Alias of `driver_connected` |
 | `driver_connected` | bool | CDP driver is connected |
-| `requests_served` | int | Chat requests served since REST start |
+| `requests_served` | int | **Accepted** chat requests since REST start. Incremented at the start of request handling (after auth, before JSON parsing) — a malformed/failed request still counts. This is **not** a count of successful sends; for that see `last_successful_send_at`. |
 | `started_at` | float | REST process start time (epoch seconds; compute uptime as `now - started_at`) |
 | `last_successful_send_at` | float \| null | Epoch of last successful chat send; `null` until first success |
 | `last_error` | string \| null | Latching last error `"<ExcType>: <msg>"` |
@@ -95,8 +95,8 @@ failure, and `broken` invites a destructive supervisor restart).
 |----------|-----------------|---------|
 | `broken` | `chrome_running == false` | Chrome is down (probe to `/json/version` failed). REST will be restarted by `ensure`. |
 | `degraded` | Chrome up **but** `driver_connected == false`, **OR** a breaker is open overlaying `starting`/`healthy` | Up but refusing some/all traffic. Do **not** restart-loop — see [§7](#7-safe-restart-sequence). |
-| `starting` | Chrome up, driver connected, but no request has ever been served (`requests_served == 0` and `last_successful_send_at is null`) | Cold bootstrap. Give it room; do not restart. |
-| `healthy` | Chrome up, driver connected, and at least one request served or send recorded | Steady state. |
+| `starting` | Chrome up, driver connected, but zero chat requests accepted (`request_count == 0`) and no send recorded (`last_successful_send_at is null`) | Cold bootstrap. Give it room; do not restart. |
+| `healthy` | Chrome up, driver connected, and **not** (`last_successful_send_at is null` AND `request_count == 0`) | REST/Chrome/driver are up and the server has seen traffic or a send has succeeded. **Caveat:** does not guarantee a send succeeded — `request_count` increments before validation, so one malformed request flips `starting`→`healthy`. True read-readiness is `last_successful_send_at != null` or a passing post-deploy send ([§8](#8-post-deploy--post-restart-validation)). |
 
 ### Triage matrix
 
@@ -165,17 +165,21 @@ Ordered roughly by frequency in practice.
   loops, you'll land in `chrome_crash_loop` (3.2).
 
 ### 3.7 Requests return 503 `circuit_open` but `/health` looks fine
-- **Symptom:** chat 503s with `code: circuit_open`, but `status=healthy`.
-- **Cause:** the breaker opened **between** your `/health` read and the request.
-  Re-read `/health`; `open_breakers` will now be non-empty. This is normal
-  eventual consistency between the health snapshot and a tripped breaker.
+- **Symptom:** chat 503s with `code: circuit_open`, but REST `status=healthy`.
+- **Two possible causes:**
+  1. **REST breaker opened between reads** — re-read `/health`; `open_breakers`
+     will now be non-empty. Normal eventual consistency between the snapshot
+     and a tripped REST breaker.
+  2. **The request was MCP, and the breaker is in MCP's local registry** —
+     REST `/health` stays healthy because MCP has a separate registry with no
+     cross-process propagation (see [§4](#4-the-503-circuit_open-response)).
+     Inspect MCP logs for `Circuit open for <kind>`; do not rely on `/health`.
 
 ---
 
 ## 4. The 503 `circuit_open` response
 
-When any breaker is open, chat requests fail fast at the preflight (REST and
-MCP both) rather than queuing against a known-bad backend.
+### Error shape (REST and MCP share this)
 
 **REST (HTTP):**
 ```json
@@ -195,10 +199,39 @@ HTTP 503
 **MCP (tool result):** `isError: true`, text
 `"Circuit open for <kind> — cooling down. Retry later. (circuit_open, kind=<kind>)"`.
 
-> **Only the first open breaker is reported.** `first_open()` returns breakers
-> in enum order (`auth_required`, `composer_send_readiness`, `cdp_reconnect`,
-> `chrome_crash_loop`). An error naming one breaker does **not** mean others
-> aren't also open — check `/health` `open_breakers` for the full list.
+### Finding the open breaker — REST vs MCP differ
+
+> ⚠️ **MCP has its own breaker registry.** The MCP process creates a separate
+> local `BreakerRegistry` (`mcp_server.py:1891`) with **no cross-process
+> propagation** to/from REST (`mcp_server.py:1890,664`). REST's `/health`
+> serializes **REST's** registry only — it does **not** reflect MCP-local
+> breaker state. An MCP `circuit_open` can occur while REST `/health` still
+> shows `open_breakers: []` and `status: healthy`.
+
+**REST `circuit_open`:** check REST `/health` for the authoritative list:
+```
+GET http://localhost:8080/health  →  open_breakers, breakers{}
+```
+This is reliable for REST because the failing request and the health snapshot
+share the same registry.
+
+**MCP `circuit_open`:** `/health` is **not** a reliable source — the open
+breaker is in MCP's local registry, not REST's. Inspect the **MCP process logs**
+(stderr via the supervisor) for the `Circuit open for <kind>` line, then act on
+that `<kind>` per [§3 failure modes](#3-common-failure-modes) and
+[§5 breakers](#5-breaker-states-and-cooldowns). Restart or wait the MCP process
+according to your supervisor policy (see [os-supervision.md](os-supervision.md)).
+(Exception: the `auth_required` breaker is effectively shared in practice —
+both processes trip it on the same expired session — but the registry state is
+still per-process; confirm via MCP logs.)
+
+### Only the first open breaker is reported
+
+`first_open()` returns breakers in enum order (`auth_required`,
+`composer_send_readiness`, `cdp_reconnect`, `chrome_crash_loop`). An error
+naming one breaker does **not** mean others aren't also open — within REST,
+check `/health` `open_breakers` for the full list; within MCP, grep the logs for
+all `Circuit open` lines.
 
 ---
 
