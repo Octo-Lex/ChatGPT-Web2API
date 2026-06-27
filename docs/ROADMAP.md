@@ -428,6 +428,16 @@ public CDPDriver facade kept stable (no caller breakage)  ✅
 **Goal:** support always-on deployments outside ZCode. Comes last because ZCode
 hooks are the primary path.
 
+✅ **PR1 (#28) — OS supervision guide.** Added `docs/os-supervision.md` covering
+systemd (Linux), launchd (macOS), and Task Scheduler / NSSM (Windows), with two
+styles: `ensure` on a timer (mirrors the ZCode hook) and `start` as a long-lived
+service. Documents the recommended reconcile command
+(`chatgpt-web2api ensure --rest-port 8080 --mcp-sse-port 8090 --cdp-port 9222`),
+the `/health`-gated restart policy (restart on process exit, not on `degraded`),
+log capture, and the env-var reference. **Docs only** — no supervisor scripts
+installed, no daemonization code, no package entrypoint changes. Linked from
+`docs/deployment.md` (Option 4).
+
 Docs only — no code:
 
 ```text
