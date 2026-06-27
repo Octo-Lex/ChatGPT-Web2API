@@ -360,29 +360,49 @@ it and cause destructive browser flapping. See [os-supervision.md](os-supervisio
 > `ensure`'s definition, so it is left alone.
 
 After pulling a code/package update (e.g. `pip install -U`, a merged fix), the
-long-lived processes must be **restarted explicitly** to load the new code:
+long-lived processes must be **restarted explicitly** to load the new code.
+**Do not restart REST and MCP back-to-back** — MCP exits during startup if it
+cannot reach Chrome/CDP (`run_mcp()` logs `"Cannot connect to Chrome"`, cleans
+up, and returns without starting the SSE listener), so a blind sequence leaves
+no MCP listener. Restart REST **first**, confirm REST/Chrome/CDP is ready,
+**then** restart MCP.
 
-- **Split-service style** (the recommended always-on layout from
-  [os-supervision.md](os-supervision.md)) — restart **both** units:
-  ```bash
-  # systemd example:
-  systemctl --user restart chatgpt-web2api.service        # REST (owns Chrome)
-  systemctl --user restart chatgpt-web2api-mcp.service     # MCP/SSE (separate process)
-  ```
-  REST owns Chrome, so restarting REST relaunches Chrome. MCP/SSE attaches to
-  REST-owned Chrome over CDP, so it must be restarted separately to pick up
-  MCP-server code changes.
+**Split-service style** (the recommended always-on layout from
+[os-supervision.md](os-supervision.md)) — ordered, not back-to-back:
+
+```bash
+# 1. Restart REST (it owns Chrome, so this relaunches Chrome too).
+systemctl --user restart chatgpt-web2api.service
+
+# 2. Wait until REST/Chrome/CDP is actually ready. `ensure` reconciles and
+#    exits 0 only when REST is ready — or poll /health until
+#    chrome_running=true and driver_connected=true.
+chatgpt-web2api ensure --rest-port 8080 --mcp-sse-port 8090 --cdp-port 9222
+
+# 3. NOW restart MCP/SSE. It connects to the already-ready Chrome over CDP.
+systemctl --user restart chatgpt-web2api-mcp.service
+
+# 4. Re-run ensure (or an MCP tool call) to confirm the SSE listener came up.
+chatgpt-web2api ensure --rest-port 8080 --mcp-sse-port 8090 --cdp-port 9222
+```
+
+Why the ordering matters: MCP/SSE attaches to REST-owned Chrome over CDP and
+has **no Chrome of its own**. Restarting MCP while REST is mid-restart (Chrome
+not yet listening on the CDP port) causes MCP to exit with "Cannot connect to
+Chrome" and leaves no SSE listener — a silent failure under `Type=simple`.
+
 - **`ensure`-timer style** — there is no long-lived supervisor to restart;
   kill the existing REST and MCP processes, then re-run `ensure` to cold-start
-  them with the new code.
+  them in the correct order (REST first; `ensure` reconciles SSE only after
+  REST is ready, so the ordering is built in).
 - **General rule:** restart **both** REST and MCP/SSE after a code change, even
   if you think only one surface was touched. The safer default avoids the
-  "REST looks healthy but MCP runs stale code" state (which silently breaks
+  "REST looks healthy but MCP runs stale code" state (which silently broke
   MCP-only fixes — see the #31 `list_conversations` schema fix, where the merged
   code did not take effect until the MCP process was restarted).
 
-After the restart, run `ensure` once to confirm readiness, then validate per
-[§8](#8-post-deploy--post-restart-validation).
+After the restart, run `ensure` once more to confirm readiness, then validate
+per [§8](#8-post-deploy--post-restart-validation).
 
 ### The safe restart
 ```bash
@@ -399,11 +419,21 @@ If `ensure` exits 2, **stop and do auth recovery (§6)** — do not loop `ensure
 
 ## 8. Post-deploy / post-restart validation
 
-> **After a code/package update, restart first.** `ensure` does not hot-reload
-> code (see [§7](#7-safe-restart-sequence)). The validation order for a code
-> deploy is: **restart REST + MCP/SSE → run `ensure` → validate**. The steps
-> below assume the processes are already running the code you intend to validate;
-> if you just merged code, do the restart in §7 before step 1.
+> **After a code/package update, restart in dependency order.** `ensure` does
+> not hot-reload code (see [§7](#7-safe-restart-sequence)), and REST/MCP must
+> not be restarted back-to-back (MCP exits if Chrome/CDP isn't ready when it
+> starts). The correct code-deploy order is:
+>
+> 1. restart **REST** (owns Chrome)
+> 2. reconcile/wait for **REST readiness** (`ensure`, or poll `/health` until
+>    `chrome_running=true` and `driver_connected=true`)
+> 3. restart **MCP/SSE** (now that Chrome is listening)
+> 4. run `ensure` to confirm both came up
+> 5. validate below
+>
+> The steps below assume the processes are running the code you intend to
+> validate. For a non-code restart (e.g. recovering from a crash), skip to
+> step 1 and let `ensure` reconcile.
 
 Run in order; stop at the first failure.
 
