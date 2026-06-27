@@ -351,6 +351,39 @@ it and cause destructive browser flapping. See [os-supervision.md](os-supervisio
 2. **Chrome is wedged** (CDP port probe fails, `chrome_crash_loop` tripping).
 3. **After a code/config change** that requires a fresh process.
 
+### Code/package updates — restart the processes, do not just re-`ensure`
+
+> **`ensure` is a readiness reconciler, not a hot-reload or deploy mechanism.**
+> It reconciles REST + MCP/SSE to a healthy state and will cold-start a missing
+> process, but it will **not** restart an already-healthy process merely because
+> the source code changed. A post-merge process running stale code is healthy by
+> `ensure`'s definition, so it is left alone.
+
+After pulling a code/package update (e.g. `pip install -U`, a merged fix), the
+long-lived processes must be **restarted explicitly** to load the new code:
+
+- **Split-service style** (the recommended always-on layout from
+  [os-supervision.md](os-supervision.md)) — restart **both** units:
+  ```bash
+  # systemd example:
+  systemctl --user restart chatgpt-web2api.service        # REST (owns Chrome)
+  systemctl --user restart chatgpt-web2api-mcp.service     # MCP/SSE (separate process)
+  ```
+  REST owns Chrome, so restarting REST relaunches Chrome. MCP/SSE attaches to
+  REST-owned Chrome over CDP, so it must be restarted separately to pick up
+  MCP-server code changes.
+- **`ensure`-timer style** — there is no long-lived supervisor to restart;
+  kill the existing REST and MCP processes, then re-run `ensure` to cold-start
+  them with the new code.
+- **General rule:** restart **both** REST and MCP/SSE after a code change, even
+  if you think only one surface was touched. The safer default avoids the
+  "REST looks healthy but MCP runs stale code" state (which silently breaks
+  MCP-only fixes — see the #31 `list_conversations` schema fix, where the merged
+  code did not take effect until the MCP process was restarted).
+
+After the restart, run `ensure` once to confirm readiness, then validate per
+[§8](#8-post-deploy--post-restart-validation).
+
 ### The safe restart
 ```bash
 # 1. Stop gracefully if you can (sends SIGTERM; REST drains).
@@ -365,6 +398,12 @@ If `ensure` exits 2, **stop and do auth recovery (§6)** — do not loop `ensure
 ---
 
 ## 8. Post-deploy / post-restart validation
+
+> **After a code/package update, restart first.** `ensure` does not hot-reload
+> code (see [§7](#7-safe-restart-sequence)). The validation order for a code
+> deploy is: **restart REST + MCP/SSE → run `ensure` → validate**. The steps
+> below assume the processes are already running the code you intend to validate;
+> if you just merged code, do the restart in §7 before step 1.
 
 Run in order; stop at the first failure.
 
@@ -387,10 +426,40 @@ curl -s -X POST http://localhost:8080/v1/chat/completions \
 
 > Use **`Reply with exactly: ok`**, not bare `"ok"`. Plain `"ok"` is often
 > interpreted as an acknowledgement cue and returns `"Acknowledged."` — still a
-> valid 200, but not an exact-output sanity check.
+> valid 200, but not an exact-output sanity check. For runtime validation, the
+> hard pass is HTTP 200 + OpenAI-compatible shape + `finish_reason: stop`; the
+> exact content is a best-effort cue unless you add a stronger system instruction.
 
 Step 3 is the only signal that the composer DOM path, completion detection, and
 backend fetch all work end-to-end. Steps 1–2 are preconditions.
+
+### 4. (If MCP/SSE is used) One MCP tool call
+
+The REST send does **not** exercise MCP output-schema validation. After a
+change touching MCP tool schemas or the MCP server, call an affected MCP tool
+and confirm it returns `isError: false`. For example, `list_conversations`
+(which returns `update_time` as an ISO string and `gizmo_id` as null — the
+shape that broke structured-output validation in #31 before the fix):
+
+```python
+# python -m pip install mcp   (if not already installed)
+import asyncio
+from mcp import ClientSession
+from mcp.client.sse import sse_client
+
+async def main():
+    async with sse_client("http://localhost:8090/sse") as (r, w):
+        async with ClientSession(r, w) as s:
+            await s.initialize()
+            res = await s.call_tool("list_conversations", {"limit": 3})
+            print("isError:", res.isError)          # expect: False
+            print("count:", len((res.structuredContent or {}).get("conversations", [])))
+
+asyncio.run(main())
+```
+
+`isError: False` with conversations returned = the MCP path is healthy. Omit
+this step only if your deployment does not use MCP/SSE.
 
 ---
 
