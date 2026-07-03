@@ -21,6 +21,7 @@ from .breakers import BreakerRegistry
 from .cdp_driver import CDPDriver
 from .chrome import ChromeProcess
 from .config import Config
+from .lock_resolver import OwnedTabRequiredError
 from .tab_registry import TabRegistry
 
 logger = logging.getLogger(__name__)
@@ -69,10 +70,14 @@ class Service:
                 server_identity=f"rest:{cfg.server.port}",
             ),
             breakers=self._breakers,
+            parallel_tabs=cfg.chatgpt.parallel_tabs,
         )
 
         try:
             await self._driver.connect()
+        except OwnedTabRequiredError:
+            # Parallel-mode fail-closed must propagate, not become a login wait.
+            raise
         except Exception as e:
             logger.info("Auth failed: %s — waiting for login", e)
             # Not logged in — wait for user to complete login
