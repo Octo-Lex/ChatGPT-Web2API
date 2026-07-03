@@ -26,7 +26,8 @@ from .cdp_driver import (
     is_rate_limited_text,
 )
 from .config import Config
-from .cross_process_lock import CrossProcessLock, LockAcquisitionError
+from .cross_process_lock import LockAcquisitionError
+from .lock_resolver import MutationLock, OwnedTabRequiredError, resolve_mutation_lock
 from .resilience import retry_on_rate_limit
 
 logger = logging.getLogger(__name__)
@@ -58,6 +59,7 @@ class APIServer:
         self._config = config
         self._driver = driver
         self._cdp_port = config.chrome.cdp_port
+        self._parallel_tabs = config.chatgpt.parallel_tabs
         self._request_count = 0
         # Health telemetry (event-derived, not polled). These are the only
         # fields that make sense to cache: they mark WHEN something happened,
@@ -326,7 +328,28 @@ class APIServer:
             # (the user may have logged back in).
             await self._check_circuit_or_recover()
 
-            async with CrossProcessLock(cdp_port=self._cdp_port):
+            # PR4/5: per-target lock in parallel mode (port-wide otherwise).
+            # Resolver raises OwnedTabRequiredError (→ 503) if parallel mode
+            # has no owned target rather than silently degrading to the port
+            # lock (split-brain guard). When parallel mode is OFF, skip the
+            # resolver entirely and use the cached port — preserves the exact
+            # legacy path (the resolver would read driver.port, which is the
+            # same value but needlessly couples the legacy path to the driver).
+            if self._parallel_tabs:
+                _port, _key = resolve_mutation_lock(self._driver, True)
+            else:
+                _port, _key = self._cdp_port, None
+            async with MutationLock(_port, _key):
+                # Drift guard (parallel mode only): if the owned target changed
+                # while we waited for the lock, the key we hold no longer names
+                # the active tab. Fail retryably instead of mutating under a
+                # stale key.
+                if self._parallel_tabs:
+                    _, _current_key = resolve_mutation_lock(self._driver, True)
+                    if _current_key != _key:
+                        raise OwnedTabRequiredError(
+                            "owned target changed while waiting for mutation lock"
+                        )
                 # Second circuit-open check, now that we hold the lock. A
                 # concurrent request may have tripped a breaker while we were
                 # waiting. Without this, we'd drive Chrome despite the process
@@ -474,6 +497,18 @@ class APIServer:
                         "type": "server_error",
                         "param": None,
                         "code": "circuit_open",
+                    }
+                },
+                status=503,
+            )
+        if isinstance(exc, OwnedTabRequiredError):
+            return web.json_response(
+                {
+                    "error": {
+                        "message": f"{exc}. Retry later.",
+                        "type": "server_error",
+                        "param": None,
+                        "code": "owned_tab_required",
                     }
                 },
                 status=503,

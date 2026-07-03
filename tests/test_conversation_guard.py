@@ -245,6 +245,7 @@ async def test_rest_auto_continue_invokes_ensure_current(monkeypatch):
     server._last_project_id = None
     server._request_count = 0
     server._cdp_port = 9222
+    server._parallel_tabs = False  # PR4: mirror __init__'s cache for __new__ bypass
     server._config = srv.Config.load(None)
     server._breakers = srv.BreakerRegistry()  # Phase 4 PR2: preflight reads this
     server._last_error = None
@@ -279,7 +280,7 @@ async def test_rest_auto_continue_invokes_ensure_current(monkeypatch):
         def __init__(self, *a, **kw): pass
         async def __aenter__(self): return self
         async def __aexit__(self, *a): return False
-    monkeypatch.setattr(srv, "CrossProcessLock", _NullLock)
+    monkeypatch.setattr(srv, "MutationLock", _NullLock)
 
     await server._handle_chat(request)
 

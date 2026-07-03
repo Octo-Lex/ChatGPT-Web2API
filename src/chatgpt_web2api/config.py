@@ -77,6 +77,11 @@ class ChatGPTConfig:
     # compatibility. Owned tabs are the safe default because adoption lets one
     # session navigate another's tab out from under it.
     tab_mode: str = "owned"
+    # Parallel multi-tab mode (PR4/5). When True, the bundle is enforced:
+    # tab_mode=owned (validated at load), per-target MutationLocks, and
+    # fail-closed owned-tab requirement (no shared-tab fallback). Default False
+    # reproduces the exact legacy single-tab-serialized behavior.
+    parallel_tabs: bool = False
 
 
 @dataclass
@@ -94,6 +99,21 @@ class EnsureConfig:
     degraded_poll_interval_s: float = 2.0
     degraded_poll_budget_s: float = 20.0
     breaker_cooldown_grace_s: float = 5.0
+
+
+def _as_bool(v: object) -> bool:
+    """Parse a config/env value as bool, robust to JSON bools and strings.
+
+    ``bool("false")`` is ``True`` in Python (non-empty string), so a naive
+    ``bool(c)`` misparses string config values. Accept JSON booleans directly
+    and the usual truthy strings (``true``/``1``/``yes``); everything else
+    (incl. ``"false"``, ``"0"``, ``"no"``) is False.
+    """
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        return v.lower() in ("true", "1", "yes")
+    return bool(v)
 
 
 @dataclass
@@ -136,6 +156,16 @@ class Config:
             else:
                 log.debug("No default config at %s; using built-in defaults", default_path)
         cfg._apply_env()
+        # Validate AFTER both file + env overlays are applied — env can fix or
+        # break what the file set. This is the first real validation in config;
+        # keep it as a single explicit bundle check for the parallel-tabs safety
+        # invariant.
+        if cfg.chatgpt.parallel_tabs and cfg.chatgpt.tab_mode != "owned":
+            raise ValueError(
+                "parallel_tabs=true requires tab_mode=owned (got "
+                f"{cfg.chatgpt.tab_mode!r}); parallel mode needs per-target "
+                "owned tabs for correct locking"
+            )
         return cfg
 
     def _apply_dict(self, data: dict) -> None:
@@ -150,7 +180,7 @@ class Config:
             self.chrome.cdp_port = int(c)
         c = data.get("headless")
         if c is not None:
-            self.chrome.headless = bool(c)
+            self.chrome.headless = _as_bool(c)
         c = data.get("port")
         if c is not None:
             self.server.port = int(c)
@@ -169,6 +199,9 @@ class Config:
         c = data.get("tab_mode")
         if c in ("owned", "adopt"):
             self.chatgpt.tab_mode = c
+        c = data.get("parallel_tabs")
+        if c is not None:
+            self.chatgpt.parallel_tabs = _as_bool(c)
         c = data.get("request_timeout")
         if c is not None:
             self.server.request_timeout = int(c)
@@ -207,6 +240,8 @@ class Config:
         if v := _env("W2A_TAB_MODE"):
             if v in ("owned", "adopt"):
                 self.chatgpt.tab_mode = v
+        if v := _env("W2A_PARALLEL_TABS"):
+            self.chatgpt.parallel_tabs = v.lower() in ("true", "1", "yes")
         if v := _env("W2A_HEADLESS"):
             self.chrome.headless = v.lower() in ("true", "1", "yes")
         if v := _env("W2A_LOG_LEVEL"):
@@ -230,6 +265,7 @@ class Config:
             "default_model": self.chatgpt.default_model,
             "default_project_id": self.chatgpt.default_project_id,
             "tab_mode": self.chatgpt.tab_mode,
+            "parallel_tabs": self.chatgpt.parallel_tabs,
             "request_timeout": self.server.request_timeout,
             "log_level": self.log.level,
             "ensure_degraded_poll_interval_s": self.ensure.degraded_poll_interval_s,

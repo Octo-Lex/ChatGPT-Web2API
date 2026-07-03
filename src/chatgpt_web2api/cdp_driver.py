@@ -23,6 +23,7 @@ from dataclasses import dataclass
 
 from .breakers import BreakerKind, BreakerRegistry
 from .diagnostics import diagnose
+from .lock_resolver import OwnedTabRequiredError
 
 try:
     import websockets
@@ -250,8 +251,14 @@ class CDPDriver:
         tab_mode: str = "owned",
         instance_id: str | None = None,
         breakers: BreakerRegistry | None = None,
+        *,
+        parallel_tabs: bool = False,
     ) -> None:
         self.port = cdp_port
+        # PR4/5: when True, owned-tab creation is mandatory (no shared-tab
+        # fallback) and the resolver grants per-target locks. Config validates
+        # tab_mode=owned when this is True; here we just store the flag.
+        self._parallel_tabs = parallel_tabs
         # Tab isolation strategy: "owned" creates a dedicated chatgpt.com tab
         # per driver (multi-session safe — two drivers get two DOMs). "adopt"
         # reuses an existing chatgpt.com tab (single-process compat). The
@@ -409,7 +416,19 @@ class CDPDriver:
                         self._tab_registry.record(self._target_id)
                     except Exception as e:
                         logger.debug("Tab registry record failed: %s", e)
+            except OwnedTabRequiredError:
+                # Never swallow the parallel-mode fail-closed signal — it must
+                # propagate as REST 503 / MCP isError, not become a login wait.
+                raise
             except Exception as e:
+                if self._parallel_tabs:
+                    # Parallel mode: refuse the shared-tab fallback. A fallback
+                    # tab cannot be per-target locked, so silently adopting one
+                    # would reintroduce the split-brain the bundle eliminates.
+                    raise OwnedTabRequiredError(
+                        f"Owned-tab creation failed in parallel mode; refusing "
+                        f"shared-tab fallback: {e}"
+                    ) from e
                 logger.warning("Tab isolation failed (%s) — falling back to shared tab", e)
                 self._target_id = None
                 self._owns_target = False
@@ -552,6 +571,9 @@ class CDPDriver:
             self._ws = None
         # Clear stale state (#18) — the page we reconnect to may be different
         self._current_conv_id = None
+        # PR4: capture the pre-reconnect target so we can detect a target change
+        # (drift) after a successful reconnect in parallel mode.
+        _pre_reconnect_target_id = self._target_id
         self._current_model = None
         self._pending.clear()
 
@@ -570,8 +592,26 @@ class CDPDriver:
                     ws_url = self._adopt_existing_chatgpt_tab()
                 if not ws_url:
                     logger.info("No reusable tab — creating new one")
-                    ws_url = await self._create_owned_tab()
+                    try:
+                        ws_url = await self._create_owned_tab()
+                    except Exception as create_err:
+                        if self._parallel_tabs:
+                            # Ownership-invariant violation: parallel mode
+                            # cannot fall back to a shared tab. Raise inside
+                            # the try so the OwnedTabRequiredError escape
+                            # (not the broad retry) handles it.
+                            raise OwnedTabRequiredError(
+                                f"Reconnect owned-tab creation failed in "
+                                f"parallel mode; refusing fallback: {create_err}"
+                            ) from create_err
+                        raise
                 if not ws_url:
+                    if self._parallel_tabs:
+                        # Parallel mode: no shared-tab fallback (split-brain guard).
+                        raise OwnedTabRequiredError(
+                            "Reconnect could not obtain an owned tab; refusing "
+                            "shared-tab fallback in parallel mode"
+                        )
                     ws_url = await self._find_page_ws()
                 self._ws = await websockets.connect(
                     ws_url,
@@ -590,8 +630,19 @@ class CDPDriver:
                 # reopens the socket but can't auth isn't a clean recovery.
                 if self._breakers:
                     self._breakers.record_success(BreakerKind.CDP_RECONNECT)
+                # PR4 drift guard: raise if the owned target changed during
+                # reconnect (parallel mode only). See _assert_reconnect_target_stable.
+                self._assert_reconnect_target_stable(_pre_reconnect_target_id)
                 return
+            except OwnedTabRequiredError:
+                # Never let the parallel-mode fail-closed signal be swallowed by
+                # the reconnect retry loop / CDPReconnectError wrapping below.
+                raise
             except Exception as e:
+                # Transient WS/auth/CDP errors still retry (parallel mode does
+                # NOT change retry policy for same-target reconnect failures —
+                # only ownership-invariant violations raise OwnedTabRequiredError
+                # inside the try, above).
                 logger.warning("Reconnect attempt %d failed: %s", attempt, e)
                 if attempt < 3:
                     await asyncio.sleep(delay)
@@ -1201,6 +1252,11 @@ class CDPDriver:
         5. Poll DOM for streaming text
         6. Fetch final text from conversation API
         """
+        # PR4 belt-and-suspenders: refuse to mutate the DOM in parallel mode if
+        # the driver lost its owned tab. The primary gate is the resolver/drift
+        # guard at the REST/MCP lock site; this catches any driver-level path
+        # that reaches send_and_stream without going through the lock.
+        self._assert_owned_tab_required()
         # Count existing assistants BEFORE sending
         try:
             initial_raw = await self._js_strict(
@@ -1580,3 +1636,40 @@ class CDPDriver:
         non-empty ``_target_id``.
         """
         return self.tab_mode == "owned" and self._owns_target and bool(self._target_id)
+
+    def _assert_owned_tab_required(self) -> None:
+        """Fail-closed owned-tab enforcement for parallel mode.
+
+        Raises ``OwnedTabRequiredError`` if ``parallel_tabs`` is on but the
+        driver has no owned target. Called at the top of ``send_and_stream``
+        as belt-and-suspenders (the resolver/drift guard at the lock site is
+        the primary gate). Surfaces as REST 503 / MCP isError=True.
+        """
+        if self._parallel_tabs and not self.has_owned_target:
+            raise OwnedTabRequiredError(
+                "parallel_tabs=true requires an owned tab target, but the "
+                f"driver has none (tab_mode={self.tab_mode!r}, "
+                f"owns_target={self._owns_target}, "
+                f"target_id={self._target_id!r})"
+            )
+
+    def _assert_reconnect_target_stable(self, pre_target_id: str | None) -> None:
+        """Reconnect drift guard (PR4): raise if the owned target changed.
+
+        Called after a successful reconnect. In parallel mode, a reconnect that
+        ends on a DIFFERENT target than it started means any in-flight mutation
+        holding the old target's lock no longer names the active tab. Fail
+        retryably so the caller re-resolves and re-locks. Factored as a method
+        so the guard is unit-testable without driving the full WS chain.
+        """
+        if (
+            self._parallel_tabs
+            and pre_target_id is not None
+            and self._target_id is not None
+            and self._target_id != pre_target_id
+        ):
+            raise OwnedTabRequiredError(
+                f"Owned target changed during reconnect "
+                f"({pre_target_id} -> {self._target_id}); retry the mutation "
+                f"so it re-resolves the lock key"
+            )

@@ -50,7 +50,12 @@ from .cdp_driver import (
     RateLimitError,
 )
 from .config import Config
-from .cross_process_lock import CrossProcessLock, LockAcquisitionError
+from .cross_process_lock import LockAcquisitionError
+from .lock_resolver import (
+    MutationLock,
+    OwnedTabRequiredError,
+    resolve_mutation_lock,
+)
 from .resilience import retry_on_rate_limit
 from .tab_registry import TabRegistry
 
@@ -676,6 +681,8 @@ _breakers: BreakerRegistry | None = None
 # section, keyed on the CDP port so all processes sharing a Chrome instance
 # serialize. None until run_mcp() sets it. Read-only tools run lock-free.
 _lock_cdp_port: int | None = None
+# PR4/5: parallel-tabs flag (mirrors _lock_cdp_port's lifecycle — set in run_mcp).
+_parallel_tabs: bool = False
 
 # Tools that mutate browser state — must hold the lock
 _MUTATING_TOOLS = frozenset(
@@ -1544,10 +1551,37 @@ def create_server() -> Server:
         # Serialize mutating tools through the cross-process lock
         try:
             if name in _MUTATING_TOOLS and _lock_cdp_port is not None:
-                async with CrossProcessLock(cdp_port=_lock_cdp_port):
+                # PR4/5: per-target MutationLock in parallel mode (port-wide
+                # otherwise). Resolver raises OwnedTabRequiredError (→ isError)
+                # if parallel mode has no owned target. When parallel mode is
+                # OFF, use the cached port directly (legacy path).
+                if _parallel_tabs:
+                    _port, _key = resolve_mutation_lock(_driver, True)
+                else:
+                    _port, _key = _lock_cdp_port, None
+                async with MutationLock(_port, _key):
+                    # Drift guard (parallel mode only).
+                    if _parallel_tabs:
+                        _, _current_key = resolve_mutation_lock(_driver, True)
+                        if _current_key != _key:
+                            raise OwnedTabRequiredError(
+                                "owned target changed while waiting for mutation lock"
+                            )
                     result = await _run()
             else:
                 result = await _run()
+        except OwnedTabRequiredError as e:
+            # Parallel-mode fail-closed: surface as retryable isError with a
+            # machine-readable marker, mirroring the rate-limit/circuit style.
+            return mcp_types.CallToolResult(
+                content=[
+                    mcp_types.TextContent(
+                        type="text",
+                        text=f"{e}. Retry later. (owned_tab_required)",
+                    )
+                ],
+                isError=True,
+            )
         except RateLimitError as e:
             # Persistent limit (transparent retries exhausted). Signal it as an
             # error result with a recognizable marker the agent can parse to
@@ -1887,12 +1921,38 @@ def create_server() -> Server:
 # ═══════════════════════════════════════════════════════════════
 
 
+def _mcp_server_identity(config: Config, transport: str, port: int) -> str:
+    """Derive the tab-registry ``server_identity`` for MCP (PR4/5).
+
+    Outside parallel mode this is the fixed ``"mcp"`` (legacy behavior). In
+    parallel mode it must be unique per concurrent MCP process so two processes
+    on the same CDP port don't collide on a tab-registry entry:
+
+      - SSE: ``mcp:sse:{host}:{port}`` — unique AND stable across restart
+        (host:port survives restart, so reclaim works). Mirrors REST's
+        ``rest:{port}`` model.
+      - stdio: ``mcp:stdio:{pid}`` — unique (one PID per process) but NOT stable
+        across restart, so restart-reclaim is sacrificed. For the typical
+        one-MCP-per-agent-session case, isolation beats reclaim; a leaked tab
+        on restart is preferable to two sessions corrupting a shared lease.
+
+    The result feeds ``TabRegistry.derive_instance_id``, which still honors
+    ``W2A_INSTANCE_ID`` as the highest-priority override.
+    """
+    if not config.chatgpt.parallel_tabs:
+        return "mcp"
+    if transport == "sse":
+        return f"mcp:sse:{config.server.host or '127.0.0.1'}:{port}"
+    return f"mcp:stdio:{os.getpid()}"
+
+
 async def run_mcp(config: Config, transport: str = "stdio", port: int = 8090) -> None:
     """Connect to Chrome and run the MCP server."""
-    global _driver, _config, _lock_cdp_port, _breakers
+    global _driver, _config, _lock_cdp_port, _breakers, _parallel_tabs
 
     _config = config
     _lock_cdp_port = config.chrome.cdp_port
+    _parallel_tabs = config.chatgpt.parallel_tabs
 
     # Phase 4 PR2: one MCP-local registry. Injected into MCP's own driver;
     # auth/composer/CDP failures record here. CHROME_CRASH_LOOP is never
@@ -1904,9 +1964,10 @@ async def run_mcp(config: Config, transport: str = "stdio", port: int = 8090) ->
         tab_mode=config.chatgpt.tab_mode,
         instance_id=TabRegistry.derive_instance_id(
             cdp_port=config.chrome.cdp_port,
-            server_identity="mcp",
+            server_identity=_mcp_server_identity(config, transport, port),
         ),
         breakers=_breakers,
+        parallel_tabs=config.chatgpt.parallel_tabs,
     )
     try:
         await _driver.connect()
