@@ -84,6 +84,17 @@ COMPOSER_FALLBACK_SELECTOR = "textarea#prompt-textarea"
 SEND_BUTTON_SELECTOR = 'button[aria-label*="Send" i]:not([data-testid="stop-button"])'
 SEND_BUTTON_FALLBACK_SELECTOR = 'button[data-testid="send-button"]'
 
+# Send-button readiness poll. After a prior send completes (or under parallel
+# mode, where the MutationLock releases the instant a send finishes), ChatGPT's
+# composer can take several seconds to re-enable the send button — the composer
+# stays in a "sending"/"regenerating" state with the button disabled or absent
+# until the UI settles. The historical 3s budget (range(10) * 0.3s) was too
+# tight for back-to-back same-tab sends and surfaced as intermittent
+# "no send button" 500s. 10s covers observed reset times without hanging
+# indefinitely on a genuinely broken composer.
+SEND_BUTTON_POLL_INTERVAL_S = 0.3
+SEND_BUTTON_POLL_MAX_WAIT_S = 10.0
+
 
 class ChatGPTDom:
     """ChatGPT-composer DOM interaction, composed by ``CDPDriver``.
@@ -386,8 +397,12 @@ class ChatGPTDom:
         """
         d = self._driver
         # Wait for the send button to appear and be enabled. Try the new
-        # aria-label selector first, then the legacy testid fallback.
-        for _ in range(10):
+        # aria-label selector first, then the legacy testid fallback. Time-
+        # budgeted (not a fixed iteration count) so the wait scales to the
+        # composer-reset window after a prior send — see
+        # SEND_BUTTON_POLL_MAX_WAIT_S for rationale.
+        deadline = time.monotonic() + SEND_BUTTON_POLL_MAX_WAIT_S
+        while time.monotonic() < deadline:
             has_btn = await d._js(
                 "(function() {"
                 f"  var btn = document.querySelector('{SEND_BUTTON_SELECTOR}')"
@@ -397,7 +412,7 @@ class ChatGPTDom:
             )
             if has_btn == "yes":
                 break
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(SEND_BUTTON_POLL_INTERVAL_S)
 
         result = await d._js(
             "(function() {"

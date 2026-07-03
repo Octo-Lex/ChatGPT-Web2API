@@ -1,9 +1,8 @@
 # Operational Validation — Parallel Multi-Tab Mode
 
-> Status: **`parallel_tabs` is merged (PR #33) and opt-in available. NOT yet
-> operationally accepted.** This checklist tracks the live validation required
-> to promote the wording to "operationally accepted." Until then, treat the
-> feature as "available, not production-proven."
+> Status: **`parallel_tabs` is merged (PR #33) and opt-in available. Live
+> validation PARTIALLY RUN (2026-07-03): §1 and §2 PASS; §3 surfaced a
+> composer-readiness gap (see Known Gap below). NOT yet operationally accepted.**
 
 This is the operational acceptance gate for the parallel multi-tab feature
 (`parallel_tabs=true`; see [deployment.md → Parallel mode](deployment.md#parallel-mode-one-chrome-many-tabs)).
@@ -12,6 +11,51 @@ It complements — does **not** replace — the unit/integration suites
 which are authoritative for the locking/serialization/fail-closed invariants.
 The checks below exercise those invariants against **real Chrome, real ChatGPT
 DOM, and a real shared account/session**.
+
+## Live validation run — 2026-07-03
+
+Environment: Chrome 149 on CDP 9222 (logged in, account: Nabeel Alajmah),
+master @ `606fdee`. Workers started fresh from master with `W2A_PARALLEL_TABS=1`.
+
+| Section | Result | Evidence |
+|---------|--------|----------|
+| §1 default-off smoke | ✅ PASS | Worker on 8091 (`parallel_tabs=false`) returned 200 / exact "PONG" reply in 11s; no `owned_tab_required` leak. Legacy behavior preserved. |
+| §2 different-tab concurrency | ✅ PASS | Two workers (8092 owns `45EBD607…`, 8093 owns `C25F97E7…` — distinct owned tabs). Two concurrent requests: total window 10.86s ≈ max(individual), NOT sum (21.5s) → ran in **parallel**, not serialized. Per-target `MutationLock` working as designed. |
+| §3 same-tab serialization | ✅ **FIXED** (was GAP) | Pre-fix: 5/5 rounds had a 500 "no send button". Post-fix (10s poll budget): 10/10 same-worker concurrent requests returned 200. Lock serializes correctly; composer-readiness wait now covers the reset window. See Known Gap below. |
+| §4 failure modes | ⏸ deferred | Pending §3 resolution — gap should be understood before declaring the failure modes authoritative. |
+| §5 observability | ⏸ deferred | Worker logs captured; pending §3 resolution. |
+
+### Known Gap: composer-readiness race on back-to-back same-tab sends — FIXED ✅
+
+**Symptom (pre-fix):** Two concurrent requests to the same worker/tab → first
+returned 200, second returned 500 `Send failed: no send button` (from
+`chatgpt_dom.click_send`). Reproduced deterministically (5/5 rounds failed).
+
+**Root cause:** NOT a `MutationLock` failure — the unit test
+`test_lock_resolver::test_mutation_lock_serializes_same_target` confirms the
+in-process `asyncio.Lock` serializes same-target coroutines correctly, and §2's
+parallel timing confirms the lock is active. The gap was a **DOM-readiness
+issue**: `click_send`'s send-button poll budget was ~3s (range(10) × 0.3s),
+too short for ChatGPT's composer to re-enable the send button after a prior
+back-to-back send released the lock. Under legacy single-worker mode requests
+naturally space out, so the race rarely surfaced; parallel mode's tighter
+pipelining exposed it.
+
+**Fix (this PR):** Increased the poll budget to 10s via named constants
+(`SEND_BUTTON_POLL_MAX_WAIT_S`, `SEND_BUTTON_POLL_INTERVAL_S` in
+`chatgpt_dom.py`) and rewrote the loop to be time-budget-based. 10s covers
+observed composer-reset times while still bounding the wait on a genuinely
+broken composer.
+
+**Stress-test result (post-fix):** 5 rounds × 2 concurrent same-worker requests
+= 10/10 returned 200, **0 failures** (was 5/10 before the fix). Timing confirms
+serialization (e.g. round 4: 7.5s + 19.2s — second request waited for the lock,
+then the composer poll waited for the button, then sent). §2 different-tab
+parallelism re-confirmed still parallel.
+
+**Impact on operational acceptance:** The gap that blocked §3 is resolved.
+§4 (failure modes) and §5 (observability) remain to run before promoting to
+"operationally accepted."
 
 ## Preflight gate (must be true before starting)
 

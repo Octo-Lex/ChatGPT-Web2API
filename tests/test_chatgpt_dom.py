@@ -262,3 +262,51 @@ def test_breaker_registry_stays_on_driver():
     d = CDPDriver(cdp_port=9222)
     assert hasattr(d, "_breakers")
     assert not hasattr(d._dom, "_breakers")
+
+
+# ── 5. click_send time-budgeted readiness poll (PR #36) ───────────────
+#
+# The poll loop was rewritten from `for _ in range(10)` (fixed 3s) to a
+# time-budgeted `while time.monotonic() < deadline`. These tests guard the
+# loop shape: it must (a) wait until the send button is enabled, then send;
+# (b) raise SendReadinessError when the budget is exhausted. Patching the
+# constants small keeps the tests fast.
+
+
+@pytest.mark.asyncio
+async def test_click_send_waits_then_sends(monkeypatch):
+    """The poll loop waits through several 'no' responses until the button is
+    enabled, then the click succeeds."""
+    import chatgpt_web2api.chatgpt_dom as dom_mod
+
+    monkeypatch.setattr(dom_mod, "SEND_BUTTON_POLL_INTERVAL_S", 0.01)
+    monkeypatch.setattr(dom_mod, "SEND_BUTTON_POLL_MAX_WAIT_S", 2.0)
+
+    dom, driver = _make_dom()
+    # First 3 readiness checks → "no" (button not ready), then "yes", then "sent".
+    driver._js = AsyncMock(side_effect=["no", "no", "no", "yes", "sent"])
+
+    await dom.click_send()  # must not raise
+
+    # The readiness poll should have run 4 times (3×"no" + 1×"yes"), then the
+    # click once ("sent") = 5 total _js calls.
+    assert driver._js.await_count == 5, f"expected 5 _js calls, got {driver._js.await_count}"
+
+
+@pytest.mark.asyncio
+async def test_click_send_raises_on_budget_exhausted(monkeypatch):
+    """When the send button never becomes enabled within the budget, the loop
+    exhausts and the final click raises SendReadinessError."""
+    import chatgpt_web2api.chatgpt_dom as dom_mod
+
+    monkeypatch.setattr(dom_mod, "SEND_BUTTON_POLL_INTERVAL_S", 0.01)
+    monkeypatch.setattr(dom_mod, "SEND_BUTTON_POLL_MAX_WAIT_S", 0.05)
+
+    dom, driver = _make_dom()
+    # Every _js call returns "no" — button never appears.
+    driver._js = AsyncMock(return_value="no")
+
+    from chatgpt_web2api.cdp_driver import SendReadinessError
+
+    with pytest.raises(SendReadinessError, match="Send failed"):
+        await dom.click_send()
