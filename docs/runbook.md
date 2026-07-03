@@ -417,6 +417,38 @@ If `ensure` exits 2, **stop and do auth recovery (§6)** — do not loop `ensure
 
 ---
 
+## 7a. Parallel mode: process death & Chrome ownership
+
+> Applies only when `parallel_tabs=true`. In the default (`parallel_tabs=false`)
+> single-worker mode there is exactly one process and this section does not apply.
+
+When parallel mode is enabled, only the **owner** process (the one that launched
+Chrome) manages the Chrome lifecycle. Other processes are **attachers**. This
+split is structural (`_owns_chrome`), not lock-based — see
+[deployment.md → Parallel mode](deployment.md#parallel-mode-one-chrome-many-tabs).
+
+**Attacher process dies** → Chrome should remain running. The owner's health
+monitor is the only one that restarts; an attacher's monitor no-ops on restart
+by design. No action required beyond restarting the attacher process itself
+(its owned tab is reclaimable on restart only if it uses a stable
+`W2A_INSTANCE_ID`; a stdio MCP process whose identity was PID-derived starts a
+fresh tab).
+
+**Owner process dies** → Chrome may be **orphaned**: it keeps running but no live
+process owns its lifecycle, so no monitor restarts it and attachers will not
+self-promote. This is **intentional in the current design** — runtime owner
+failover / an ownership lease is deferred future work, not an incident. Recover
+with the normal [safe restart sequence (§7)](#7-safe-restart-sequence): restart
+the REST/owner process first, wait for Chrome/CDP readiness, then restart
+MCP/SSE or attachers. A freshly started process finds the CDP port and elects
+owner (or attaches) per `ChromeProcess.ensure_running`.
+
+If an operator depends on restart-on-crash surviving owner death, supervise the
+owner process with OS-level restart (see [os-supervision.md](os-supervision.md))
+so a new owner process starts automatically.
+
+---
+
 ## 8. Post-deploy / post-restart validation
 
 > **After a code/package update, restart in dependency order.** `ensure` does
