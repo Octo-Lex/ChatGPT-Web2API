@@ -142,7 +142,7 @@ resp = client.chat.completions.create(
 )
 ```
 
-**Important**: Only one request at a time. The browser is single-threaded. For team use, queue requests or run multiple instances on different ports.
+**Important**: One mutating request at a time *per tab* by default. The browser is single-threaded per page. For team use, queue requests, run multiple instances on different ports, or enable `parallel_tabs` (see [Parallel mode](#parallel-mode-one-chrome-many-tabs) below) for per-tab concurrency on one shared Chrome.
 
 ---
 
@@ -244,6 +244,51 @@ server {
     }
 }
 ```
+
+### Parallel mode (one Chrome, many tabs)
+
+`parallel_tabs: true` (or `W2A_PARALLEL_TABS=1`) lets several bridge processes
+share **one** Chrome instance, each driving its own owned tab in parallel — no
+proxy, no second browser profile. Per-target locking serializes same-tab
+mutations while different tabs run concurrently. Requires `tab_mode: "owned"`
+(enforced at load; the default).
+
+```bash
+# Process A — its own REST port, own tab on the shared Chrome (cdp 9222)
+W2A_PARALLEL_TABS=1 chatgpt-web2api --port 8081 --cdp-port 9222
+
+# Process B — different REST port, different tab on the SAME Chrome
+W2A_PARALLEL_TABS=1 chatgpt-web2api --port 8082 --cdp-port 9222
+```
+
+**Requirements and caveats:**
+- `parallel_tabs: true` requires `tab_mode: "owned"` (enforced at load). Each
+  process drives exactly one owned tab; mutating operations serialize per owned
+  target, not globally per CDP port. This is **not** an in-process tab pool or
+  request router — that remains future work.
+- Each process still needs its **own local REST/MCP port** (`--port`). There is
+  no single-endpoint router yet.
+- **One ChatGPT account is shared** across all tabs (one Chrome profile).
+  Parallel mode increases browser-tab parallelism, **not** account quota — all
+  workers share one session and may hit account-level rate limits; rate-limit
+  handling stays reactive (backoff/retry).
+- **Unique instance identity per process.** REST derives it from `rest:{port}`
+  automatically. MCP derives it from `mcp:sse:{host}:{port}` (SSE) or
+  `mcp:stdio:{pid}` (stdio) when `parallel_tabs=true`. The stdio PID identity
+  is unique per run but **not stable across restart** (a new PID can't reclaim
+  the prior tab); set `W2A_INSTANCE_ID` to a stable, unique-per-worker value if
+  you need restart-reclaim. **Do not reuse the same `W2A_INSTANCE_ID` across
+  live workers** on the same Chrome — that makes them collide on one tab.
+- **Fail-closed, not fallback.** If a process can't obtain (or loses mid-flight)
+  an owned tab, the operation fails retryably (REST 503 `code=owned_tab_required`
+  / MCP `isError`) rather than silently sharing a tab. Mixing per-target and
+  port-wide locks would reintroduce split-brain. Other retryable 503/`isError`
+  codes (`lock_timeout`, `circuit_open`) keep their existing semantics.
+
+> **Rollout warning:** do not mix old (port-lock-only) workers and new
+> (`parallel_tabs=true`) workers on the **same CDP port** during a rolling
+> upgrade — their lock files don't exclude each other. Finish the rollout on a
+> port before enabling parallel mode on it.
 
 ---
 

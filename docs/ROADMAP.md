@@ -482,7 +482,16 @@ always-on / server users → use OS supervision (this phase)
 4. non-rate-limit breaker policy                           ✅ (PR1 #18 / PR2 #19 / PR3 #20)
 5. split cdp_driver.py                                     ✅ (#22–#26; complete 2026-06-27)
 6. optional OS-supervision docs                            (last, docs-only)
+7. parallel multi-tab on one Chrome                        ✅ (PR1–5; per-target locks +
+   _owns_chrome lifecycle + MutationLock/resolver + parallel_tabs bundle + docs)
 ```
+
+The parallel-tabs phase (7) shipped as five stacked PRs: `CrossProcessLock`
+`lock_key` generalization → `_owns_chrome` lifecycle ownership → `MutationLock`
++ resolver (inert) → `parallel_tabs` config + enforcement + wiring → docs. The
+safety invariant — the `parallel_tabs` bundle becomes usable in the same PR
+where fail-closed owned-tab enforcement lands — held across the sequence. The
+cross-instance pool/router (single endpoint) remains future work.
 
 Known follow-ups (A–E, listed under Phase 4) slot in around Phase 5 as small
 standalone PRs — do not bundle them into the refactor. The recommended

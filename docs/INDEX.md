@@ -31,7 +31,7 @@ deployment.
 
 | Doc | Purpose |
 |-----|---------|
-| [deployment.md](deployment.md) | **Installing & sharing.** pip / Docker / cookie-export / remote-deploy options, plus cross-links to supervision and the runbook. |
+| [deployment.md](deployment.md) | **Installing & sharing.** pip / Docker / cookie-export / remote-deploy options, multiple-instance scaling, `parallel_tabs` (one Chrome, many tabs), plus cross-links to supervision and the runbook. |
 | [os-supervision.md](os-supervision.md) | **Always-on supervision.** systemd (Linux), launchd (macOS), Task Scheduler + NSSM (Windows); `ensure`-on-a-timer and REST+MCP split-service styles. |
 | [runbook.md](runbook.md) | **Operating a running deployment.** Startup checklist, `/health` interpretation, failure modes, breaker states, auth recovery, safe restart, post-deploy validation, logs. Source-cited. |
 | [api-reference.md](api-reference.md) | **Calling the API.** OpenAI-compatible REST endpoints and the MCP server surface (tools, transports). |

@@ -7,6 +7,8 @@
   "headless": false,
   "default_model": "auto",
   "default_project_id": null,
+  "tab_mode": "owned",
+  "parallel_tabs": false,
   "api_keys": [],
   "request_timeout": 120,
   "log_level": "INFO",

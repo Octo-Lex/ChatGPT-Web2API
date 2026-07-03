@@ -377,6 +377,8 @@ chat_with_gpt(gpt_id="g-hkJGhxxx", message="Analyze this data")
   "headless": false,
   "default_model": "auto",
   "default_project_id": null,
+  "tab_mode": "owned",
+  "parallel_tabs": false,
   "api_keys": [],
   "request_timeout": 120
 }
@@ -495,7 +497,7 @@ Key docs:
 - **Single browser session** — one Chrome profile = one ChatGPT account (scale with nginx round-robin)
 - **No headless** — headless Chrome triggers ChatGPT's bot detection; use VNC on servers
 - **Cookie expiry** — auth cookies expire ~2 weeks; re-login needed
-- **Serial requests** — one chat at a time through the browser (concurrent reads are fine)
+- **Serial requests** — one chat at a time through the browser *by default* (concurrent reads are fine). For per-tab parallelism on one shared Chrome, set `parallel_tabs: true` (requires `tab_mode: "owned"`); see [docs/deployment.md](docs/deployment.md) → "Parallel mode (one Chrome, many tabs)".
 - **Memory writes** — ChatGPT's `/backend-api/memories` is read-only; creating memories works via chat interface
 - **No image input** — text only (CDP file upload not yet implemented)
 
@@ -503,7 +505,7 @@ Key docs:
 
 - [ ] Image/file upload to conversations via CDP drag-and-drop
 - [ ] Headless mode with anti-detection patches
-- [ ] Concurrent chat pooling across multiple Chrome instances
+- [ ] Concurrent chat pooling across multiple Chrome instances (per-tab parallelism on one Chrome landed via `parallel_tabs`; the cross-instance pool/router is still future work)
 - [ ] Web search mode (trigger ChatGPT's built-in search)
 - [ ] DALL-E image generation via ChatGPT
 - [ ] Canvas/code execution support
