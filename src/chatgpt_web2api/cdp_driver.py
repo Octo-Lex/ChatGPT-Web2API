@@ -1241,6 +1241,99 @@ class CDPDriver:
 
     # ── Response Retrieval ────────────────────────────────────
 
+    async def _read_assistant_count_baseline(self) -> int:
+        """Read the pre-send assistant-message count with bounded retry + fail-closed.
+
+        This baseline is the completion detector's reference point: Phase-1
+        waits for ``current_count > initial_count``. If this returns 0 on a
+        conversation that already has assistant messages, the detector
+        immediately treats a pre-existing assistant node as "new" and returns
+        the previous turn's text (stale-return).
+
+        The old code fell back to ``initial_count = 0`` on any JS failure —
+        the dominant root cause of stale-return during the parallel-tabs
+        operational validation. This helper retries, logs structured
+        diagnostics, and raises if it cannot establish a trusted baseline.
+        """
+        import time as _time
+
+        selector = (
+            "document.querySelectorAll("
+            "'[data-message-author-role=\"assistant\"]'"
+            ").length"
+        )
+        user_selector = (
+            "document.querySelectorAll("
+            "'[data-message-author-role=\"user\"]'"
+            ").length"
+        )
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            t0 = _time.monotonic()
+            err: Exception | None = None
+            try:
+                raw = await self._js_strict(selector)
+            except CDPJSError as e:
+                err = e
+            else:
+                try:
+                    # Explicit parse — do NOT use truthiness (numeric 0 from
+                    # CDP is falsy but valid for a fresh chat). ChatGPT's
+                    # review caught that `raw and int(raw)` rejects numeric 0.
+                    count = int(raw)
+                except (ValueError, TypeError) as e:
+                    err = e
+                else:
+                    if count < 0:
+                        err = ValueError(f"negative assistant count: {count}")
+
+            # If we got a valid count, log + return.
+            if err is None:
+                elapsed_ms = int((_time.monotonic() - t0) * 1000)
+                # Best-effort user-count for diagnostics (non-fatal).
+                try:
+                    user_raw = await self._js_strict(user_selector)
+                    user_count = int(user_raw)
+                except (CDPJSError, ValueError, TypeError):
+                    user_count = None
+                logger.info(
+                    "send_baseline: attempt=%d assistant_count=%d "
+                    "user_count=%s elapsed_ms=%d conv_id=%s",
+                    attempt,
+                    count,
+                    user_count,
+                    elapsed_ms,
+                    self._current_conv_id or "(none)",
+                )
+                return count
+
+            # Retry or fail-closed.
+            if attempt < max_attempts:
+                logger.warning(
+                    "send_baseline_failed: attempt=%d error=%s "
+                    "conv_id=%s — retrying",
+                    attempt,
+                    err,
+                    self._current_conv_id or "(none)",
+                )
+                await asyncio.sleep(0.3 * attempt)
+            else:
+                logger.error(
+                    "send_baseline_unavailable: attempts=%d last_error=%s "
+                    "conv_id=%s — refusing to send with untrusted baseline "
+                    "(stale-return risk)",
+                    attempt,
+                    err,
+                    self._current_conv_id or "(none)",
+                )
+                raise SendReadinessError(
+                    f"Cannot establish pre-send assistant-count baseline "
+                    f"after {max_attempts} attempts: {err}. Refusing to send "
+                    f"with an untrusted baseline (would risk stale-return)."
+                ) from err
+        # Unreachable (the loop either returns or raises).
+        raise SendReadinessError("send_baseline: exhausted retries unexpectedly")
+
     async def send_and_stream(self, text: str, timeout: float = 120) -> AsyncIterator[StreamChunk]:
         """Send a message and yield streaming response chunks.
 
@@ -1257,15 +1350,16 @@ class CDPDriver:
         # guard at the REST/MCP lock site; this catches any driver-level path
         # that reaches send_and_stream without going through the lock.
         self._assert_owned_tab_required()
-        # Count existing assistants BEFORE sending
-        try:
-            initial_raw = await self._js_strict(
-                "document.querySelectorAll('[data-message-author-role=\"assistant\"]').length"
-            )
-            initial_count = int(initial_raw) if initial_raw else 0
-        except CDPJSError as e:
-            logger.warning("send_and_stream: initial count failed: %s", e)
-            initial_count = 0
+        # Count existing assistants BEFORE sending. This baseline is the
+        # completion detector's reference: Phase-1 waits for
+        # current_count > initial_count. A wrong baseline (especially 0 on a
+        # conversation that already has assistant messages) makes the detector
+        # treat a PRE-EXISTING assistant node as "new" → stale-return (the
+        # bridge returns the previous turn's text). The old fallback
+        # (`initial_count = 0` on any JS failure) was the dominant root cause
+        # of stale-return during the parallel-tabs operational validation.
+        # See: references/agent-field-notes.md §1 (stale-return).
+        initial_count = await self._read_assistant_count_baseline()
 
         # Type and send
         await self.type_message(text)
