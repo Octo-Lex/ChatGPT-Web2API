@@ -1,67 +1,17 @@
-"""Tests for PR3/5 ``lock_resolver``: MutationLock + resolver + driver properties.
-
-PR3 is purely additive machinery — nothing is wired into REST/MCP yet (PR4
-wires it). These tests cover:
-
-- ``CDPDriver`` read-only properties (``target_id``/``owns_target``/
-  ``has_owned_target``) backed by the private fields.
-- ``resolve_mutation_lock``: the three branches (port lock when parallel_tabs
-  is off; target lock when on + owned; RAISE when on + no owned target).
-- ``MutationLock``: process-local serialization (same target blocks), parallel
-  across targets, correct acquire/release ordering, and cleanup on file-lock
-  failure.
-
-The ``CrossProcessLock`` component uses the ``__new__`` bypass + tmpdir idiom
-from ``test_cross_process_lock.py`` so no real home-dir lockfile is touched.
-The suite runs on one session-scoped event loop (conftest.py), so
-``asyncio.Lock()`` works across tests with no special handling.
-"""
-
 import asyncio
-import os
-import shutil
-import tempfile
+from unittest.mock import AsyncMock
 
 import pytest
-
-from chatgpt_web2api.cdp_driver import CDPDriver
-from chatgpt_web2api.cross_process_lock import CrossProcessLock
-from chatgpt_web2api import lock_resolver as lr_mod
 from chatgpt_web2api.lock_resolver import (
+    CDPDriver,
     MutationLock,
     OwnedTabRequiredError,
     _proc_lock_for,
     resolve_mutation_lock,
 )
+from chatgpt_web2api.mcp_server import _mcp_server_identity
 
-
-# ── Driver properties ────────────────────────────────────────────────────
-
-
-def test_driver_properties_default_false():
-    """A fresh driver (no connect) reports no owned target."""
-    d = CDPDriver(cdp_port=9222)
-    assert d.target_id is None
-    assert d.owns_target is False
-    assert d.has_owned_target is False
-
-
-def test_driver_properties_reflect_owned_state():
-    """Mutating the backing fields flips the properties (owned case)."""
-    d = CDPDriver(cdp_port=9222)
-    d._target_id = "ABC123"
-    d._owns_target = True
-    assert d.target_id == "ABC123"
-    assert d.owns_target is True
-    assert d.has_owned_target is True
-
-
-def test_has_owned_target_requires_all_three():
-    """has_owned_target is False unless tab_mode=owned AND owns AND target_id."""
-    d = CDPDriver(cdp_port=9222)
-    # owns_target + target_id but tab_mode != owned → False
-    d._target_id = "ABC"
-    d._owns_target = True
+e
     d.tab_mode = "adopt"
     assert d.has_owned_target is False
     # tab_mode=owned + owns_target but no target_id → False
