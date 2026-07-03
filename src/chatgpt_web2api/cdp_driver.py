@@ -1556,3 +1556,27 @@ class CDPDriver:
     @property
     def is_connected(self) -> bool:
         return self._ws is not None and self._ws.state.name == "OPEN"
+
+    # PR3/5: read-only owned-target state for the lock resolver + observability.
+    # Backs ``has_owned_target``, which the resolver uses to decide per-target
+    # vs port-wide locking in parallel mode. Mirrors the close() guard at
+    # :1535 — "a driver that adopted a tab never closes a tab it didn't open."
+    @property
+    def target_id(self) -> str | None:
+        """The owned tab's CDP targetId, or None if none owned/adopted."""
+        return self._target_id
+
+    @property
+    def owns_target(self) -> bool:
+        """True iff this driver created its target (owned mode), not adopted."""
+        return self._owns_target
+
+    @property
+    def has_owned_target(self) -> bool:
+        """True iff the driver holds a dedicated owned tab target.
+
+        The condition the parallel-tabs lock resolver checks before granting a
+        per-target lock: ``tab_mode == "owned"`` AND ``_owns_target`` AND a
+        non-empty ``_target_id``.
+        """
+        return self.tab_mode == "owned" and self._owns_target and bool(self._target_id)
