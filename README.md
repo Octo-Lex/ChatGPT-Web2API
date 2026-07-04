@@ -192,9 +192,11 @@ interference: one session may navigate, continue, or mutate the browser state
 expected by another.
 
 Until the B1 MCP session-affine tab pool is implemented and enabled, use SSE
-for a **single active agent session at a time**. For parallel agent sessions,
-use separate MCP processes with `parallel_tabs=true` and `tab_mode=owned`, or
-wait for B1.
+for a **single active agent session at a time**. For parallel agent sessions
+today, use separate MCP processes with `parallel_tabs=true` and
+`tab_mode=owned`, and ensure the Chrome-owning `chatgpt-web2api` REST process
+is started with the same parallel config or is not serving REST traffic on
+that CDP port. Otherwise, wait for B1.
 
 Start it (in a dedicated terminal — Chrome must already be running with an
 authenticated session, i.e. `chatgpt-web2api` started first):
