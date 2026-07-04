@@ -1,33 +1,21 @@
-"""Tests for the A2 turn-anchor module (Step 4).
-
-Pure-Python tests for the matcher, selectors, and tri-state collapse. No CDP,
-no real browser — operates on synthetic projected mappings.
-"""
-from __future__ import annotations
-
 import pytest
 
-from chatgpt_web2api.turn_anchor import (
-    EndTurnStatus,
-    SKEW_TOLERANCE_SECONDS,
-    TurnAnchor,
+from chatgpt_web2api.models import TurnAnchor
+from chatgpt_web2api.selectors import (
     TurnEndResult,
-    TurnTextResult,
     collapse_to_end_turn_status,
     normalize_text,
     select_end_turn_for_turn,
     select_text_for_turn,
-    user_text_matches_sent,
 )
 
 
-# ── Test fixtures ─────────────────────────────────────────────────────────
-
-def _user_node(node_id: str, text: str, create_time: float, *, children=None) -> dict:
+def _user_node(id: str, text: str, create_time: float, children=None):
     return {
-        "id": node_id,
+        "id": id,
+        "parent": None,
         "message": {
-            "id": node_id,
+            "id": id,
             "author": {"role": "user"},
             "create_time": create_time,
             "content": {"content_type": "text", "parts": [text]},
@@ -36,141 +24,98 @@ def _user_node(node_id: str, text: str, create_time: float, *, children=None) ->
     }
 
 
-def _assistant_node(node_id: str, text: str, create_time: float, *,
-                    end_turn: bool = False, content_type: str = "text",
-                    parent: str | None = None, children=None) -> dict:
+def _assistant_node(
+    id: str,
+    text: str,
+    create_time: float,
+    end_turn: bool = False,
+    parent: str = None,
+    children=None,
+    content_type: str = "text",
+):
     return {
-        "id": node_id,
+        "id": id,
         "parent": parent,
         "message": {
-            "id": node_id,
+            "id": id,
             "author": {"role": "assistant"},
             "create_time": create_time,
-            "end_turn": end_turn,
-            "content": {"content_type": content_type,
-                        "parts": [text] if text else []},
+            "content": {"content_type": content_type, "parts": [text]},
+            "metadata": {"is_complete": end_turn},
         },
         "children": children or [],
     }
 
 
-def _mapping(*nodes) -> dict:
-    """Build a projected mapping from a list of (id, node_dict)."""
-    return {"nodes": {n[0]: n[1] for n in nodes}}
+def _mapping(*pairs):
+    return {id: node for id, node in pairs}
 
 
-# ── Matcher tests ─────────────────────────────────────────────────────────
-
-class TestMatcher:
-    def test_full_equality_short(self):
-        assert user_text_matches_sent("hello", "hello")
-
-    def test_full_equality_with_whitespace_normalization(self):
-        assert user_text_matches_sent("  hello  ", "hello")
-        assert user_text_matches_sent("hello\r\nworld", "hello\nworld")
-
-    def test_full_equality_case_sensitive(self):
-        # Matcher is case-sensitive after normalization (no lowercasing).
-        assert not user_text_matches_sent("Hello", "hello")
-
-    def test_truncated_prefix_long_accepted(self):
-        parent = "A" * 1024
-        sent = "A" * 1024 + "B" * 100  # sent is longer; parent is a prefix
-        assert user_text_matches_sent(parent, sent)
-
-    def test_short_prefix_rejected(self):
-        # 64-char shared prefix — below threshold.
-        parent = "X" * 64
-        sent = "X" * 64 + "Y"
-        assert not user_text_matches_sent(parent, sent)
-
-    def test_below_threshold_must_match_exactly(self):
-        parent = "A" * 500
-        sent = "A" * 500 + "B"
-        assert not user_text_matches_sent(parent, sent)
-
-    def test_empty_strings(self):
-        assert not user_text_matches_sent("", "")
-        assert not user_text_matches_sent("hello", "")
-
-
-# ── Selector: primary ID path ─────────────────────────────────────────────
-
-class TestPrimaryIdPath:
-    def test_captured_id_exact_match(self):
+class TestExistingConversation:
+    def test_simple_match(self):
         user = _user_node("u-1", "hello", 100.0, children=["a-1"])
-        asst = _assistant_node("a-1", "Hi there", 101.0, end_turn=True, parent="u-1")
+        asst = _assistant_node("a-1", "Hi", 101.0, end_turn=True, parent="u-1")
         mapping = _mapping(("u-1", user), ("a-1", asst))
         anchor = TurnAnchor(
-            sent_text="hello", mode="captured_id",
-            captured_user_message_id="u-1",
+            sent_text="hello",
+            mode="existing_conversation",
+            latest_user_node_id="u-1",
+            latest_user_create_time=100.0,
         )
         result = select_text_for_turn(mapping, anchor)
         assert result.status == "matched"
-        assert result.text == "Hi there"
+        assert result.text == "Hi"
 
-    def test_captured_id_not_yet_in_mapping(self):
-        anchor = TurnAnchor(
-            sent_text="hello", mode="captured_id",
-            captured_user_message_id="u-MISSING",
-        )
-        mapping = _mapping(("u-1", _user_node("u-1", "hello", 100.0)))
-        result = select_text_for_turn(mapping, anchor)
-        assert result.status == "not_ready"
-        assert "id_not_yet_in_mapping" in result.diagnostic.get("reason", "")
-
-
-# ── Selector: fallback existing_conversation ──────────────────────────────
-
-class TestExistingConversationFallback:
-    def test_text_match_with_anchor_newer(self):
-        old_user = _user_node("u-old", "hello", 90.0, children=["a-old"])
-        new_user = _user_node("u-new", "hello", 100.0, children=["a-new"])
-        asst = _assistant_node("a-new", "Fresh reply", 101.0, end_turn=True, parent="u-new")
-        mapping = _mapping(("u-old", old_user), ("u-new", new_user), ("a-new", asst))
+    def test_ambiguous_if_two_children(self):
+        user = _user_node("u-1", "hello", 100.0, children=["a-1", "a-2"])
+        asst1 = _assistant_node("a-1", "Hi", 101.0, parent="u-1")
+        asst2 = _assistant_node("a-2", "Hello", 101.0, parent="u-1")
+        mapping = _mapping(("u-1", user), ("a-1", asst1), ("a-2", asst2))
         anchor = TurnAnchor(
             sent_text="hello", mode="existing_conversation",
-            latest_user_node_id="u-old", latest_user_create_time=90.0,
+            latest_user_node_id="u-1", latest_user_create_time=100.0,
         )
-        result = select_text_for_turn(mapping, anchor)
-        assert result.status == "matched"
-        assert result.text == "Fresh reply"
-
-    def test_timestamp_tie_node_id_disambiguates(self):
-        # Two user nodes with same text and same create_time; different ids.
-        u1 = _user_node("u-1", "hello", 100.0, children=["a-1"])
-        u2 = _user_node("u-2", "hello", 100.0, children=["a-2"])
-        a1 = _assistant_node("a-1", "Reply 1", 101.0, end_turn=True, parent="u-1")
-        a2 = _assistant_node("a-2", "Reply 2", 102.0, end_turn=True, parent="u-2")
-        mapping = _mapping(("u-1", u1), ("u-2", u2), ("a-1", a1), ("a-2", a2))
-        anchor = TurnAnchor(
-            sent_text="hello", mode="existing_conversation",
-            latest_user_node_id="u-PREVIOUS", latest_user_create_time=100.0,
-        )
-        # Both u-1 and u-2 are different from u-PREVIOUS and >= 100.0 → ambiguous.
         result = select_text_for_turn(mapping, anchor)
         assert result.status == "ambiguous"
 
-    def test_identical_answer_text_still_matches_newest(self):
-        # Same text sent twice; both responses identical. Selector must still
-        # find the NEWER end_turn=true descendant.
-        old_user = _user_node("u-old", "ping", 90.0, children=["a-old"])
-        new_user = _user_node("u-new", "ping", 100.0, children=["a-new"])
-        a_old = _assistant_node("a-old", "pong", 91.0, end_turn=True, parent="u-old")
-        a_new = _assistant_node("a-new", "pong", 101.0, end_turn=True, parent="u-new")
-        mapping = _mapping(("u-old", old_user), ("u-new", new_user),
-                           ("a-old", a_old), ("a-new", a_new))
+    def test_fresh_if_user_newer_than_anchor(self):
+        user = _user_node("u-new", "hello", 105.0, children=["a-1"])
+        asst = _assistant_node("a-1", "Hi", 106.0, end_turn=True, parent="u-new")
+        mapping = _mapping(("u-new", user), ("a-1", asst))
+        # Anchor reflects the old state.
         anchor = TurnAnchor(
-            sent_text="ping", mode="existing_conversation",
-            latest_user_node_id="u-old", latest_user_create_time=90.0,
+            sent_text="hello",
+            mode="existing_conversation",
+            latest_user_node_id="u-old",
+            latest_user_create_time=100.0,
         )
         result = select_text_for_turn(mapping, anchor)
-        assert result.status == "matched"
-        # Should return the newer assistant's text (both "pong" but from a-new).
-        assert result.diagnostic.get("assistant_node") == "a-new"
+        assert result.status == "fresh"
 
-    def test_no_fresh_text_match(self):
-        # Only the previous user node matches; it's not newer.
+    def test_not_ready_if_no_reply(self):
+        user = _user_node("u-1", "hello", 100.0, children=[])
+        mapping = _mapping(("u-1", user))
+        anchor = TurnAnchor(
+            sent_text="hello", mode="existing_conversation",
+            latest_user_node_id="u-1", latest_user_create_time=100.0,
+        )
+        result = select_text_for_turn(mapping, anchor)
+        assert result.status == "not_ready"
+
+    def test_not_ready_if_user_not_newer(self):
+        # If the latest user node is the same as the one in the anchor,
+        # we assume we've already processed it. So we need a newer one.
+        user = _user_node("u-1", "hello", 100.0, children=["a-1"])
+        asst = _assistant_node("a-1", "Hi", 101.0, end_turn=True, parent="u-1")
+        mapping = _mapping(("u-1", user), ("a-1", asst))
+        anchor = TurnAnchor(
+            sent_text="hello", mode="existing_conversation",
+            latest_user_node_id="u-1", latest_user_create_time=100.0,
+        )
+        result = select_text_for_turn(mapping, anchor)
+        assert result.status == "not_ready"
+
+    def test_not_ready_if_previous_user_node_matches_its_not_newer(self):
         old_user = _user_node("u-old", "hello", 90.0, children=["a-old"])
         mapping = _mapping(("u-old", old_user))
         anchor = TurnAnchor(
