@@ -82,6 +82,21 @@ class ChatGPTConfig:
     # fail-closed owned-tab requirement (no shared-tab fallback). Default False
     # reproduces the exact legacy single-tab-serialized behavior.
     parallel_tabs: bool = False
+    # B1: MCP session-affine driver pool. When True, the MCP server does NOT
+    # connect to Chrome at startup. Instead, the first browser-affecting request
+    # from each MCP session materializes one owned CDPDriver/tab. Different
+    # sessions get different tabs, capped by pool size. Default off — singleton
+    # driver behavior is unchanged when False.
+    # Requires parallel_tabs=true + tab_mode=owned (validated at load).
+    mcp_session_pool_enabled: bool = False
+    mcp_session_pool_size: int = 2
+    mcp_session_pool_ttl_seconds: int = 1800
+    mcp_session_pool_acquire_timeout: float = 5.0
+    mcp_session_pool_sweep_interval_seconds: int = 60
+    mcp_session_pool_create_concurrency: int = 1
+    # Account-level throttle breaker: pauses mutations pool-wide if ChatGPT
+    # signals excessive consumption from simultaneous multi-tab use.
+    mcp_account_throttle_cooldown_seconds: int = 300
 
 
 @dataclass
@@ -166,6 +181,30 @@ class Config:
                 f"{cfg.chatgpt.tab_mode!r}); parallel mode needs per-target "
                 "owned tabs for correct locking"
             )
+        # B1: pool mode requires the full parallel-tabs safety bundle.
+        if cfg.chatgpt.mcp_session_pool_enabled:
+            if not cfg.chatgpt.parallel_tabs:
+                raise ValueError(
+                    "mcp_session_pool_enabled=true requires parallel_tabs=true; "
+                    "the pool needs per-target owned tabs and per-target locks"
+                )
+            if cfg.chatgpt.tab_mode != "owned":
+                raise ValueError(
+                    "mcp_session_pool_enabled=true requires tab_mode=owned"
+                )
+            if cfg.chatgpt.mcp_session_pool_size < 1:
+                raise ValueError(
+                    "mcp_session_pool_size must be >= 1"
+                )
+            if cfg.chatgpt.mcp_session_pool_create_concurrency < 1:
+                raise ValueError(
+                    "mcp_session_pool_create_concurrency must be >= 1"
+                )
+            if cfg.chatgpt.mcp_session_pool_create_concurrency > cfg.chatgpt.mcp_session_pool_size:
+                raise ValueError(
+                    "mcp_session_pool_create_concurrency must be <= "
+                    "mcp_session_pool_size"
+                )
         return cfg
 
     def _apply_dict(self, data: dict) -> None:
@@ -202,6 +241,27 @@ class Config:
         c = data.get("parallel_tabs")
         if c is not None:
             self.chatgpt.parallel_tabs = _as_bool(c)
+        c = data.get("mcp_session_pool_enabled")
+        if c is not None:
+            self.chatgpt.mcp_session_pool_enabled = _as_bool(c)
+        c = data.get("mcp_session_pool_size")
+        if c is not None:
+            self.chatgpt.mcp_session_pool_size = int(c)
+        c = data.get("mcp_session_pool_ttl_seconds")
+        if c is not None:
+            self.chatgpt.mcp_session_pool_ttl_seconds = int(c)
+        c = data.get("mcp_session_pool_acquire_timeout")
+        if c is not None:
+            self.chatgpt.mcp_session_pool_acquire_timeout = float(c)
+        c = data.get("mcp_session_pool_sweep_interval_seconds")
+        if c is not None:
+            self.chatgpt.mcp_session_pool_sweep_interval_seconds = int(c)
+        c = data.get("mcp_session_pool_create_concurrency")
+        if c is not None:
+            self.chatgpt.mcp_session_pool_create_concurrency = int(c)
+        c = data.get("mcp_account_throttle_cooldown_seconds")
+        if c is not None:
+            self.chatgpt.mcp_account_throttle_cooldown_seconds = int(c)
         c = data.get("request_timeout")
         if c is not None:
             self.server.request_timeout = int(c)
@@ -242,6 +302,20 @@ class Config:
                 self.chatgpt.tab_mode = v
         if v := _env("W2A_PARALLEL_TABS"):
             self.chatgpt.parallel_tabs = v.lower() in ("true", "1", "yes")
+        if v := _env("W2A_MCP_SESSION_POOL_ENABLED"):
+            self.chatgpt.mcp_session_pool_enabled = v.lower() in ("true", "1", "yes")
+        if v := _env("W2A_MCP_SESSION_POOL_SIZE"):
+            self.chatgpt.mcp_session_pool_size = int(v)
+        if v := _env("W2A_MCP_SESSION_POOL_TTL_SECONDS"):
+            self.chatgpt.mcp_session_pool_ttl_seconds = int(v)
+        if v := _env("W2A_MCP_SESSION_POOL_ACQUIRE_TIMEOUT"):
+            self.chatgpt.mcp_session_pool_acquire_timeout = float(v)
+        if v := _env("W2A_MCP_SESSION_POOL_SWEEP_INTERVAL_SECONDS"):
+            self.chatgpt.mcp_session_pool_sweep_interval_seconds = int(v)
+        if v := _env("W2A_MCP_SESSION_POOL_CREATE_CONCURRENCY"):
+            self.chatgpt.mcp_session_pool_create_concurrency = int(v)
+        if v := _env("W2A_MCP_ACCOUNT_THROTTLE_COOLDOWN_SECONDS"):
+            self.chatgpt.mcp_account_throttle_cooldown_seconds = int(v)
         if v := _env("W2A_HEADLESS"):
             self.chrome.headless = v.lower() in ("true", "1", "yes")
         if v := _env("W2A_LOG_LEVEL"):
@@ -266,6 +340,13 @@ class Config:
             "default_project_id": self.chatgpt.default_project_id,
             "tab_mode": self.chatgpt.tab_mode,
             "parallel_tabs": self.chatgpt.parallel_tabs,
+            "mcp_session_pool_enabled": self.chatgpt.mcp_session_pool_enabled,
+            "mcp_session_pool_size": self.chatgpt.mcp_session_pool_size,
+            "mcp_session_pool_ttl_seconds": self.chatgpt.mcp_session_pool_ttl_seconds,
+            "mcp_session_pool_acquire_timeout": self.chatgpt.mcp_session_pool_acquire_timeout,
+            "mcp_session_pool_sweep_interval_seconds": self.chatgpt.mcp_session_pool_sweep_interval_seconds,
+            "mcp_session_pool_create_concurrency": self.chatgpt.mcp_session_pool_create_concurrency,
+            "mcp_account_throttle_cooldown_seconds": self.chatgpt.mcp_account_throttle_cooldown_seconds,
             "request_timeout": self.server.request_timeout,
             "log_level": self.log.level,
             "ensure_degraded_poll_interval_s": self.ensure.degraded_poll_interval_s,
