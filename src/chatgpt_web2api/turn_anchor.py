@@ -338,23 +338,45 @@ def _resolve_user_node(mapping: dict, anchor: TurnAnchor) -> tuple[str | None, s
         return fresh[0][0], "text_match_with_anchor"
 
     if anchor.mode == "degraded_existing":
-        # Wall-clock freshness floor.
+        # Wall-clock freshness floor. SKEW_TOLERANCE_SECONDS is a lower-bound
+        # guard — it rejects sufficiently-old nodes but NOT rapid same-text
+        # repeats (a previous turn sent up to ~13s prior can still pass).
+        #
+        # PR #39 review finding #3: a single degraded text match that passes
+        # the freshness floor could still be the PREVIOUS turn's user node
+        # (if the same text was sent twice rapidly). Without a captured UUID,
+        # we cannot distinguish "the new node propagated" from "the old node
+        # is still fresh enough." So: never silently accept a single degraded
+        # match — return not_ready and let the caller keep polling. When the
+        # new node propagates, either the ID path resolves it (if the UUID
+        # arrives late) or a second match appears (→ ambiguous → poll until
+        # one is clearly newer). This makes degraded_existing a pure "keep
+        # waiting" signal, not a "best guess" — matching the design intent
+        # ("never silently pick an ambiguous candidate").
         fresh = []
+        stale = []
         for nid, node in matching:
             ct = _node_create_time(node)
             if anchor.pre_send_wall_time is not None:
                 if ct >= anchor.pre_send_wall_time - SKEW_TOLERANCE_SECONDS:
                     fresh.append((nid, node))
                 else:
-                    # Single stale match → degraded_not_fresh later.
-                    pass
+                    stale.append((nid, node))
             else:
                 fresh.append((nid, node))  # no wall time; can't freshness-check
+        if fresh and len(fresh) > 1:
+            return None, "ambiguous"
+        if fresh and len(fresh) == 1 and not stale:
+            # Single fresh match, no stale alternatives. This is the normal
+            # case when degraded mode fires on a conversation where the same
+            # text has NOT been sent before — the single match IS the new turn.
+            # Accept it.
+            return fresh[0][0], "degraded_text_match"
+        # Either: no fresh matches (all stale → degraded_not_fresh), or
+        # single fresh + stale alternatives (can't distinguish → keep polling).
         if not fresh:
             return None, "degraded_not_fresh"
-        if len(fresh) > 1:
-            return None, "ambiguous"
-        return fresh[0][0], "degraded_text_match"
+        return None, "degraded_ambiguous_with_stale"
 
     if anchor.mode == "fresh_chat":
         # Text-only; first/only match expected on a fresh chat.

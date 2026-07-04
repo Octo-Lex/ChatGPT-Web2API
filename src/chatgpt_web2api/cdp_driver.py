@@ -469,6 +469,12 @@ class CDPDriver:
                 self._target_id = None
                 self._owns_target = False
                 ws_url = await self._find_page_ws()
+        # Keepalive: ping every 20s, allow 10s for pong response. This is
+        # the pre-A2 production value (set during parallel-tabs PR2); the A2
+        # plan proposed ping_timeout=60, but the existing value of 10 passed
+        # the post-idle survival test (130s idle, listener stayed alive) and
+        # is tighter against transient stalls. Kept deliberately; see PR #39
+        # review finding #4.
         self._ws = await websockets.connect(
             ws_url,
             max_size=100 * 1024 * 1024,

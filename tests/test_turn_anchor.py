@@ -221,6 +221,27 @@ class TestDegradedExisting:
         result = select_text_for_turn(mapping, anchor)
         assert result.status == "ambiguous"
 
+    def test_degraded_same_text_repeat_does_not_silently_match(self):
+        """PR #39 review finding #3: degraded mode with one fresh + one stale
+        same-text match must NOT silently pick the fresh one — we can't
+        distinguish 'new node propagated' from 'old node still fresh enough.'
+        Must return not_ready (keep polling) until disambiguated."""
+        # Previous turn's user node — stale (below freshness floor).
+        u_old = _user_node("u-old", "continue", 82.0, children=["a-old"])
+        # New turn's user node — fresh (within the TOL=8 window).
+        u_new = _user_node("u-new", "continue", 100.0, children=["a-new"])
+        mapping = _mapping(("u-old", u_old), ("u-new", u_new))
+        anchor = TurnAnchor(
+            sent_text="continue", mode="degraded_existing",
+            pre_send_wall_time=95.0,
+        )
+        result = select_text_for_turn(mapping, anchor)
+        # Must NOT be "matched" — the stale alternative means we can't be
+        # certain u-new is the new turn (it might be u-old's text still
+        # propagating). Keep polling.
+        assert result.status != "matched"
+        assert result.status in ("not_ready", "degraded_ambiguous_with_stale")
+
 
 # ── Selector: fresh_chat ──────────────────────────────────────────────────
 

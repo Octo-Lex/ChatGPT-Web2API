@@ -154,7 +154,13 @@ class CompletionDetector:
         # Imported lazily to avoid a module-load circular dependency: cdp_driver
         # top-level re-exports PHASE_STALL_SECONDS / is_rate_limited_text from
         # this module, so this module must not import cdp_driver at load time.
-        from .cdp_driver import CDPJSError, GenerationStuckError, RateLimitError, StreamChunk
+        from .cdp_driver import (
+            AuthExpiredError,
+            CDPJSError,
+            GenerationStuckError,
+            RateLimitError,
+            StreamChunk,
+        )
         from .turn_anchor import collapse_to_end_turn_status
 
         d = self._driver
@@ -495,12 +501,14 @@ class CompletionDetector:
                             end_result.status, end_result.diagnostic,
                         )
                     # else: not_ready — no-op (do NOT set backend_fetch_failed).
+                except AuthExpiredError:
+                    # Auth failure must NEVER degrade to DOM fallback.
+                    # (PR #39 review finding #2 — the prior broad except
+                    # swallowed this, violating "auth failure never degrades.")
+                    raise
                 except Exception as e:
-                    # AuthExpiredError or unexpected — preserve existing
-                    # behavior of treating fetch exceptions as fallback-unlock.
-                    # (Auth errors propagate from the fetcher as AuthExpiredError
-                    # and should NOT be swallowed; but preserving the prior
-                    # broad-except for safety during the transition.)
+                    # Transport/backend failure — treat as fetch_failed so the
+                    # DOM fallback unlocks for this poll.
                     backend_fetch_failed = True
                     logger.debug("end_turn fetch raised (ignored): %s", e)
 

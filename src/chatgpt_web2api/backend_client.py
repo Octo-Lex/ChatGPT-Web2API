@@ -307,6 +307,18 @@ class BackendClient:
                 raise _Transient404(conversation_id)
             if status is not None:
                 raise RuntimeError(f"projection HTTP {status} for {conversation_id}")
+        # Decode projection JS errors (the JS catches exceptions and returns
+        # {"__error": "..."}). Without this, a projection error would reach
+        # the selector as an empty mapping → not_ready → the detector would
+        # NOT unlock DOM fallback → reconciliation timeout instead of
+        # fetch_failed. (PR #39 review finding #1.)
+        if raw.startswith('{"__error"') or raw.startswith('{ "__error"'):
+            try:
+                payload = json.loads(raw)
+                err_msg = payload.get("__error", "unknown projection error")
+            except (json.JSONDecodeError, TypeError):
+                err_msg = "projection returned unparseable error blob"
+            raise CDPJSError(f"projection JS error for {conversation_id}: {err_msg}")
         # Parse the projected mapping.
         try:
             return json.loads(raw)
