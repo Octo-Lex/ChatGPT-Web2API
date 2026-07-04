@@ -403,6 +403,38 @@ chat_with_gpt(gpt_id="g-hkJGhxxx", message="Analyze this data")
 
 See [`config.example.json`](config.example.json) for all available keys.
 
+### MCP Session Pool (B1 — experimental, default off)
+
+When `mcp_session_pool_enabled=true`, the MCP SSE server does **not** connect to
+Chrome at startup. Instead, each MCP client session gets its own owned
+`CDPDriver`/Chrome tab on first request (lazy materialization). Different
+sessions get different tabs, capped by pool size. This enables parallel
+multi-session use of one shared SSE endpoint.
+
+Requires `parallel_tabs=true` + `tab_mode=owned` (validated at load).
+
+```json
+{
+  "parallel_tabs": true,
+  "tab_mode": "owned",
+  "mcp_session_pool_enabled": true,
+  "mcp_session_pool_size": 2
+}
+```
+
+Or via environment:
+
+```bash
+W2A_PARALLEL_TABS=1 \
+W2A_MCP_SESSION_POOL_ENABLED=1 \
+W2A_MCP_SESSION_POOL_SIZE=2 \
+chatgpt-web2api-mcp --transport sse --port 8090
+```
+
+Pool defaults are conservative (size=2, TTL=30min). Raise the size only after
+the account-level burst canary shows no token-rotation errors or hard account
+challenges from genuinely simultaneous multi-tab use.
+
 ### Environment Variables
 
 ```bash
