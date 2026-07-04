@@ -9,8 +9,8 @@ has_action is a fallback for the pre-conv_id window.
 These tests verify the Python-side completion POLICY (which signal wins),
 using the same mocking pattern as test_sse_end_turn_new_chat.py:
 monkeypatch time.monotonic + asyncio.sleep, fake _js_strict returning
-phase-appropriate JSON, AsyncMock for _fetch_end_turn / type_message /
-click_send / _fetch_text.
+phase-appropriate JSON, AsyncMock for _fetch_end_turn_for_turn /
+type_message / click_send / _fetch_text_for_turn.
 """
 
 import json
@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from chatgpt_web2api.cdp_driver import CDPDriver
+from chatgpt_web2api.turn_anchor import TurnEndResult, TurnTextResult
 
 
 def _make_driver():
@@ -87,8 +88,13 @@ async def test_end_turn_wins_over_no_has_action(monkeypatch):
     d._js_strict = _phase1_then_phase2_js(state, phase2_factory=phase2)
     d.type_message = AsyncMock()
     d.click_send = AsyncMock()
-    d._fetch_text = AsyncMock(return_value="")
-    d._fetch_end_turn = AsyncMock(return_value=True)
+    # A2: anchored final-text fetch. The DOM already streamed "The answer."
+    # (last_dom_text); return matched with the same text so the reconciliation
+    # loop breaks cleanly (len == last_dom_text → no spurious delta).
+    d._fetch_text_for_turn = AsyncMock(
+        return_value=TurnTextResult(status="matched", text="The answer.")
+    )
+    d._fetch_end_turn_for_turn = AsyncMock(return_value=TurnEndResult(status="matched"))
 
     chunks = []
     async for chunk in d.send_and_stream("hello", timeout=10000):
@@ -97,7 +103,7 @@ async def test_end_turn_wins_over_no_has_action(monkeypatch):
     deltas = [c.delta for c in chunks if c.delta]
     assert any("The answer" in c for c in deltas), f"deltas: {deltas}"
     assert chunks[-1].finish_reason == "stop"
-    assert d._fetch_end_turn.await_count >= 1
+    assert d._fetch_end_turn_for_turn.await_count >= 1
 
 
 # ── 2. end_turn=True wins even when is_thinking=True ───────────────────
@@ -125,8 +131,11 @@ async def test_end_turn_wins_over_is_thinking(monkeypatch):
     d._js_strict = _phase1_then_phase2_js(state, phase2_factory=phase2)
     d.type_message = AsyncMock()
     d.click_send = AsyncMock()
-    d._fetch_text = AsyncMock(return_value="")
-    d._fetch_end_turn = AsyncMock(return_value=True)
+    # A2: DOM streamed "Done." (last_dom_text); return matched with same text.
+    d._fetch_text_for_turn = AsyncMock(
+        return_value=TurnTextResult(status="matched", text="Done.")
+    )
+    d._fetch_end_turn_for_turn = AsyncMock(return_value=TurnEndResult(status="matched"))
 
     chunks = []
     async for chunk in d.send_and_stream("hello", timeout=10000):
@@ -165,8 +174,13 @@ async def test_has_action_fallback_without_conv_id(monkeypatch):
     )
     d.type_message = AsyncMock()
     d.click_send = AsyncMock()
-    d._fetch_text = AsyncMock(return_value="")
-    d._fetch_end_turn = AsyncMock(return_value=True)  # should NOT be called
+    # A2: conv_id never resolves (URL stays ?model=auto) so the reconciliation
+    # loop is skipped — this mock is never called. Mapped to not_ready for
+    # semantic fidelity with the old return_value="".
+    d._fetch_text_for_turn = AsyncMock(
+        return_value=TurnTextResult(status="not_ready")
+    )
+    d._fetch_end_turn_for_turn = AsyncMock(return_value=TurnEndResult(status="matched"))  # should NOT be called
 
     chunks = []
     async for chunk in d.send_and_stream("hello", timeout=10000):
@@ -177,7 +191,7 @@ async def test_has_action_fallback_without_conv_id(monkeypatch):
     assert any("Fallback answer" in c for c in deltas), f"deltas: {deltas}"
     assert chunks[-1].finish_reason == "stop"
     # end_turn was never consulted because conv_id_for_check was never set
-    assert d._fetch_end_turn.await_count == 0
+    assert d._fetch_end_turn_for_turn.await_count == 0
 
 
 # ── 4. JS selector walks to ancestor depth 8 (structural check) ────────
@@ -260,9 +274,13 @@ async def test_has_action_does_not_complete_when_backend_says_not_done(monkeypat
     d._js_strict = _phase1_then_phase2_js(state, phase2_factory=phase2)
     d.type_message = AsyncMock()
     d.click_send = AsyncMock()
-    d._fetch_text = AsyncMock(return_value="")
+    # A2: loop never reaches reconciliation (GenerationStuckError fires in
+    # Phase-2 first). Mapped to not_ready (faithful to old "").
+    d._fetch_text_for_turn = AsyncMock(
+        return_value=TurnTextResult(status="not_ready")
+    )
     # Backend is reachable but says NOT done — authoritative
-    d._fetch_end_turn = AsyncMock(return_value=False)
+    d._fetch_end_turn_for_turn = AsyncMock(return_value=TurnEndResult(status="not_ready"))
 
     from chatgpt_web2api.cdp_driver import GenerationStuckError
 
@@ -274,4 +292,4 @@ async def test_has_action_does_not_complete_when_backend_says_not_done(monkeypat
     # The loop polled the backend (conv_id resolved after ~1s) and did NOT
     # break on has_action — it ran until the stall guard fired. Proves the DOM
     # signal cannot override a live backend.
-    assert d._fetch_end_turn.await_count >= 1, "backend must be consulted once conv_id is available"
+    assert d._fetch_end_turn_for_turn.await_count >= 1, "backend must be consulted once conv_id is available"

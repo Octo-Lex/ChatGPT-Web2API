@@ -16,21 +16,22 @@ detection surface that was previously inlined in ``CDPDriver.send_and_stream``:
 The driver-reference collaborator seam: ``CompletionDetector`` holds a
 reference to its owning ``CDPDriver`` and reaches through it for the CDP
 transport (``_js_strict``), the backend completion signals
-(``_fetch_end_turn`` / ``_get_live_conversation_id_best_effort``), and the
-in-flight conversation id (``_current_conv_id``, read-only). No state migrates
-into this module — it stays on the driver, and the detector is stateless
-beyond ``_driver``.
+(``_fetch_end_turn_for_turn`` / ``_get_live_conversation_id_best_effort``),
+and the in-flight conversation id (``_current_conv_id``, read-only). No state
+migrates into this module — it stays on the driver, and the detector is
+stateless beyond ``_driver``.
 
 Boundary: this module is the generation-completion detection layer.
 ``send_and_stream`` orchestration (pre-count, type/send, the post-loop
-conversation-id resolve + ``_current_conv_id`` mutation, the ``_fetch_text``
-final reconcile, and the terminal ``finish_reason="stop"`` chunk) stays in
-``cdp_driver.py``. The detector yields **deltas only** — it never emits a
+conversation-id resolve + ``_current_conv_id`` mutation, the
+``_fetch_text_for_turn`` final reconcile, and the terminal
+``finish_reason="stop"`` chunk) stays in ``cdp_driver.py``. The detector
+yields **deltas only** — it never emits a
 ``finish_reason`` and never writes ``_current_conv_id``.
 
 Per-call result surfacing: the driver's post-loop tail consumes two values the
 Phase-2 loop accumulates as locals — ``last_dom_text`` (the streamed-text
-baseline used to emit the ``_fetch_text`` suffix delta) and
+baseline used to emit the ``_fetch_text_for_turn`` suffix delta) and
 ``had_non_text_content`` (drives the non-text placeholder). They cannot be
 re-derived without re-running the poll, so after the generator exhausts the
 driver reads ``self._completion.last_dom_text`` /
@@ -43,7 +44,7 @@ through ``self._driver`` (NOT ``self``) to preserve monkeypatch interception on
 the driver-facing seam (the PR2 lesson):
 
   transport:       self._driver._js_strict(...)
-  backend signals: self._driver._fetch_end_turn(...)
+  backend signals: self._driver._fetch_end_turn_for_turn(...)
                    self._driver._get_live_conversation_id_best_effort(...)
   conv-id read:    self._driver._current_conv_id   (read once into a local;
                    NEVER assigned here)
@@ -131,6 +132,7 @@ class CompletionDetector:
         *,
         initial_count: int,
         timeout: float,
+        turn_anchor,
     ) -> AsyncIterator[StreamChunk]:
         """Run Phase-1 (appear) + Phase-2 (stream) and yield delta chunks.
 
@@ -140,11 +142,20 @@ class CompletionDetector:
         iterating) once generation is detected complete (backend ``end_turn``
         primary, action-button fallback, or a stall raises
         ``GenerationStuckError``).
+
+        A2: ``turn_anchor`` is required. The backend ``end_turn`` completion
+        signal is turn-correlated via ``_fetch_end_turn_for_turn`` (tri-state).
+        The DOM
+        ``has_action`` fallback gate is unchanged — ``backend_fetch_failed`` is
+        set ONLY on ``fetch_failed`` (true transport failure), NOT on
+        ``not_ready``/``ambiguous``/``degraded_not_fresh`` (which collapse to
+        ``not_ready`` and must NOT unlock the DOM fallback).
         """
         # Imported lazily to avoid a module-load circular dependency: cdp_driver
         # top-level re-exports PHASE_STALL_SECONDS / is_rate_limited_text from
         # this module, so this module must not import cdp_driver at load time.
         from .cdp_driver import CDPJSError, GenerationStuckError, RateLimitError, StreamChunk
+        from .turn_anchor import collapse_to_end_turn_status
 
         d = self._driver
 
@@ -348,7 +359,7 @@ class CompletionDetector:
                     # pinned is_thinking=true on every thinking-model turn
                     # and on any answer that mentioned the word "thinking",
                     # which suppressed all delta emission (see the elif below)
-                    # and produced empty responses when _fetch_text lagged.
+                    # and produced empty responses when the backend fetch lagged.
                     # Also recognize a plain "Thinking..." innerText placeholder
                     # (some layouts show reasoning text without .result-thinking)
                     # so the stall clock treats it as active generation, not a stall.
@@ -450,7 +461,19 @@ class CompletionDetector:
             ):
                 last_backend_check = time.monotonic()
                 try:
-                    if await d._fetch_end_turn(conv_id_for_check):
+                    # A2: anchored tri-state completion. The selector returns
+                    # a rich TurnEndResult; collapse_to_end_turn_status maps
+                    # it to the detector's tri-state gate. Critical: not_ready/
+                    # ambiguous/degraded_not_fresh collapse to not_ready and
+                    # must NOT set backend_fetch_failed (would unlock the DOM
+                    # fallback and risk completing off a prior turn's action
+                    # row — the line-493 gate invariant).
+                    end_result = await d._fetch_end_turn_for_turn(
+                        conv_id_for_check, turn_anchor,
+                        had_non_text_content=had_non_text_content,
+                    )
+                    status = collapse_to_end_turn_status(end_result)
+                    if status == "complete":
                         # STRICT: end_turn AND usable content. The saw_thinking
                         # unlock lets us CONSULT the backend during thinking, but
                         # we must not finish on a bare end_turn with no answer.
@@ -465,9 +488,21 @@ class CompletionDetector:
                             "not completing (strict content guard)",
                             conv_id_for_check,
                         )
+                    elif status == "fetch_failed":
+                        backend_fetch_failed = True
+                        logger.debug(
+                            "end_turn fetch failed (status=%s): %s",
+                            end_result.status, end_result.diagnostic,
+                        )
+                    # else: not_ready — no-op (do NOT set backend_fetch_failed).
                 except Exception as e:
+                    # AuthExpiredError or unexpected — preserve existing
+                    # behavior of treating fetch exceptions as fallback-unlock.
+                    # (Auth errors propagate from the fetcher as AuthExpiredError
+                    # and should NOT be swallowed; but preserving the prior
+                    # broad-except for safety during the transition.)
                     backend_fetch_failed = True
-                    logger.debug("end_turn fetch failed (ignored): %s", e)
+                    logger.debug("end_turn fetch raised (ignored): %s", e)
 
             # FALLBACK: DOM action button (has_action). Used ONLY when the primary
             # backend signal can't run: conv_id is unavailable (before the URL
@@ -493,5 +528,5 @@ class CompletionDetector:
 
         # Per-call results (last_dom_text / had_non_text_content) are already
         # mirrored to self.* as they changed during the loop; the driver tail
-        # reads them to emit the _fetch_text suffix delta / non-text placeholder.
+        # reads them to emit the final-text suffix delta / non-text placeholder.
         return

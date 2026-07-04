@@ -1,0 +1,253 @@
+{
+  "nodes": {
+    "client-created-root": {
+      "id": "client-created-root",
+      "parent": null,
+      "children": [
+        "0b8575da-e38a-4fdb-b182-ccfb7f4f29ec"
+      ],
+      "role": "unknown",
+      "create_time": 0,
+      "end_turn": false,
+      "content_type": "unknown",
+      "text": ""
+    },
+    "0b8575da-e38a-4fdb-b182-ccfb7f4f29ec": {
+      "id": "0b8575da-e38a-4fdb-b182-ccfb7f4f29ec",
+      "parent": "client-created-root",
+      "children": [
+        "9a809728-0f2d-437e-986f-61a5ccd7e4d3"
+      ],
+      "role": "system",
+      "create_time": 0,
+      "end_turn": true,
+      "content_type": "text",
+      "text": ""
+    },
+    "9a809728-0f2d-437e-986f-61a5ccd7e4d3": {
+      "id": "9a809728-0f2d-437e-986f-61a5ccd7e4d3",
+      "parent": "0b8575da-e38a-4fdb-b182-ccfb7f4f29ec",
+      "children": [
+        "cbb5dd3f-e24b-47f8-96a2-5a7f0eff39fc"
+      ],
+      "role": "system",
+      "create_time": 0,
+      "end_turn": true,
+      "content_type": "text",
+      "text": ""
+    },
+    "cbb5dd3f-e24b-47f8-96a2-5a7f0eff39fc": {
+      "id": "cbb5dd3f-e24b-47f8-96a2-5a7f0eff39fc",
+      "parent": "9a809728-0f2d-437e-986f-61a5ccd7e4d3",
+      "children": [
+        "8a1718b6-d9b2-4eb1-bb18-a14c4711becf"
+      ],
+      "role": "system",
+      "create_time": 0,
+      "end_turn": false,
+      "content_type": "text",
+      "text": ""
+    },
+    "8a1718b6-d9b2-4eb1-bb18-a14c4711becf": {
+      "id": "8a1718b6-d9b2-4eb1-bb18-a14c4711becf",
+      "parent": "cbb5dd3f-e24b-47f8-96a2-5a7f0eff39fc",
+      "children": [
+        "ffa19648-10f4-42db-ad17-3ffc85215f1e"
+      ],
+      "role": "user",
+      "create_time": 0,
+      "end_turn": false,
+      "content_type": "user_editable_context",
+      "text": ""
+    },
+    "ffa19648-10f4-42db-ad17-3ffc85215f1e": {
+      "id": "ffa19648-10f4-42db-ad17-3ffc85215f1e",
+      "parent": "8a1718b6-d9b2-4eb1-bb18-a14c4711becf",
+      "children": [
+        "1919e19a-da54-4880-a385-9aef15d8811a"
+      ],
+      "role": "user",
+      "create_time": 1783140512.71,
+      "end_turn": false,
+      "content_type": "text",
+      "text": "[User]\nReply with exactly: TRUEFRESH-1"
+    },
+    "1919e19a-da54-4880-a385-9aef15d8811a": {
+      "id": "1919e19a-da54-4880-a385-9aef15d8811a",
+      "parent": "ffa19648-10f4-42db-ad17-3ffc85215f1e",
+      "children": [
+        "4f2b2cd3-4997-4256-8f4c-44334ca3ea73"
+      ],
+      "role": "system",
+      "create_time": 1783140514.5355382,
+      "end_turn": false,
+      "content_type": "text",
+      "text": ""
+    },
+    "4f2b2cd3-4997-4256-8f4c-44334ca3ea73": {
+      "id": "4f2b2cd3-4997-4256-8f4c-44334ca3ea73",
+      "parent": "1919e19a-da54-4880-a385-9aef15d8811a",
+      "children": [
+        "ef53abbc-8edc-4a06-8ef9-2eac62231a51"
+      ],
+      "role": "assistant",
+      "create_time": 1783140514.7041733,
+      "end_turn": false,
+      "content_type": "model_editable_context",
+      "text": ""
+    },
+    "ef53abbc-8edc-4a06-8ef9-2eac62231a51": {
+      "id": "ef53abbc-8edc-4a06-8ef9-2eac62231a51",
+      "parent": "4f2b2cd3-4997-4256-8f4c-44334ca3ea73",
+      "children": [
+        "ef4f1c98-5467-478d-8993-d49358b33f0e"
+      ],
+      "role": "assistant",
+      "create_time": 1783140515.942522,
+      "end_turn": false,
+      "content_type": "thoughts",
+      "text": ""
+    },
+    "ef4f1c98-5467-478d-8993-d49358b33f0e": {
+      "id": "ef4f1c98-5467-478d-8993-d49358b33f0e",
+      "parent": "ef53abbc-8edc-4a06-8ef9-2eac62231a51",
+      "children": [
+        "880df662-8fc0-412e-afff-8db7e163b065"
+      ],
+      "role": "assistant",
+      "create_time": 1783140516.123232,
+      "end_turn": false,
+      "content_type": "reasoning_recap",
+      "text": ""
+    },
+    "880df662-8fc0-412e-afff-8db7e163b065": {
+      "id": "880df662-8fc0-412e-afff-8db7e163b065",
+      "parent": "ef4f1c98-5467-478d-8993-d49358b33f0e",
+      "children": [
+        "67ad1f56-3035-4593-9d57-559cc20bdebf"
+      ],
+      "role": "assistant",
+      "create_time": 1783140514.591565,
+      "end_turn": true,
+      "content_type": "text",
+      "text": "TRUEFRESH-1"
+    },
+    "67ad1f56-3035-4593-9d57-559cc20bdebf": {
+      "id": "67ad1f56-3035-4593-9d57-559cc20bdebf",
+      "parent": "880df662-8fc0-412e-afff-8db7e163b065",
+      "children": [
+        "b4bd6940-fd41-4394-9e53-23d712ce0509"
+      ],
+      "role": "user",
+      "create_time": 1783140663.976,
+      "end_turn": false,
+      "content_type": "text",
+      "text": "[User]\nReply with exactly: POSTIDLE-1"
+    },
+    "b4bd6940-fd41-4394-9e53-23d712ce0509": {
+      "id": "b4bd6940-fd41-4394-9e53-23d712ce0509",
+      "parent": "67ad1f56-3035-4593-9d57-559cc20bdebf",
+      "children": [
+        "d1c66b0e-d371-417c-9610-6c0b1d7f5f87"
+      ],
+      "role": "assistant",
+      "create_time": 1783140667.174669,
+      "end_turn": false,
+      "content_type": "thoughts",
+      "text": ""
+    },
+    "d1c66b0e-d371-417c-9610-6c0b1d7f5f87": {
+      "id": "d1c66b0e-d371-417c-9610-6c0b1d7f5f87",
+      "parent": "b4bd6940-fd41-4394-9e53-23d712ce0509",
+      "children": [
+        "101f5265-a9e7-4fb7-9d11-1cfc2b311515"
+      ],
+      "role": "assistant",
+      "create_time": 1783140667.214854,
+      "end_turn": false,
+      "content_type": "reasoning_recap",
+      "text": ""
+    },
+    "101f5265-a9e7-4fb7-9d11-1cfc2b311515": {
+      "id": "101f5265-a9e7-4fb7-9d11-1cfc2b311515",
+      "parent": "d1c66b0e-d371-417c-9610-6c0b1d7f5f87",
+      "children": [
+        "35ea46d3-5237-4aeb-8c49-4d8ec7672ba8"
+      ],
+      "role": "assistant",
+      "create_time": 1783140666.325117,
+      "end_turn": true,
+      "content_type": "text",
+      "text": "POSTIDLE-1"
+    },
+    "35ea46d3-5237-4aeb-8c49-4d8ec7672ba8": {
+      "id": "35ea46d3-5237-4aeb-8c49-4d8ec7672ba8",
+      "parent": "101f5265-a9e7-4fb7-9d11-1cfc2b311515",
+      "children": [
+        "83346724-3733-489e-bf59-d6993f3e6fdc"
+      ],
+      "role": "user",
+      "create_time": 1783140731.069,
+      "end_turn": false,
+      "content_type": "text",
+      "text": "[User]\nThink step by step. What is 17 * 23? Show your reason...[truncated]"
+    },
+    "83346724-3733-489e-bf59-d6993f3e6fdc": {
+      "id": "83346724-3733-489e-bf59-d6993f3e6fdc",
+      "parent": "35ea46d3-5237-4aeb-8c49-4d8ec7672ba8",
+      "children": [
+        "29621773-cdad-4c45-931b-d965988b03bb"
+      ],
+      "role": "assistant",
+      "create_time": 1783140734.781526,
+      "end_turn": false,
+      "content_type": "thoughts",
+      "text": ""
+    },
+    "29621773-cdad-4c45-931b-d965988b03bb": {
+      "id": "29621773-cdad-4c45-931b-d965988b03bb",
+      "parent": "83346724-3733-489e-bf59-d6993f3e6fdc",
+      "children": [
+        "7cbf6743-199b-4bad-bb4a-310e86a99373"
+      ],
+      "role": "assistant",
+      "create_time": 1783140735.552245,
+      "end_turn": false,
+      "content_type": "reasoning_recap",
+      "text": ""
+    },
+    "7cbf6743-199b-4bad-bb4a-310e86a99373": {
+      "id": "7cbf6743-199b-4bad-bb4a-310e86a99373",
+      "parent": "29621773-cdad-4c45-931b-d965988b03bb",
+      "children": [],
+      "role": "assistant",
+      "create_time": 1783140733.290837,
+      "end_turn": true,
+      "content_type": "text",
+      "text": "17 \u00d7 23 = 17 \u00d7 (20 + 3)\n\n17 \u00d7 20 = 340  \n17 \u00d7 3 = 51  \n\n340 ...[truncated]"
+    }
+  },
+  "current_node": "7cbf6743-199b-4bad-bb4a-310e86a99373",
+  "_meta": {
+    "source": "real captured ChatGPT backend mapping",
+    "captured": "2026-07-04",
+    "conversation_id": "6a4890a0-584c-83eb-8429-becab7336e5f",
+    "node_count": 19,
+    "has_reasoning_recap": true,
+    "has_tool_use": false,
+    "roles": {
+      "?": 1,
+      "system": 4,
+      "user": 4,
+      "assistant": 10
+    },
+    "content_types": {
+      "?": 1,
+      "text": 10,
+      "user_editable_context": 1,
+      "model_editable_context": 1,
+      "thoughts": 3,
+      "reasoning_recap": 3
+    }
+  }
+}

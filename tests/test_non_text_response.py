@@ -3,7 +3,7 @@
 Verifies that image/tool-use/non-text responses don't falsely trigger the
 stall detector, that text responses stream correctly (no regression), and
 that the placeholder message surfaces when non-text content is detected
-but _fetch_text returns empty.
+but _fetch_text_for_turn returns not_ready/empty.
 """
 
 import json
@@ -15,6 +15,7 @@ import pytest
 from chatgpt_web2api.cdp_driver import (
     CDPDriver,
 )
+from chatgpt_web2api.turn_anchor import TurnEndResult, TurnTextResult
 
 
 def _make_driver():
@@ -70,7 +71,11 @@ async def test_image_response_does_not_stall(monkeypatch):
     d._js_strict = _fake_js
     d.type_message = AsyncMock()
     d.click_send = AsyncMock()
-    d._fetch_text = AsyncMock(return_value="")  # no text from API
+    # A2: image turn — selector reports non_text so the reconciliation loop
+    # breaks to the placeholder path (last_dom_text empty + had_non_text_content).
+    d._fetch_text_for_turn = AsyncMock(
+        return_value=TurnTextResult(status="non_text")
+    )
 
     chunks = []
     async for chunk in d.send_and_stream("generate an image", timeout=10000):
@@ -124,7 +129,11 @@ async def test_text_response_streams_delta_unchanged(monkeypatch):
     d._js_strict = _fake_js
     d.type_message = AsyncMock()
     d.click_send = AsyncMock()
-    d._fetch_text = AsyncMock(return_value="")
+    # A2: _fake_js has no location.href handler → conv_id never resolves →
+    # reconciliation skipped. Mapped to not_ready (faithful to old "").
+    d._fetch_text_for_turn = AsyncMock(
+        return_value=TurnTextResult(status="not_ready")
+    )
 
     chunks = []
     async for chunk in d.send_and_stream("hello", timeout=10000):
@@ -138,13 +147,14 @@ async def test_text_response_streams_delta_unchanged(monkeypatch):
     assert chunks[-1].finish_reason == "stop"
 
 
-# ── 3. _fetch_text empty + non-text content → placeholder ────────────
+# ── 3. _fetch_text_for_turn not_ready + non-text content → placeholder ─
 
 
 @pytest.mark.asyncio
 async def test_placeholder_on_empty_fetch_with_non_text_content(monkeypatch):
-    """When Phase-2 detects non-text content (html_len > 50) but _fetch_text
-    returns empty, the reconcile should yield a placeholder message."""
+    """When Phase-2 detects non-text content (html_len > 50) but
+    _fetch_text_for_turn returns not_ready, the reconcile should yield a
+    placeholder message."""
     d = _make_driver()
     t = [0.0]
     monkeypatch.setattr("chatgpt_web2api.cdp_driver.time.monotonic", lambda: t[0])
@@ -180,11 +190,15 @@ async def test_placeholder_on_empty_fetch_with_non_text_content(monkeypatch):
     d._js_strict = _fake_js
     d.type_message = AsyncMock()
     d.click_send = AsyncMock()
-    d._fetch_text = AsyncMock(return_value="")  # API returns no text
+    # A2: non-text turn (html_len=200>50 → had_non_text_content). Selector
+    # reports non_text → reconciliation breaks to the placeholder path.
+    d._fetch_text_for_turn = AsyncMock(
+        return_value=TurnTextResult(status="non_text")
+    )
     # Updated for #12: backend end_turn is primary when conv_id is available.
     # This test's URL resolves to /c/test-conv-123, so the backend is consulted.
     # end_turn confirms completion once the non-text content is present.
-    d._fetch_end_turn = AsyncMock(return_value=True)
+    d._fetch_end_turn_for_turn = AsyncMock(return_value=TurnEndResult(status="matched"))
 
     chunks = []
     async for chunk in d.send_and_stream("generate image", timeout=10000):

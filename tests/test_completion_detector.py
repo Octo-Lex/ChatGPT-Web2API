@@ -31,6 +31,7 @@ from chatgpt_web2api.completion_detector import (
     PHASE_STALL_SECONDS,
     CompletionDetector,
 )
+from chatgpt_web2api.turn_anchor import TurnAnchor, TurnEndResult
 
 
 def _make_detector():
@@ -40,7 +41,7 @@ def _make_detector():
     driver = MagicMock()
     driver._current_conv_id = None
     driver._js_strict = AsyncMock(return_value="")
-    driver._fetch_end_turn = AsyncMock(return_value=False)
+    driver._fetch_end_turn_for_turn = AsyncMock(return_value=TurnEndResult(status="not_ready"))
     driver._get_live_conversation_id_best_effort = AsyncMock(return_value="")
     return CompletionDetector(driver), driver
 
@@ -122,7 +123,7 @@ def test_per_call_results_reset_on_each_call():
         return "1"  # assistant-node count poll
 
     driver._js_strict = fake_js
-    driver._fetch_end_turn = AsyncMock(return_value=True)
+    driver._fetch_end_turn_for_turn = AsyncMock(return_value=TurnEndResult(status="matched"))
     # Provide a conv_id so the backend end_turn primary signal is eligible
     # (guard requires conv_id_for_check); without it the loop has no
     # completion path and would run to the timeout.
@@ -131,7 +132,10 @@ def test_per_call_results_reset_on_each_call():
     import asyncio
 
     async def drain():
-        async for _ in detector.stream_until_complete(initial_count=0, timeout=5):
+        async for _ in detector.stream_until_complete(
+            initial_count=0, timeout=5,
+            turn_anchor=TurnAnchor(sent_text="test", mode="fresh_chat"),
+        ):
             pass
 
     asyncio.run(drain())
@@ -171,7 +175,7 @@ async def test_detector_routes_js_through_driver():
     """The detector must call self._driver._js_strict, NOT a local copy — so
     driver-side monkeypatches (used across the test suite) still intercept."""
     detector, driver = _make_detector()
-    driver._fetch_end_turn = AsyncMock(return_value=True)
+    driver._fetch_end_turn_for_turn = AsyncMock(return_value=TurnEndResult(status="matched"))
     # Discriminate by JS expression: body scan -> JSON, count -> "1" (exceeds
     # initial_count=0 so Phase-1 breaks), poll -> completed payload WITH text so
     # the backend end_turn strict-content guard can fire and end the loop.
@@ -188,16 +192,19 @@ async def test_detector_routes_js_through_driver():
         return "1"
 
     driver._js_strict = fake_js
-    driver._fetch_end_turn = AsyncMock(return_value=True)
+    driver._fetch_end_turn_for_turn = AsyncMock(return_value=TurnEndResult(status="matched"))
     # Provide conv_id so the backend end_turn primary signal is eligible and
     # the loop completes (otherwise no completion path → runs to timeout).
     driver._get_live_conversation_id_best_effort = AsyncMock(return_value="conv-1")
     seen = []
-    async for chunk in detector.stream_until_complete(initial_count=0, timeout=10000):
+    async for chunk in detector.stream_until_complete(
+        initial_count=0, timeout=10000,
+        turn_anchor=TurnAnchor(sent_text="test", mode="fresh_chat"),
+    ):
         seen.append(chunk)
     assert js_calls["n"] >= 1, "detector must reach transport via _driver._js_strict"
-    assert driver._fetch_end_turn.await_count >= 1, (
-        "detector must reach backend via _driver._fetch_end_turn"
+    assert driver._fetch_end_turn_for_turn.await_count >= 1, (
+        "detector must reach backend via _driver._fetch_end_turn_for_turn"
     )
 
 

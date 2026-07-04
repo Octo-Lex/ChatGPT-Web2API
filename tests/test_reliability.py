@@ -17,6 +17,7 @@ from chatgpt_web2api.cdp_driver import (
     CDPDriver,
     GenerationStuckError,
 )
+from chatgpt_web2api.turn_anchor import TurnEndResult, TurnTextResult
 
 # ── Helpers ────────────────────────────────────────────────────
 
@@ -32,7 +33,8 @@ def _make_driver():
 
 def _mock_js_with_payload(d, payload_map):
     """Make d._js_with_data return values based on a lookup of (conv_id/token)
-    → response string. For _fetch_text the payload carries conv_id+token."""
+    → response string. For backend conversation fetches the payload carries
+    conv_id+token."""
 
     async def _fake(js_template, data, timeout=15):
         return payload_map.get(data.get("conv_id"), "")
@@ -104,56 +106,12 @@ async def test_read_methods_call_ensure_token_first():
     assert call_order == ["ensure_token", "fetch"], f"order: {call_order}"
 
 
-# ── 3. _fetch_text 401 raises AuthExpiredError ─────────────────
-
-
-@pytest.mark.asyncio
-async def test_fetch_text_401_raises_auth_expired():
-    d = _make_driver()
-
-    async def _fake(js_template, data, timeout=15):
-        return '{"__status": 401}'
-
-    d._js_with_data_strict = _fake
-    d.ensure_token = AsyncMock(return_value="tok")
-    with pytest.raises(AuthExpiredError):
-        await d._fetch_text("conv-1")
-
-
-@pytest.mark.asyncio
-async def test_fetch_text_404_raises_runtime_error():
-    """A persistent 404 (bound exhausted) surfaces as RuntimeError with the
-    code. The bounded retry in backend_client._fetch_text is exercised, but
-    backoff is zeroed here to keep the test fast."""
-    d = _make_driver()
-    calls = {"n": 0}
-
-    async def _fake(js_template, data, timeout=15):
-        calls["n"] += 1
-        return '{"__status": 404}'
-
-    d._js_with_data_strict = _fake
-    d.ensure_token = AsyncMock(return_value="tok")
-    # Zero the backoff so the bound is exhausted without real sleeping.
-    d._backend_client._FETCH_TEXT_404_BACKOFF_SECONDS = 0.0
-    with pytest.raises(RuntimeError) as ei:
-        await d._fetch_text("conv-1")
-    assert "404" in str(ei.value)
-    # Bound exhausted → one fetch per attempt.
-    assert calls["n"] == d._backend_client._FETCH_TEXT_404_MAX_ATTEMPTS
-
-
-@pytest.mark.asyncio
-async def test_fetch_text_valid_body_returns_text():
-    d = _make_driver()
-
-    async def _fake(js_template, data, timeout=15):
-        return "the assistant reply text"
-
-    d._js_with_data_strict = _fake
-    d.ensure_token = AsyncMock(return_value="tok")
-    result = await d._fetch_text("conv-1")
-    assert result == "the assistant reply text"
+# ── 3. (removed) legacy _fetch_text status-decode tests ─────────
+#
+# The uncorrelated ``_fetch_text`` / ``_fetch_end_turn`` methods were deleted
+# in the A2 Step 9/10 cleanup; the same status-decode + breaker behavior now
+# lives in ``_fetch_recent_conversation_projection`` and is exercised via the
+# A2 anchored fetchers (``_fetch_text_for_turn`` / ``_fetch_end_turn_for_turn``).
 
 
 # ── 4. Phase-1 stall (node count never changes) ────────────────
@@ -238,7 +196,7 @@ async def test_phase2_stall_raises_generation_stuck(monkeypatch):
     d._js_strict = _fake_js
     d.type_message = AsyncMock()
     d.click_send = AsyncMock()
-    d._fetch_text = AsyncMock(return_value="")
+    d._fetch_text_for_turn = AsyncMock(return_value=TurnTextResult(status="not_ready"))
 
     with pytest.raises(GenerationStuckError) as ei:
         async for _ in d.send_and_stream("hi", timeout=10000):
@@ -283,7 +241,9 @@ async def test_slow_appear_succeeds_without_cap(monkeypatch):
     d._js_strict = _fake_js
     d.type_message = AsyncMock()
     d.click_send = AsyncMock()
-    d._fetch_text = AsyncMock(return_value="done")
+    d._fetch_text_for_turn = AsyncMock(
+        return_value=TurnTextResult(status="matched", text="done")
+    )
 
     chunks = []
     async for chunk in d.send_and_stream("hi", timeout=10000):
@@ -325,7 +285,9 @@ async def test_progressing_generation_does_not_raise(monkeypatch):
     d._js_strict = _fake_js
     d.type_message = AsyncMock()
     d.click_send = AsyncMock()
-    d._fetch_text = AsyncMock(return_value=state["text"])
+    d._fetch_text_for_turn = AsyncMock(
+        return_value=TurnTextResult(status="matched", text=state["text"])
+    )
 
     chunks = []
     async for chunk in d.send_and_stream("hi", timeout=100000):
@@ -344,13 +306,14 @@ async def test_thinking_model_streams_during_answer_phase(monkeypatch):
     The old `if is_thinking / elif text-changed` structure meant
     is_thinking=true suppressed ALL delta emission — freezing
     last_dom_text="" and producing an empty response whenever the
-    _fetch_text fallback lagged (the common case for thinking models,
-    whose conversation-API text commits late).
+    backend final-text fetch lagged (the common case for thinking
+    models, whose conversation-API text commits late).
 
     Simulates the post-reasoning gap: is_thinking=true throughout
     (.result-thinking lingers after reasoning ends), answer text grows
-    each poll, has_action fires at the end. With _fetch_text mocked
-    empty (fallback lag), the answer MUST still arrive via deltas."""
+    each poll, has_action fires at the end. With _fetch_text_for_turn
+    mocked not_ready (fallback lag), the answer MUST still arrive via
+    deltas."""
     d = _make_driver()
     t = [0.0]
     monkeypatch.setattr("chatgpt_web2api.cdp_driver.time.monotonic", lambda: t[0])
@@ -386,7 +349,9 @@ async def test_thinking_model_streams_during_answer_phase(monkeypatch):
     d._js_strict = _fake_js
     d.type_message = AsyncMock()
     d.click_send = AsyncMock()
-    d._fetch_text = AsyncMock(return_value="")  # fallback lag → empty
+    d._fetch_text_for_turn = AsyncMock(
+        return_value=TurnTextResult(status="not_ready")
+    )  # fallback lag → empty
 
     chunks = []
     async for chunk in d.send_and_stream("think then answer", timeout=10000):
@@ -436,16 +401,18 @@ async def test_phase2_end_turn_fallback_completes_when_dom_action_missing(monkey
     d._js_strict = _fake_js
     d.type_message = AsyncMock()
     d.click_send = AsyncMock()
-    d._fetch_text = AsyncMock(return_value="the full answer")
+    d._fetch_text_for_turn = AsyncMock(
+        return_value=TurnTextResult(status="matched", text="the full answer")
+    )
     # Backend says end_turn is true on first check → completes.
-    d._fetch_end_turn = AsyncMock(return_value=True)
+    d._fetch_end_turn_for_turn = AsyncMock(return_value=TurnEndResult(status="matched"))
     end_turn_calls["n"] = 0
 
-    async def _counting_end_turn(cid):
+    async def _counting_end_turn(cid, anchor, *, had_non_text_content=False):
         end_turn_calls["n"] += 1
-        return True
+        return TurnEndResult(status="matched")
 
-    d._fetch_end_turn = _counting_end_turn
+    d._fetch_end_turn_for_turn = _counting_end_turn
 
     chunks = []
     async for chunk in d.send_and_stream("hi", timeout=10000):
@@ -484,13 +451,13 @@ async def test_phase2_end_turn_fallback_ignored_on_fetch_failure(monkeypatch):
     d._js_strict = _fake_js
     d.type_message = AsyncMock()
     d.click_send = AsyncMock()
-    d._fetch_text = AsyncMock(return_value="")
+    d._fetch_text_for_turn = AsyncMock(return_value=TurnTextResult(status="not_ready"))
 
     # Backend fetch raises — must be swallowed, not propagated.
-    async def _raising_end_turn(cid):
+    async def _raising_end_turn(cid, anchor, *, had_non_text_content=False):
         raise RuntimeError("backend blew up")
 
-    d._fetch_end_turn = _raising_end_turn
+    d._fetch_end_turn_for_turn = _raising_end_turn
 
     # Should still raise GenerationStuckError (stall), NOT the backend error.
     with pytest.raises(GenerationStuckError) as ei:
@@ -530,13 +497,13 @@ async def test_phase2_end_turn_fallback_skipped_when_no_text(monkeypatch):
     d._js_strict = _fake_js
     d.type_message = AsyncMock()
     d.click_send = AsyncMock()
-    d._fetch_text = AsyncMock(return_value="")
+    d._fetch_text_for_turn = AsyncMock(return_value=TurnTextResult(status="not_ready"))
 
-    async def _counting_end_turn(cid):
+    async def _counting_end_turn(cid, anchor, *, had_non_text_content=False):
         end_turn_calls["n"] += 1
-        return True
+        return TurnEndResult(status="matched")
 
-    d._fetch_end_turn = _counting_end_turn
+    d._fetch_end_turn_for_turn = _counting_end_turn
 
     with pytest.raises(GenerationStuckError):
         async for _ in d.send_and_stream("hi", timeout=10000):
@@ -586,13 +553,15 @@ async def test_phase2_backend_end_turn_is_primary_over_dom(monkeypatch):
     d._js_strict = _fake_js
     d.type_message = AsyncMock()
     d.click_send = AsyncMock()
-    d._fetch_text = AsyncMock(return_value="answer")
+    d._fetch_text_for_turn = AsyncMock(
+        return_value=TurnTextResult(status="matched", text="answer")
+    )
 
-    async def _counting_end_turn(cid):
+    async def _counting_end_turn(cid, anchor, *, had_non_text_content=False):
         end_turn_calls["n"] += 1
-        return True
+        return TurnEndResult(status="matched")
 
-    d._fetch_end_turn = _counting_end_turn
+    d._fetch_end_turn_for_turn = _counting_end_turn
 
     async for _ in d.send_and_stream("hi", timeout=10000):
         pass
@@ -658,14 +627,18 @@ async def test_thinking_placeholder_does_not_stall_past_90s(monkeypatch):
     d._js_strict = _fake_js
     d.type_message = AsyncMock()
     d.click_send = AsyncMock()
-    d._fetch_text = AsyncMock(return_value="the answer")
+    d._fetch_text_for_turn = AsyncMock(
+        return_value=TurnTextResult(status="matched", text="the answer")
+    )
 
     # Backend says not-done during thinking, then done once the answer appears.
-    async def _end_turn(cid):
+    async def _end_turn(cid, anchor, *, had_non_text_content=False):
         state["end_turn_calls"] += 1
-        return state["phase2_polls"] > 10
+        return TurnEndResult(
+            status="matched" if state["phase2_polls"] > 10 else "not_ready"
+        )
 
-    d._fetch_end_turn = _end_turn
+    d._fetch_end_turn_for_turn = _end_turn
 
     chunks = []
     async for chunk in d.send_and_stream("think hard", timeout=10000):
@@ -710,8 +683,8 @@ async def test_saw_thinking_unlocks_fallback_but_empty_end_turn_does_not_finish(
     d._js_strict = _fake_js
     d.type_message = AsyncMock()
     d.click_send = AsyncMock()
-    d._fetch_text = AsyncMock(return_value="")
-    d._fetch_end_turn = AsyncMock(return_value=True)
+    d._fetch_text_for_turn = AsyncMock(return_value=TurnTextResult(status="not_ready"))
+    d._fetch_end_turn_for_turn = AsyncMock(return_value=TurnEndResult(status="matched"))
 
     # is_thinking keeps resetting the stall clock, and the strict content
     # guard prevents completing on empty. The loop runs to the deadline and
@@ -762,8 +735,10 @@ async def test_saw_thinking_with_end_turn_and_content_finishes(monkeypatch):
     d._js_strict = _fake_js
     d.type_message = AsyncMock()
     d.click_send = AsyncMock()
-    d._fetch_text = AsyncMock(return_value="the full answer")
-    d._fetch_end_turn = AsyncMock(return_value=True)
+    d._fetch_text_for_turn = AsyncMock(
+        return_value=TurnTextResult(status="matched", text="the full answer")
+    )
+    d._fetch_end_turn_for_turn = AsyncMock(return_value=TurnEndResult(status="matched"))
 
     chunks = []
     async for chunk in d.send_and_stream("think then answer", timeout=10000):

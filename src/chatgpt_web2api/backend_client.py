@@ -4,8 +4,9 @@ Phase 5 PR1 extraction (no behavior change). Owns the method bodies that talk
 to ChatGPT's backend-api over HTTP via ``Runtime.evaluate``:
 
   - token / session lifecycle (``_refresh_token``, ``ensure_token``, ``recover_auth``)
-  - conversation fetch (``_fetch_text``, ``_fetch_end_turn``, conversation-id
-    resolution, ``_check_auth_in_raw``)
+  - conversation fetch (``_fetch_text_for_turn`` /
+    ``_fetch_end_turn_for_turn`` / ``_fetch_recent_conversation_projection``,
+    conversation-id resolution, ``_check_auth_in_raw``)
   - backend-api read/mutate (models, projects, conversations, memories, gpts)
 
 The driver-reference collaborator seam: ``BackendClient`` holds a reference to
@@ -44,12 +45,13 @@ logger = logging.getLogger(__name__)
 
 
 class _Transient404(Exception):
-    """Sentinel raised by ``_fetch_text_once`` on a backend 404.
+    """Sentinel raised by ``_fetch_recent_conversation_projection`` on a backend 404.
 
-    Internal to ``_fetch_text``'s bounded retry loop — never escapes this
-    module. The 404 is a transient race (conversation not yet persisted
-    immediately after a send), NOT an auth failure or persistent backend
-    fault, so it is deliberately not modeled as a breaker signal.
+    Internal to this module — caught and swallowed by the
+    ``_fetch_text_for_turn`` / ``_fetch_end_turn_for_turn`` wrappers, so it
+    never escapes. The 404 is a transient race (conversation not yet
+    persisted immediately after a send), NOT an auth failure or persistent
+    backend fault, so it is deliberately not modeled as a breaker signal.
     """
 
 
@@ -146,7 +148,8 @@ class BackendClient:
         Returns the token. The TTL guard (TOKEN_TTL_SECONDS) catches expiry
         well before the real JWT lifetime; callers should invoke this before
         any /backend-api/* fetch so a stale session surfaces as
-        AuthExpiredError (via _fetch_text) rather than silent empty data.
+        AuthExpiredError (via ``_fetch_recent_conversation_projection`` and
+        the other /backend-api fetchers) rather than silent empty data.
 
         Reaches ``_refresh_token`` through the driver delegator so test
         monkeypatches of ``driver._refresh_token`` intercept. This is NOT
@@ -214,143 +217,6 @@ class BackendClient:
 
     # ── Conversation fetch ────────────────────────────────────
 
-    # Bounded retry for the transient 404 returned by the backend-api
-    # immediately after a send, before the just-created conversation is
-    # persisted server-side. This is a transient race, NOT an auth failure or
-    # a persistent backend fault, so it is deliberately NOT a breaker signal
-    # (follow-up C decides separately whether persistent 404/5xx should ever
-    # trip a breaker). The bound stays small so a genuinely-missing
-    # conversation surfaces quickly.
-    _FETCH_TEXT_404_MAX_ATTEMPTS = 4
-    _FETCH_TEXT_404_BACKOFF_SECONDS = 0.5
-
-    async def _fetch_text(self, conversation_id: str) -> str:
-        """Fetch the latest assistant text from the conversation API.
-
-        Non-OK responses are encoded by the JS as ``{"__status": <code>}``
-        rather than ``''`` so Python can distinguish an auth failure (401 →
-        AuthExpiredError) from a missing conversation (404) or a network
-        error. This parse-and-raise happens here, before any return reaches
-        the caller, so callers never see a raw status blob as text.
-
-        A 404 specifically is treated as a transient race and retried a
-        bounded number of times: the backend-api returns 404 immediately
-        after a send while the just-created conversation is still
-        propagating server-side. Only 404 is retried — 401 still raises
-        ``AuthExpiredError`` immediately (with breaker trip) and any other
-        non-OK status still raises ``RuntimeError`` immediately. After the
-        retry bound is exhausted the 404 surfaces as ``RuntimeError`` so
-        callers see the same type they did pre-retry.
-
-        Picks the newest assistant text message by ``create_time`` rather than
-        trusting the API's ``current_node`` pointer: that pointer lags behind
-        on continued conversations (it still points at the previous turn right
-        after a send), which produced an off-by-one where request N returned
-        request N-1's text. The newest-by-create-time selection is immune to
-        that lag.
-        """
-        from .cdp_driver import CDPJSError
-
-        last_error: Exception | None = None
-        for attempt in range(1, self._FETCH_TEXT_404_MAX_ATTEMPTS + 1):
-            try:
-                return await self._fetch_text_once(conversation_id)
-            except _Transient404 as e:
-                # Transient race — retry after a short backoff unless this was
-                # the final attempt, in which case it falls through to the
-                # RuntimeError raise below.
-                last_error = e
-                if attempt < self._FETCH_TEXT_404_MAX_ATTEMPTS:
-                    logger.debug(
-                        "_fetch_text 404 for %s (attempt %d/%d), retrying",
-                        conversation_id,
-                        attempt,
-                        self._FETCH_TEXT_404_MAX_ATTEMPTS,
-                    )
-                    await asyncio.sleep(self._FETCH_TEXT_404_BACKOFF_SECONDS)
-                continue
-            except CDPJSError as e:
-                # JS transport failure: not a 404 race. Preserve the pre-retry
-                # behavior of swallowing it and returning "" (callers retry
-                # the whole send poll loop).
-                logger.debug("_fetch_text JS failed: %s", e)
-                return ""
-        # Bound exhausted — surface the 404 as RuntimeError, matching the
-        # pre-retry behavior callers already handle.
-        raise RuntimeError(
-            f"_fetch_text HTTP 404 for {conversation_id} "
-            f"after {self._FETCH_TEXT_404_MAX_ATTEMPTS} attempts"
-        ) from last_error
-
-    async def _fetch_text_once(self, conversation_id: str) -> str:
-        """Single backend-api conversation fetch + status decode.
-
-        Returns the assistant text on success, raises ``_Transient404`` on a
-        404 (so the bounded retry loop in ``_fetch_text`` can catch it),
-        raises ``AuthExpiredError`` (with breaker trip) on 401, and raises
-        ``RuntimeError`` for any other non-OK status. Empty/blank bodies and
-        JS-transport failures are handled by the caller.
-
-        Status decode (the ``__status`` blob shape) lives here so it runs
-        before any text reaches the caller regardless of the retry wrapper.
-        """
-        # Imported lazily to avoid a module-load circular dependency.
-        from .cdp_driver import AuthExpiredError
-
-        d = self._driver
-        await self._driver.ensure_token()
-        raw = await d._js_with_data_strict(
-            "(async function() {"
-            "  try {"
-            "    var r = await fetch('/backend-api/conversation/' + __D.conv_id + '?offset=0&limit=5', {"
-            "      headers: {'Authorization': 'Bearer ' + __D.token}"
-            "    });"
-            "    if (!r.ok) return JSON.stringify({__status: r.status});"
-            "    var conv = await r.json();"
-            "    var mapping = conv.mapping || {};"
-            # Find the NEWEST assistant text message by create_time.
-            # current_node lags on continued conversations, so we cannot
-            # trust it to point at the turn we just sent.
-            "    var best = null;"
-            "    var bestTime = -1;"
-            "    for (var k in mapping) {"
-            "      var n = mapping[k];"
-            "      var m = n.message;"
-            "      if (!m || !m.author || m.author.role !== 'assistant') continue;"
-            "      if (!m.content || m.content.content_type !== 'text') continue;"
-            "      var parts = m.content.parts || [];"
-            "      if (!parts.length || !parts.some(function(p){ return String(p).trim(); })) continue;"
-            "      var t = m.create_time || 0;"
-            "      if (t >= bestTime) { bestTime = t; best = parts.filter(function(p){ return String(p).trim(); }).join('\\n'); }"
-            "    }"
-            "    return best || '';"
-            "  } catch(e) { return ''; }"
-            "})()",
-            {"conv_id": conversation_id, "token": d._access_token},
-            timeout=15,
-        )
-        if not raw:
-            return ""
-        # Detect the status-blob shape (non-OK response) and raise appropriately.
-        # Cheap pre-check before json.loads to avoid parsing every valid text body.
-        if raw.startswith('{"__status"') or raw.startswith('{ "__status"'):
-            try:
-                payload = json.loads(raw)
-                status = payload.get("__status")
-            except (json.JSONDecodeError, TypeError):
-                status = None
-            if status == 401:
-                if d._breakers:
-                    d._breakers.trip(BreakerKind.AUTH_EXPIRED, "HTTP 401 from backend-api")
-                raise AuthExpiredError()
-            if status == 404:
-                # Transient race: conversation not yet persisted after send.
-                # The bounded retry in _fetch_text catches this.
-                raise _Transient404(conversation_id)
-            if status is not None:
-                raise RuntimeError(f"_fetch_text HTTP {status} for {conversation_id}")
-        return raw
-
     async def _conversation_id_from_url(self) -> str:
         """Parse the conversation id from the live tab's ``location.href``.
 
@@ -388,58 +254,118 @@ class BackendClient:
             return self._driver._current_conv_id
         return await self._conversation_id_from_url()
 
-    async def _fetch_end_turn(self, conversation_id: str) -> bool:
-        """Backend secondary completion signal: is the latest assistant TEXT
-        node marked ``end_turn === true``?
+    # ── A2: Anchored turn-correlation fetchers ─────────────────
+    #
+    # The projection JS (``backend_projection.CONVERSATION_PROJECTION_JS``)
+    # fetches the conversation mapping and projects it to a compact skeleton
+    # schema; the pure-Python selectors (``turn_anchor.select_*``) correlate
+    # against the anchor captured by the driver/IdentityListener.
+    #
+    # Status-decode convention: 401 → AuthExpiredError+trip, 404 →
+    # _Transient404 (transient race, swallowed by the wrappers below),
+    # other non-OK → RuntimeError, transport failure → fetch_failed status.
 
-        A fallback for the Phase-2 DOM completion detector: if the action-
-        button selector drifts again (as it did when ChatGPT moved the buttons
-        to a sibling container), the DOM ``has_action`` stays false forever
-        and the loop stalls. This reads the conversation API and checks the
-        terminal flag on the newest assistant text node — the same
-        newest-by-create-time selection ``_fetch_text`` uses (NOT current_node,
-        which lags on continued conversations, and NOT reasoning_recap nodes,
-        which carry empty text).
+    async def _fetch_recent_conversation_projection(
+        self, conversation_id: str
+    ) -> dict:
+        """Fetch and project the recent conversation mapping.
 
-        Returns False on ANY failure (fetch error, parse error, no assistant
-        text node, end_turn falsy). Callers treat False as "not confirmed,
-        keep polling DOM" — this is defense-in-depth, never the sole signal.
+        Executes ``CONVERSATION_PROJECTION_JS`` via the driver's
+        ``_js_with_data_strict``. Returns the projected dict
+        (``{"nodes": {...}, "current_node": ...}``). Raises ``AuthExpiredError``
+        on 401 (with breaker trip), ``_Transient404`` on 404, ``RuntimeError``
+        on other non-OK status, and ``CDPJSError`` on transport failure.
         """
-        from .cdp_driver import CDPJSError
+        from .backend_projection import CONVERSATION_PROJECTION_JS, TURN_PROJECTION_LIMIT
+        from .cdp_driver import AuthExpiredError, CDPJSError
 
         d = self._driver
         await self._driver.ensure_token()
+        raw = await d._js_with_data_strict(
+            CONVERSATION_PROJECTION_JS,
+            {
+                "conv_id": conversation_id,
+                "token": d._access_token,
+                "limit": TURN_PROJECTION_LIMIT,
+            },
+            timeout=15,
+        )
+        if not raw:
+            raise CDPJSError("projection returned empty")
+        # Status-decode (the ``__status`` blob shape).
+        if raw.startswith('{"__status"') or raw.startswith('{ "__status"'):
+            try:
+                payload = json.loads(raw)
+                status = payload.get("__status")
+            except (json.JSONDecodeError, TypeError):
+                status = None
+            if status == 401:
+                if d._breakers:
+                    d._breakers.trip(BreakerKind.AUTH_EXPIRED, "HTTP 401 from backend-api")
+                raise AuthExpiredError()
+            if status == 404:
+                raise _Transient404(conversation_id)
+            if status is not None:
+                raise RuntimeError(f"projection HTTP {status} for {conversation_id}")
+        # Parse the projected mapping.
         try:
-            raw = await d._js_with_data_strict(
-                "(async function() {"
-                "  try {"
-                "    var r = await fetch('/backend-api/conversation/' + __D.conv_id + '?offset=0&limit=5', {"
-                "      headers: {'Authorization': 'Bearer ' + __D.token}"
-                "    });"
-                "    if (!r.ok) return 'false';"
-                "    var conv = await r.json();"
-                "    var mapping = conv.mapping || {};"
-                # Newest assistant TEXT node by create_time (mirrors
-                # _fetch_text: current_node lags; reasoning_recap has no text).
-                "    var bestTime = -1; var bestEnd = false;"
-                "    for (var k in mapping) {"
-                "      var n = mapping[k]; var m = n.message;"
-                "      if (!m || !m.author || m.author.role !== 'assistant') continue;"
-                "      if (!m.content || m.content.content_type !== 'text') continue;"
-                "      var parts = m.content.parts || [];"
-                "      if (!parts.length || !parts.some(function(p){ return String(p).trim(); })) continue;"
-                "      var t = m.create_time || 0;"
-                "      if (t >= bestTime) { bestTime = t; bestEnd = !!m.end_turn; }"
-                "    }"
-                "    return bestEnd ? 'true' : 'false';"
-                "  } catch(e) { return 'false'; }"
-                "})()",
-                {"conv_id": conversation_id, "token": d._access_token},
-                timeout=15,
+            return json.loads(raw)
+        except (json.JSONDecodeError, TypeError) as e:
+            raise CDPJSError(f"projection returned unparseable JSON: {e}") from e
+
+    async def _fetch_text_for_turn(
+        self, conversation_id: str, anchor
+    ):
+        """Anchored final-text fetch for one turn.
+
+        Fetches the projected mapping and runs ``select_text_for_turn`` to
+        resolve the terminal assistant text for the submitted turn. Returns a
+        ``TurnTextResult`` with rich status for diagnostics.
+
+        Transport failures map to ``fetch_failed`` (caller keeps polling);
+        auth failures propagate as ``AuthExpiredError`` (never degrades).
+        """
+        from .cdp_driver import AuthExpiredError, CDPJSError
+        from .turn_anchor import TurnTextResult, select_text_for_turn
+
+        try:
+            mapping = await self._fetch_recent_conversation_projection(conversation_id)
+            return select_text_for_turn(mapping, anchor)
+        except AuthExpiredError:
+            raise  # hard fail — never degrade on auth
+        except _Transient404:
+            # Transient race — mapping not yet propagated. Treat as not_ready.
+            return TurnTextResult("not_ready", diagnostic={"reason": "transient_404"})
+        except (CDPJSError, RuntimeError) as e:
+            # Transport/backend failure — caller keeps polling.
+            return TurnTextResult("fetch_failed", diagnostic={"error": str(e)})
+
+    async def _fetch_end_turn_for_turn(
+        self, conversation_id: str, anchor, *, had_non_text_content: bool
+    ):
+        """Anchored completion-status fetch for one turn.
+
+        Returns a ``TurnEndResult`` with internal status. The caller (detector)
+        collapses to tri-state via ``collapse_to_end_turn_status``.
+
+        ``had_non_text_content`` is the DOM-derived flag passed IN so the
+        content-guard decision lives in the selector where the correlated
+        node identity is known (ChatGPT round 4 refinement).
+        """
+        from .cdp_driver import AuthExpiredError, CDPJSError
+        from .turn_anchor import TurnEndResult, select_end_turn_for_turn
+
+        try:
+            mapping = await self._fetch_recent_conversation_projection(conversation_id)
+            return select_end_turn_for_turn(
+                mapping, anchor, had_non_text_content=had_non_text_content
             )
-        except CDPJSError:
-            return False
-        return raw == "true"
+        except AuthExpiredError:
+            raise  # hard fail — never degrade on auth
+        except _Transient404:
+            return TurnEndResult("not_ready", diagnostic={"reason": "transient_404"})
+        except (CDPJSError, RuntimeError) as e:
+            return TurnEndResult("fetch_failed", diagnostic={"error": str(e)})
 
     # ── Backend API: Models & Projects ─────────────────────────
 

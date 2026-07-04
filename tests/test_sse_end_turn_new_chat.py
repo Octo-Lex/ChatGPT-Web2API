@@ -23,6 +23,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from chatgpt_web2api.cdp_driver import CDPDriver
+from chatgpt_web2api.turn_anchor import TurnEndResult, TurnTextResult
 
 
 def _make_driver():
@@ -149,16 +150,20 @@ async def test_loop_resolves_conv_id_mid_loop(monkeypatch):
     d._js_strict = _phase1_then_phase2_js(state, phase2_factory=phase2)
     d.type_message = AsyncMock()
     d.click_send = AsyncMock()
-    d._fetch_text = AsyncMock(return_value="")
+    # A2: DOM streamed "Hello world. " (last_dom_text); return matched with the
+    # same text so reconciliation breaks cleanly (len == last_dom_text → no delta).
+    d._fetch_text_for_turn = AsyncMock(
+        return_value=TurnTextResult(status="matched", text="Hello world. ")
+    )
 
-    # end_turn becomes True once polled. Mocked to record the conv_id it saw.
+    # end_turn becomes matched once polled. Mocked to record the conv_id it saw.
     seen_conv_ids = []
 
-    async def _fake_end_turn(conv_id):
+    async def _fake_end_turn(conv_id, anchor, *, had_non_text_content=False):
         seen_conv_ids.append(conv_id)
-        return True
+        return TurnEndResult(status="matched")
 
-    d._fetch_end_turn = _fake_end_turn
+    d._fetch_end_turn_for_turn = _fake_end_turn
 
     chunks = []
     async for chunk in d.send_and_stream("hello", timeout=10000):
@@ -197,8 +202,12 @@ async def test_backend_end_turn_completes_with_text(monkeypatch):
     d._js_strict = _phase1_then_phase2_js(state, phase2_factory=phase2)
     d.type_message = AsyncMock()
     d.click_send = AsyncMock()
-    d._fetch_text = AsyncMock(return_value="")
-    d._fetch_end_turn = AsyncMock(return_value=True)
+    # A2: DOM streamed "Final answer." (last_dom_text); return matched with
+    # same text so reconciliation breaks cleanly (no spurious delta).
+    d._fetch_text_for_turn = AsyncMock(
+        return_value=TurnTextResult(status="matched", text="Final answer.")
+    )
+    d._fetch_end_turn_for_turn = AsyncMock(return_value=TurnEndResult(status="matched"))
 
     chunks = []
     async for chunk in d.send_and_stream("hello", timeout=10000):
@@ -207,7 +216,7 @@ async def test_backend_end_turn_completes_with_text(monkeypatch):
     deltas = [c.delta for c in chunks if c.delta]
     assert any("Final answer" in c for c in deltas), f"deltas: {deltas}"
     assert chunks[-1].finish_reason == "stop"
-    assert d._fetch_end_turn.await_count >= 1
+    assert d._fetch_end_turn_for_turn.await_count >= 1
 
 
 # ── 5. is_thinking=True does not prevent backend completion ────────────
@@ -241,8 +250,11 @@ async def test_is_thinking_does_not_block_backend_completion(monkeypatch):
     d._js_strict = _phase1_then_phase2_js(state, phase2_factory=phase2)
     d.type_message = AsyncMock()
     d.click_send = AsyncMock()
-    d._fetch_text = AsyncMock(return_value="")
-    d._fetch_end_turn = AsyncMock(return_value=True)
+    # A2: DOM streamed "Answer." (last_dom_text); return matched with same text.
+    d._fetch_text_for_turn = AsyncMock(
+        return_value=TurnTextResult(status="matched", text="Answer.")
+    )
+    d._fetch_end_turn_for_turn = AsyncMock(return_value=TurnEndResult(status="matched"))
 
     chunks = []
     async for chunk in d.send_and_stream("hello", timeout=10000):

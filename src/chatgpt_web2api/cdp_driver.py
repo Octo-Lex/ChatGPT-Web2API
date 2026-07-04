@@ -291,6 +291,16 @@ class CDPDriver:
         # CDP response routing (#7): id-keyed futures + background reader
         self._pending: dict[int, asyncio.Future] = {}
         self._reader_task: asyncio.Task | None = None
+        # A2: unsolicited CDP event dispatch table. The reader loop consults
+        # this for events without an id (Network.requestWillBeSent, etc.).
+        # Handlers must be fast and non-blocking — the reader loop is the sole
+        # ws.recv() consumer and resolves all pending command futures; heavy
+        # work must be scheduled via loop.create_task. See CDPTransport._reader_loop.
+        self._cdp_event_handlers: dict[str, callable] = {}
+        # A2: identity listener (network-event-driven UUID capture). Owned by
+        # the driver (Layer 2), attached on connect/reconnect. Lazy-imported
+        # at attach time to avoid a module-load circular dependency.
+        self._identity_listener = None
         # Tab isolation: the targetId of the tab this driver is attached to.
         # _owns_target records whether *we* created it: only tabs we created are
         # closed in close(), so a driver that adopted an existing tab (e.g.
@@ -326,13 +336,39 @@ class CDPDriver:
         # Phase 5 PR4: streaming completion detection (Phase-1 appear loop +
         # Phase-2 stream loop) extracted into CompletionDetector. Lazy import
         # for the same reason; the detector reaches through this driver for
-        # _js_strict, _fetch_end_turn, _get_live_conversation_id_best_effort,
-        # and reads _current_conv_id (read-only — never assigned by the
-        # detector). It yields delta chunks only; the terminal stop chunk and
-        # the _current_conv_id mutation stay in send_and_stream.
+        # _js_strict, _fetch_end_turn_for_turn,
+        # _get_live_conversation_id_best_effort, and reads _current_conv_id
+        # (read-only — never assigned by the detector). It yields delta chunks
+        # only; the terminal stop chunk and the _current_conv_id mutation stay
+        # in send_and_stream.
         from .completion_detector import CompletionDetector
 
         self._completion = CompletionDetector(self)
+
+    async def _attach_identity_listener(self) -> None:
+        """A2: attach (or re-attach) the identity listener on the current ws.
+
+        Called from ``connect()`` and ``reconnect()`` after the reader loop is
+        running. The listener registers its ``Network.requestWillBeSent``
+        handler on ``self._cdp_event_handlers`` and enables the Network domain
+        for POST-body capture. Best-effort: a failure logs and leaves the
+        listener unready — ``send_and_stream`` will fall back to dual-anchor
+        correlation on the next send via the pre-send health check.
+        """
+        # Lazy import to avoid the module-load circular dependency
+        # (identity_listener imports nothing from cdp_driver, but keeping
+        # the pattern consistent with BackendClient/CompletionDetector).
+        from .identity_listener import IdentityListener
+
+        if self._identity_listener is None:
+            self._identity_listener = IdentityListener(self)
+        # Re-attach is idempotent: detach clears the old handler, attach
+        # re-registers and re-enables Network on the new websocket.
+        self._identity_listener.detach()
+        try:
+            await self._identity_listener.attach()
+        except Exception as e:
+            logger.warning("identity_listener_attach_failed (will degrade to dual-anchor): %s", e)
 
     async def connect(self) -> None:
         """Connect to Chrome's CDP and authenticate.
@@ -441,6 +477,11 @@ class CDPDriver:
         )
         self._reader_task = asyncio.create_task(self._reader_loop())
         logger.info("CDP connected to Chrome")
+        # A2: attach the identity listener now that the reader loop is running.
+        # Persistent from connect — re-attached on reconnect. The listener
+        # registers its Network.requestWillBeSent handler on the dispatch
+        # table (Step 1) and enables the Network domain for POST-body capture.
+        await self._attach_identity_listener()
         # Wait for the freshly-grabbed tab to actually be on chatgpt.com before
         # fetching the token — see _wait_for_chatgpt_ready. Without this the
         # fetch races the page load and returns an empty accessToken, killing
@@ -625,6 +666,8 @@ class CDPDriver:
                 await self._wait_for_chatgpt_ready()
                 await self._refresh_token()
                 logger.info("CDP reconnected on attempt %d", attempt)
+                # A2: re-attach the identity listener on the new websocket.
+                await self._attach_identity_listener()
                 # Success: clear CDP failure history and recover a half-open
                 # breaker. Only after refresh_token succeeds — a reconnect that
                 # reopens the socket but can't auth isn't a clean recovery.
@@ -1334,106 +1377,227 @@ class CDPDriver:
         # Unreachable (the loop either returns or raises).
         raise SendReadinessError("send_baseline: exhausted retries unexpectedly")
 
+    async def _capture_pre_send_fallback_anchor(self, text: str):
+        """A2: build the pre-send fallback TurnAnchor (NO captured UUID yet).
+
+        Called between the baseline count and ``type_message``. The UUID is
+        populated AFTER ``click_send`` via ``anchor.with_captured_id(uuid)``.
+
+        Modes:
+          - ``fresh_chat``: ``_current_conv_id`` is None (new chat). Text-only
+            anchor; correlation by sent_text after conv_id resolves.
+          - ``existing_conversation``: ``_current_conv_id`` set AND backend
+            anchor fetch succeeds. Records latest user/assistant node-id/time.
+          - ``degraded_existing``: ``_current_conv_id`` set but backend anchor
+            fetch failed (transient). Falls back to sent_text + wall-clock
+            freshness. Auth failure propagates hard (never degrades).
+
+        The wall-clock (``pre_send_wall_time``) is always captured, even in
+        ``existing_conversation`` mode, so the degraded freshness floor is
+        available if the backend anchor later proves wrong.
+        """
+        import time as _time
+
+        from .turn_anchor import TurnAnchor
+
+        pre_send_wall = _time.time()
+        conv_id = self._current_conv_id
+
+        if conv_id is None:
+            # Fresh chat — no backend anchor possible until URL resolves.
+            return TurnAnchor(
+                sent_text=text, mode="fresh_chat",
+                pre_send_wall_time=pre_send_wall,
+                conversation_id_at_capture=None,
+            )
+
+        # Existing conversation — fetch the pre-send backend mapping for anchor.
+        try:
+            mapping = await self._backend_client._fetch_recent_conversation_projection(conv_id)
+            nodes = mapping.get("nodes") or {}
+            # Find latest user + assistant nodes by create_time.
+            latest_user_id, latest_user_ct = None, None
+            latest_asst_id, latest_asst_ct = None, None
+            for _nid, node in nodes.items():
+                role = node.get("role") or ""
+                ct = float(node.get("create_time") or 0)
+                if role == "user" and (latest_user_ct is None or ct > latest_user_ct):
+                    latest_user_id = node.get("id") or _nid
+                    latest_user_ct = ct
+                elif role == "assistant" and (latest_asst_ct is None or ct > latest_asst_ct):
+                    latest_asst_id = node.get("id") or _nid
+                    latest_asst_ct = ct
+            return TurnAnchor(
+                sent_text=text, mode="existing_conversation",
+                latest_user_node_id=latest_user_id,
+                latest_user_create_time=latest_user_ct,
+                latest_assistant_node_id=latest_asst_id,
+                latest_assistant_create_time=latest_asst_ct,
+                pre_send_wall_time=pre_send_wall,
+                conversation_id_at_capture=conv_id,
+            )
+        except Exception as e:
+            # Transient backend failure — degrade to wall-clock freshness.
+            # AuthExpiredError propagates (caller's responsibility).
+            from .cdp_driver import AuthExpiredError
+            if isinstance(e, AuthExpiredError):
+                raise
+            logger.warning(
+                "turn_anchor_degraded: backend anchor fetch failed for %s: %s — "
+                "using degraded_existing mode (sent_text + wall-clock freshness)",
+                conv_id, e,
+            )
+            return TurnAnchor(
+                sent_text=text, mode="degraded_existing",
+                pre_send_wall_time=pre_send_wall,
+                conversation_id_at_capture=conv_id,
+            )
+
     async def send_and_stream(self, text: str, timeout: float = 120) -> AsyncIterator[StreamChunk]:
         """Send a message and yield streaming response chunks.
 
-        This is the main high-level operation:
-        1. Count existing assistant messages
-        2. Type message
-        3. Click send
-        4. Wait for new assistant message to appear
-        5. Poll DOM for streaming text
-        6. Fetch final text from conversation API
+        A2 turn-correlation sequence (peer-reviewed, conv ``6a482cfd``):
+        1. Read assistant-count baseline (A1 fail-closed).
+        2. Health-check the identity listener; re-enable if stale.
+        3. Arm a per-send capture scope (IdentityListener).
+        4. Build a pre-send fallback anchor (existing/degraded/fresh — NO
+           captured UUID yet; the UUID only exists in the POST that
+           click_send generates).
+        5. type_message + click_send.
+        6. Wait for the IdentityListener to capture the UUID (short timeout).
+        7. Anchor = fallback.with_captured_id(uuid) if captured else fallback.
+        8. stream_until_complete(turn_anchor=anchor) + anchored reconciliation.
+        9. ALWAYS: scope.close() in finally (clears capture state on every
+           terminal path — success, timeout, exception, cancellation).
         """
-        # PR4 belt-and-suspenders: refuse to mutate the DOM in parallel mode if
-        # the driver lost its owned tab. The primary gate is the resolver/drift
-        # guard at the REST/MCP lock site; this catches any driver-level path
-        # that reaches send_and_stream without going through the lock.
+        from .identity_listener import hash_sent_text
+        from .turn_anchor import TurnReconciliationError
+
+        # PR4 belt-and-suspenders: refuse to mutate the DOM in parallel mode.
         self._assert_owned_tab_required()
-        # Count existing assistants BEFORE sending. This baseline is the
-        # completion detector's reference: Phase-1 waits for
-        # current_count > initial_count. A wrong baseline (especially 0 on a
-        # conversation that already has assistant messages) makes the detector
-        # treat a PRE-EXISTING assistant node as "new" → stale-return (the
-        # bridge returns the previous turn's text). The old fallback
-        # (`initial_count = 0` on any JS failure) was the dominant root cause
-        # of stale-return during the parallel-tabs operational validation.
-        # See: references/agent-field-notes.md §1 (stale-return).
+        # A1: count existing assistants BEFORE sending (fail-closed baseline).
         initial_count = await self._read_assistant_count_baseline()
 
-        # Type and send
-        await self.type_message(text)
-        await self.click_send()
+        # A2 Step 2: identity-listener health check.
+        capture_scope = None
+        if self._identity_listener is not None:
+            await self._identity_listener.reenable_if_stale()
 
-        # Phase 5 PR4: the Phase-1 (assistant-node appear) and Phase-2 (DOM
-        # streaming + completion-detection) loops were extracted verbatim into
-        # CompletionDetector.stream_until_complete — a delta-only async
-        # sub-generator. Re-yield its chunks with NO buffering / post-processing
-        # so the public yield sequence stays byte-equivalent to pre-extraction.
-        # The detector yields StreamChunk(delta=...) only; the terminal
-        # finish_reason="stop" chunk is emitted by the tail below. The detector
-        # raises RateLimitError / GenerationStuckError on the same conditions
-        # the inline loops did; those propagate out of the async-for unchanged.
-        async for chunk in self._completion.stream_until_complete(
-            initial_count=initial_count,
-            timeout=timeout,
-        ):
-            yield chunk
+        # A2 Step 3+4: arm capture scope + build fallback anchor.
+        # The fallback anchor captures pre-send state (backend node-ids/times
+        # or wall-clock) for dual-anchor correlation if UUID capture fails.
+        fallback_anchor = await self._capture_pre_send_fallback_anchor(text)
+        if self._identity_listener is not None and self._identity_listener.is_alive():
+            capture_scope = self._identity_listener.arm_capture_scope(
+                expected_text_hash=hash_sent_text(text),
+                conversation_id=self._current_conv_id,
+                target_id=self._target_id,
+            )
 
+        try:
+            # Type and send.
+            await self.type_message(text)
+            await self.click_send()
 
-        # Wait for URL to become /c/{id}
-        conv_id = ""
-        for _ in range(30):
-            try:
-                url = await self._js_strict("window.location.href")
-            except CDPJSError:
-                await asyncio.sleep(0.5)
-                continue
-            if "/c/" in url:
-                conv_id = url.split("/c/")[1].split("/")[0].split("?")[0]
-                break
-            await asyncio.sleep(0.5)
+            # A2 Step 6: wait for the IdentityListener to capture the UUID.
+            captured_uuid = None
+            if capture_scope is not None:
+                captured_uuid = await self._identity_listener.wait_for_captured_uuid(timeout=5.0)
 
-        if conv_id:
-            logger.info("Conversation: %s", conv_id)
-            self._current_conv_id = conv_id
-            # last_dom_text is the streamed-text baseline accumulated by the
-            # Phase-2 loop in CompletionDetector; had_non_text_content flags an
-            # image/tool-use turn. Both are surfaced as per-call results on the
-            # detector (read here; the loop owned them pre-extraction).
-            last_dom_text = self._completion.last_dom_text
-            had_non_text_content = self._completion.had_non_text_content
-            # Fetch final text from API (more reliable than DOM for thinking models)
-            for _ in range(60):
-                api_text = await self._fetch_text(conv_id)
-                if api_text and len(api_text) > len(last_dom_text):
-                    yield StreamChunk(delta=api_text[len(last_dom_text) :])
-                    last_dom_text = api_text
-                    break
-                if api_text:
+            # A2 Step 7: build the final anchor (fallback + captured UUID).
+            turn_anchor = fallback_anchor.with_captured_id(captured_uuid)
+
+            # A2 Step 8: stream + completion with the anchored turn.
+            async for chunk in self._completion.stream_until_complete(
+                initial_count=initial_count,
+                timeout=timeout,
+                turn_anchor=turn_anchor,
+            ):
+                yield chunk
+
+            # Wait for URL to become /c/{id}
+            conv_id = ""
+            for _ in range(30):
+                try:
+                    url = await self._js_strict("window.location.href")
+                except CDPJSError:
+                    await asyncio.sleep(0.5)
+                    continue
+                if "/c/" in url:
+                    conv_id = url.split("/c/")[1].split("/")[0].split("?")[0]
                     break
                 await asyncio.sleep(0.5)
-            # If no text was captured but Phase-2 detected non-text content
-            # (image, tool-use, etc.), surface a placeholder so the agent
-            # knows something was generated and where to find it.
-            if not last_dom_text and had_non_text_content:
-                placeholder = (
-                    "[Non-text response generated (image/tool-use/etc.) — "
-                    "use get_conversation to retrieve full content.]"
-                )
-                yield StreamChunk(delta=placeholder)
+
+            if conv_id:
+                logger.info("Conversation: %s", conv_id)
+                self._current_conv_id = conv_id
+                last_dom_text = self._completion.last_dom_text
+                had_non_text_content = self._completion.had_non_text_content
+                # A2: anchored final-text reconciliation. The selector resolves
+                # the terminal assistant text for THIS turn (by captured UUID
+                # or dual-anchor fallback); stale text from a prior turn is
+                # never accepted.
+                last_status = "not_ready"
+                for _ in range(60):
+                    result = await self._fetch_text_for_turn(conv_id, turn_anchor)
+                    last_status = result.status
+                    if result.status == "matched" and result.text:
+                        if len(result.text) > len(last_dom_text):
+                            yield StreamChunk(delta=result.text[len(last_dom_text):])
+                            last_dom_text = result.text
+                        break
+                    if result.status == "non_text":
+                        break  # placeholder path below
+                    if result.status in ("ambiguous", "degraded_not_fresh", "fetch_failed"):
+                        # Keep polling — these may resolve as the backend settles.
+                        pass
+                    # not_ready → keep polling.
+                    await asyncio.sleep(0.5)
+                else:
+                    # Loop exhausted without match — raise typed error.
+                    raise TurnReconciliationError(
+                        conversation_id=conv_id,
+                        anchor_mode=turn_anchor.mode,
+                        last_status=last_status,
+                        diagnostic={
+                            "captured_id": turn_anchor.captured_user_message_id,
+                            "had_non_text_content": had_non_text_content,
+                        },
+                    )
+                # Non-text placeholder (unchanged from pre-A2).
+                if not last_dom_text and had_non_text_content:
+                    placeholder = (
+                        "[Non-text response generated (image/tool-use/etc.) — "
+                        "use get_conversation to retrieve full content.]"
+                    )
+                    yield StreamChunk(delta=placeholder)
+        finally:
+            # A2 Step 9: ALWAYS clear the capture scope (failure-mode E).
+            if capture_scope is not None:
+                capture_scope.close()
 
         yield StreamChunk(delta="", finish_reason="stop")
 
-    async def _fetch_text(self, conversation_id: str) -> str:
-        """Fetch the latest assistant text from the conversation API.
+    async def _fetch_text_for_turn(self, conversation_id: str, anchor):
+        """A2 anchored final-text fetch. Delegated to BackendClient.
 
-        Delegated to BackendClient (Phase 5 PR1 extraction). The 401→
-        AuthExpiredError+trip behavior is preserved exactly; a transient 404
-        (conversation not yet persisted after send) is now retried a bounded
-        number of times before surfacing as RuntimeError (PR #23).
+        Returns a ``TurnTextResult`` (rich status). The detector tail in
+        ``send_and_stream`` uses this to resolve the terminal assistant text
+        for the submitted turn via the captured anchor.
         """
-        return await self._backend_client._fetch_text(conversation_id)
+        return await self._backend_client._fetch_text_for_turn(conversation_id, anchor)
+
+    async def _fetch_end_turn_for_turn(
+        self, conversation_id: str, anchor, *, had_non_text_content: bool
+    ):
+        """A2 anchored completion-status fetch. Delegated to BackendClient.
+
+        Returns a ``TurnEndResult`` (internal status); the detector collapses
+        to tri-state via ``collapse_to_end_turn_status``.
+        """
+        return await self._backend_client._fetch_end_turn_for_turn(
+            conversation_id, anchor, had_non_text_content=had_non_text_content,
+        )
 
     async def _conversation_id_from_url(self) -> str:
         """Parse the conversation id from the live tab's location.href.
@@ -1446,13 +1610,6 @@ class CDPDriver:
 
         Delegated to BackendClient (Phase 5 PR1 extraction)."""
         return await self._backend_client._get_live_conversation_id_best_effort()
-
-    async def _fetch_end_turn(self, conversation_id: str) -> bool:
-        """Backend secondary completion signal: is the latest assistant TEXT
-        node marked ``end_turn === true``?
-
-        Delegated to BackendClient (Phase 5 PR1 extraction)."""
-        return await self._backend_client._fetch_end_turn(conversation_id)
 
     async def dismiss_rate_limit(self) -> bool:
         """Dismiss ChatGPT's 'Too many requests' pop-up by clicking 'Got it'.

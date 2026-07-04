@@ -68,9 +68,19 @@ class CDPTransport:
         """Background reader: sole consumer of self._ws.recv().
 
         Routes each incoming CDP message to the matching pending Future by id.
-        Messages without an id (CDP events like Page.frameNavigated) are logged
-        at DEBUG and discarded — no caller subscribes to events today, but the
-        hook is here for future navigation-ready detection.
+        Messages without an id (unsolicited CDP events like
+        ``Network.requestWillBeSent``, ``Page.frameNavigated``) are dispatched
+        to a registered event handler if one exists for the event's method
+        name (via ``driver._cdp_event_handlers``); otherwise they are logged
+        at DEBUG and discarded.
+
+        Event-handler contract: handlers MUST be fast and non-blocking. The
+        reader loop is the sole consumer of ``ws.recv()`` and also resolves
+        all pending CDP command futures — blocking it on heavy work (e.g.
+        parsing a large POST body synchronously) risks unrelated CDP
+        timeouts. Handlers that need to do expensive work should schedule it
+        via ``loop.create_task`` and return immediately. If a handler raises,
+        it is logged and swallowed so one bad handler cannot kill the reader.
 
         On ConnectionClosed, fails all pending futures so callers don't hang.
         """
@@ -85,8 +95,23 @@ class CDPTransport:
                     continue
                 mid = msg.get("id")
                 if mid is None:
-                    # Unsolicited CDP event — no caller subscribes yet.
-                    logger.debug("CDP event: %s", msg.get("method", "?"))
+                    # Unsolicited CDP event. Dispatch to a registered handler
+                    # if one exists for this method name; else debug-log.
+                    method = msg.get("method")
+                    if method:
+                        # Generic dispatch table on the driver (Layer 2 owns
+                        # handler registration — transport is wire-only).
+                        handlers = getattr(d, "_cdp_event_handlers", None)
+                        handler = handlers.get(method) if handlers else None
+                        if handler is not None:
+                            try:
+                                handler(msg)
+                            except Exception:
+                                logger.exception(
+                                    "CDP event handler failed for %s", method
+                                )
+                        elif logger.isEnabledFor(logging.DEBUG):
+                            logger.debug("CDP event: %s", method)
                     continue
                 fut = d._pending.pop(mid, None)
                 if fut and not fut.done():
