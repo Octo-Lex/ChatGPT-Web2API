@@ -184,9 +184,11 @@ class TestExistingConversationFallback:
 # ── Selector: degraded_existing ───────────────────────────────────────────
 
 class TestDegradedExisting:
-    def test_degraded_fresh_match_accepted(self):
-        # Backend create_time is ~5s ahead of local; pre_send_wall_time=95.0.
-        # New user at 100.0 → 100.0 >= 95.0 - 8.0 = 87.0 → fresh.
+    def test_degraded_never_matches_single_fresh(self):
+        """Degraded mode never accepts a match — it only polls or times out.
+        Even a single fresh node with no stale alternatives is not sufficient
+        evidence, because we can't prove it's the NEW turn vs the previous
+        same-text turn still within the freshness window."""
         user = _user_node("u-1", "hello", 100.0, children=["a-1"])
         asst = _assistant_node("a-1", "Reply", 101.0, end_turn=True, parent="u-1")
         mapping = _mapping(("u-1", user), ("a-1", asst))
@@ -195,8 +197,8 @@ class TestDegradedExisting:
             pre_send_wall_time=95.0,
         )
         result = select_text_for_turn(mapping, anchor)
-        assert result.status == "matched"
-        assert result.text == "Reply"
+        assert result.status != "matched"
+        assert result.status == "not_ready"
 
     def test_degraded_stale_single_match_rejected(self):
         # Old user node from 80.0; pre_send_wall_time=95.0.
@@ -236,11 +238,30 @@ class TestDegradedExisting:
             pre_send_wall_time=95.0,
         )
         result = select_text_for_turn(mapping, anchor)
-        # Must NOT be "matched" — the stale alternative means we can't be
-        # certain u-new is the new turn (it might be u-old's text still
-        # propagating). Keep polling.
         assert result.status != "matched"
         assert result.status in ("not_ready", "degraded_ambiguous_with_stale")
+
+    def test_degraded_single_fresh_previous_turn_not_accepted(self):
+        """The narrowest rapid-repeat case: only ONE matching user node exists,
+        it passes the freshness floor, but it's actually the PREVIOUS turn's
+        node (the new node hasn't propagated yet). Degraded mode must NOT
+        accept this — it has insufficient evidence to prove this is the new
+        turn rather than the old one.
+        (PR #39 review — the prior implementation accepted this case.)"""
+        # Previous "continue" sent ~3s ago; backend create_time is ~5s ahead
+        # of local, so this node's create_time=100.0 is within the freshness
+        # floor of pre_send_wall_time=95.0 (100.0 >= 95.0 - 8.0 = 87.0).
+        # But the NEW "continue" send's node hasn't propagated to the backend
+        # mapping yet — there's only one match, and it's the OLD one.
+        user = _user_node("u-prev", "continue", 100.0, children=["a-prev"])
+        mapping = _mapping(("u-prev", user))
+        anchor = TurnAnchor(
+            sent_text="continue", mode="degraded_existing",
+            pre_send_wall_time=95.0,
+        )
+        result = select_text_for_turn(mapping, anchor)
+        assert result.status != "matched"
+        assert result.status == "not_ready"
 
 
 # ── Selector: fresh_chat ──────────────────────────────────────────────────

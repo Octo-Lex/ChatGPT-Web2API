@@ -338,21 +338,23 @@ def _resolve_user_node(mapping: dict, anchor: TurnAnchor) -> tuple[str | None, s
         return fresh[0][0], "text_match_with_anchor"
 
     if anchor.mode == "degraded_existing":
-        # Wall-clock freshness floor. SKEW_TOLERANCE_SECONDS is a lower-bound
-        # guard — it rejects sufficiently-old nodes but NOT rapid same-text
-        # repeats (a previous turn sent up to ~13s prior can still pass).
+        # Degraded mode is logged, not guessed. Without a captured UUID, a
+        # text match + wall-clock freshness cannot distinguish "the new node
+        # propagated" from "the previous same-text turn is still within the
+        # freshness window." So degraded_existing NEVER resolves a user node —
+        # it only classifies what it sees for diagnostics and returns not_ready.
         #
-        # PR #39 review finding #3: a single degraded text match that passes
-        # the freshness floor could still be the PREVIOUS turn's user node
-        # (if the same text was sent twice rapidly). Without a captured UUID,
-        # we cannot distinguish "the new node propagated" from "the old node
-        # is still fresh enough." So: never silently accept a single degraded
-        # match — return not_ready and let the caller keep polling. When the
-        # new node propagates, either the ID path resolves it (if the UUID
-        # arrives late) or a second match appears (→ ambiguous → poll until
-        # one is clearly newer). This makes degraded_existing a pure "keep
-        # waiting" signal, not a "best guess" — matching the design intent
-        # ("never silently pick an ambiguous candidate").
+        # The caller keeps polling. When the new node propagates, either:
+        # - the ID path resolves it (if the UUID arrives late), or
+        # - a second match appears → the caller sees ≥2 candidates → ambiguous,
+        #   and the newer-create-time one wins once both fully propagate.
+        # If neither happens within the polling budget, the caller raises
+        # TurnReconciliationError — never silently returns stale text.
+        #
+        # (PR #39 review: the prior implementation accepted a single fresh
+        # match when no stale alternatives existed. That is the exact
+        # rapid-repeat case where the previous turn's node is still within
+        # the 8-second freshness tolerance and no new node has propagated yet.)
         fresh = []
         stale = []
         for nid, node in matching:
@@ -364,19 +366,18 @@ def _resolve_user_node(mapping: dict, anchor: TurnAnchor) -> tuple[str | None, s
                     stale.append((nid, node))
             else:
                 fresh.append((nid, node))  # no wall time; can't freshness-check
-        if fresh and len(fresh) > 1:
+
+        if len(fresh) > 1:
             return None, "ambiguous"
-        if fresh and len(fresh) == 1 and not stale:
-            # Single fresh match, no stale alternatives. This is the normal
-            # case when degraded mode fires on a conversation where the same
-            # text has NOT been sent before — the single match IS the new turn.
-            # Accept it.
-            return fresh[0][0], "degraded_text_match"
-        # Either: no fresh matches (all stale → degraded_not_fresh), or
-        # single fresh + stale alternatives (can't distinguish → keep polling).
-        if not fresh:
+        if fresh and stale:
+            return None, "degraded_ambiguous_with_stale"
+        if not fresh and stale:
             return None, "degraded_not_fresh"
-        return None, "degraded_ambiguous_with_stale"
+        # Single fresh match, no stale alternatives. We still do NOT accept —
+        # we cannot prove this is the new turn rather than the previous one
+        # that happens to be fresh. Return not_ready; the caller keeps polling
+        # and either the ID path resolves or TurnReconciliationError fires.
+        return None, "degraded_insufficient_evidence"
 
     if anchor.mode == "fresh_chat":
         # Text-only; first/only match expected on a fresh chat.
