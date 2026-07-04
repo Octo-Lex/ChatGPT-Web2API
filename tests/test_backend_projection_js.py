@@ -13,10 +13,6 @@ a real captured mapping via the CDP instrumentation scripts.
 """
 from __future__ import annotations
 
-import json
-
-import pytest
-
 from chatgpt_web2api.backend_projection import (
     CONVERSATION_PROJECTION_JS,
     PROJECTED_SCHEMA_FIELDS,
@@ -73,6 +69,7 @@ class TestProjectionLimit:
         # Re-import to pick up env. (The module reads os.getenv at import.)
         monkeypatch.setenv("W2A_TURN_PROJECTION_LIMIT", "100")
         import importlib
+
         import chatgpt_web2api.backend_projection as mod
         importlib.reload(mod)
         assert mod.TURN_PROJECTION_LIMIT == 100

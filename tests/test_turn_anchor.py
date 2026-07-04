@@ -8,18 +8,14 @@ from __future__ import annotations
 import pytest
 
 from chatgpt_web2api.turn_anchor import (
-    EndTurnStatus,
-    SKEW_TOLERANCE_SECONDS,
     TurnAnchor,
     TurnEndResult,
-    TurnTextResult,
     collapse_to_end_turn_status,
     normalize_text,
     select_end_turn_for_turn,
     select_text_for_turn,
     user_text_matches_sent,
 )
-
 
 # ── Test fixtures ─────────────────────────────────────────────────────────
 

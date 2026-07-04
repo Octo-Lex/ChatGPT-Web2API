@@ -7,15 +7,12 @@ events — no real CDP/Chrome required.
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from chatgpt_web2api.identity_listener import (
-    CaptureResult,
-    CaptureScope,
     IdentityListener,
     hash_sent_text,
 )
