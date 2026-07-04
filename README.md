@@ -181,11 +181,20 @@ Expose ChatGPT to Claude Desktop, Cursor, Craft Agent, or any MCP client. Two
 transports are supported — **SSE is recommended** for persistent clients like
 ZCode; stdio is kept as a compatibility/dev mode.
 
-#### Recommended: SSE transport (one persistent server)
+#### SSE transport (persistent server; single active session until B1)
 
-SSE is recommended for ZCode because one long-lived MCP server can serve many
-client sessions without spawning a new MCP process or Chrome tab per session.
-Start the SSE server once, then point any number of clients at it.
+SSE is useful for one long-lived MCP server, but **current master does not yet
+provide per-client tab/session isolation inside one SSE process**. Multiple MCP
+clients may attach to the same SSE endpoint, but they share one MCP server, one
+`CDPDriver`, one Chrome tab, and one browser conversation surface. Running
+parallel agent sessions through the same SSE server can cause cross-session
+interference: one session may navigate, continue, or mutate the browser state
+expected by another.
+
+Until the B1 MCP session-affine tab pool is implemented and enabled, use SSE
+for a **single active agent session at a time**. For parallel agent sessions,
+use separate MCP processes with `parallel_tabs=true` and `tab_mode=owned`, or
+wait for B1.
 
 Start it (in a dedicated terminal — Chrome must already be running with an
 authenticated session, i.e. `chatgpt-web2api` started first):
@@ -207,8 +216,14 @@ Then add the client config:
 }
 ```
 
-Every client session that attaches to that URL shares the single MCP server
-and its Chrome connection — there is no per-session process or tab growth.
+Every client session that attaches to that URL currently shares the single MCP
+server and Chrome connection. This avoids per-session process growth, but it is
+**not safe for parallel independent agent sessions** until B1's session-affine
+driver/tab pool is available and explicitly enabled.
+
+> **Multi-session warning:** A2 prevents stale-return by anchoring responses to
+> the submitted turn, but it does not isolate multiple MCP SSE clients from each
+> other. Shared SSE remains a single browser-control surface today.
 
 #### Alternative: stdio transport (per-session, dev/debug)
 
