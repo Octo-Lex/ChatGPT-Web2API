@@ -687,6 +687,8 @@ _breakers: BreakerRegistry | None = None
 _lock_cdp_port: int | None = None
 # PR4/5: parallel-tabs flag (mirrors _lock_cdp_port's lifecycle — set in run_mcp).
 _parallel_tabs: bool = False
+# B1: the MCP transport ("sse" or "stdio"), set in run_mcp.
+_transport: str = "stdio"
 
 # Tools that mutate browser state — must hold the lock
 _MUTATING_TOOLS = frozenset(
@@ -1485,6 +1487,9 @@ def create_server() -> Server:
         from .session_key import current_mcp_session_key
         from .mcp_driver_pool import PoolExhaustedError, PoolShuttingDownError
 
+        # Canary logging — distinguishes failure modes A/B/C/D (see PR #42 review).
+        logger.info("_call_tool_pooled entered: name=%s", name)
+
         # Defense-in-depth: gated tool check (same as singleton path).
         gate = _tool_gate_env(name)
         if gate is not None and not _env_enabled(gate):
@@ -1504,9 +1509,10 @@ def create_server() -> Server:
 
         # Resolve session key (fail-closed for pool-enabled SSE with no session_id).
         session_key = current_mcp_session_key(
-            srv, transport=_config.chatgpt.mcp_session_pool_enabled and "sse" or "stdio",
+            srv, transport=_transport,
             pool_enabled=True,
         )
+        logger.info("_call_tool_pooled session_key=%s transport=%s", session_key, _transport)
         # Fix: transport should come from the actual transport, not inferred from pool.
         # But we don't have the transport in scope here — use the global _transport.
         # For now, use a simpler approach: always try SSE first, fall back.
@@ -1528,6 +1534,7 @@ def create_server() -> Server:
         })
 
         try:
+            logger.info("pool.acquire entered: session_key=%s", session_key)
             async with _driver_pool.acquire(session_key) as lease:
                 async with lease.call_lock:
                     driver = lease.driver
@@ -1577,6 +1584,32 @@ def create_server() -> Server:
         except (PoolExhaustedError, PoolShuttingDownError) as e:
             return mcp_types.CallToolResult(
                 content=[mcp_types.TextContent(type="text", text=f"{e}. Retry later.")],
+                isError=True,
+            )
+        except OwnedTabRequiredError as e:
+            # Same structured error mapping as the singleton path.
+            return mcp_types.CallToolResult(
+                content=[mcp_types.TextContent(
+                    type="text",
+                    text=f"{e}. Retry later. (owned_tab_required)",
+                )],
+                isError=True,
+            )
+        except RateLimitError as e:
+            # Same structured error mapping as the singleton path.
+            return mcp_types.CallToolResult(
+                content=[mcp_types.TextContent(
+                    type="text",
+                    text=f"{e}. (rate_limited)",
+                )],
+                isError=True,
+            )
+        except CircuitOpenError as e:
+            return mcp_types.CallToolResult(
+                content=[mcp_types.TextContent(
+                    type="text",
+                    text=f"Circuit breaker open: {e}. Retry later. (circuit_open)",
+                )],
                 isError=True,
             )
 
@@ -2118,11 +2151,12 @@ def _mcp_server_identity(config: Config, transport: str, port: int) -> str:
 
 async def run_mcp(config: Config, transport: str = "stdio", port: int = 8090) -> None:
     """Connect to Chrome and run the MCP server."""
-    global _driver, _driver_pool, _config, _lock_cdp_port, _breakers, _parallel_tabs
+    global _driver, _driver_pool, _config, _lock_cdp_port, _breakers, _parallel_tabs, _transport
 
     _config = config
     _lock_cdp_port = config.chrome.cdp_port
     _parallel_tabs = config.chatgpt.parallel_tabs
+    _transport = transport
 
     if config.chatgpt.mcp_session_pool_enabled:
         # B1: pool mode. Do NOT connect to Chrome at startup. The pool

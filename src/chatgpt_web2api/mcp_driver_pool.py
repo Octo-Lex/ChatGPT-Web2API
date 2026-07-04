@@ -200,7 +200,7 @@ class McpSessionDriverPool:
         # Per-session tab-registry identity (B1 §12).
         instance_id = os.environ.get("W2A_INSTANCE_ID") or f"mcp:sse:session:{id(self)}"
         driver = CDPDriver(
-            port=cfg.chrome.cdp_port,
+            cdp_port=cfg.chrome.cdp_port,
             tab_mode="owned",
             parallel_tabs=True,
             instance_id=instance_id,
@@ -217,6 +217,7 @@ class McpSessionDriverPool:
           - It must attach only to the one owned tab for this slot.
           - It must not enumerate or attach to unrelated profile tabs.
         """
+        logger.info("_materialize_slot entered: session_key=%s", slot.session_key)
         try:
             driver = await self._create_driver()
         except Exception:
