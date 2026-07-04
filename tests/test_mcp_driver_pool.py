@@ -51,7 +51,7 @@ def _make_driver(name="driver"):
     return d
 
 
-async def _fake_driver_factory(cfg, transport, port):
+async def _fake_driver_factory(cfg, transport, port, slot):
     """Factory that creates mock drivers with unique names."""
     d = _make_driver(name=f"driver-{time.monotonic()}")
     return d
@@ -162,7 +162,7 @@ async def test_release_decrements_in_flight_exactly_once():
 async def test_materialize_failure_frees_capacity():
     call_count = [0]
 
-    async def failing_factory(cfg, transport, port):
+    async def failing_factory(cfg, transport, port, slot):
         call_count[0] += 1
         if call_count[0] == 1:
             raise ConnectionError("Chrome not ready")
@@ -219,7 +219,7 @@ async def test_idle_closing_slot_counts_against_capacity_until_close():
 
     slow_close.close = slow_close_fn
 
-    async def factory(cfg, transport, port):
+    async def factory(cfg, transport, port, slot):
         return slow_close
 
     pool = McpSessionDriverPool(
@@ -265,7 +265,7 @@ async def test_shutdown_during_materialization_does_not_leak_driver():
     """If shutdown starts during materialization, the driver is closed, not leaked."""
     materialize_started = asyncio.Event()
 
-    async def slow_factory(cfg, transport, port):
+    async def slow_factory(cfg, transport, port, slot):
         materialize_started.set()
         await asyncio.sleep(0.5)  # slow materialization
         return _make_driver()

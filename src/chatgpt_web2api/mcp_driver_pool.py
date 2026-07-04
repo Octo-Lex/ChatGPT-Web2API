@@ -188,23 +188,43 @@ class McpSessionDriverPool:
         if self._sweep_task is None or self._sweep_task.done():
             self._sweep_task = asyncio.create_task(self._sweep_idle())
 
-    async def _create_driver(self) -> Any:
-        """Create and connect a new CDPDriver. Injectable for testing."""
+    async def _create_driver(self, slot: DriverSlot) -> Any:
+        """Create and connect a new CDPDriver for a slot. Injectable for testing.
+
+        Passes slot.breakers into CDPDriver so driver failure sites record
+        into the slot's breaker registry (PR #42 review fix #3).
+        Derives instance_id from the session_key for per-session tab-registry
+        identity (PR #42 review fix #4).
+        """
         if self._driver_factory is not None:
-            return await self._driver_factory(self._config, self._transport, self._port)
+            return await self._driver_factory(self._config, self._transport, self._port, slot)
         # Real path: construct + connect a CDPDriver.
+        import hashlib
         import os
 
         from .cdp_driver import CDPDriver
+        from .tab_registry import TabRegistry
 
         cfg = self._config
-        # Per-session tab-registry identity (B1 §12).
-        instance_id = os.environ.get("W2A_INSTANCE_ID") or f"mcp:sse:session:{id(self)}"
+        # Per-session tab-registry identity, derived from session_key (fix #4).
+        # W2A_INSTANCE_ID in pool mode: suffix with session hash so each slot
+        # gets a distinct registry identity rather than collapsing to one.
+        session_hash = hashlib.sha256(slot.session_key.encode()).hexdigest()[:12]
+        if os.environ.get("W2A_INSTANCE_ID"):
+            base = os.environ["W2A_INSTANCE_ID"]
+            server_identity = f"{base}:session:{session_hash}"
+        else:
+            server_identity = f"mcp:{self._transport}:{self._port}:session:{session_hash}"
+        instance_id = TabRegistry.derive_instance_id(
+            cdp_port=cfg.chrome.cdp_port,
+            server_identity=server_identity,
+        )
         driver = CDPDriver(
             cdp_port=cfg.chrome.cdp_port,
             tab_mode="owned",
             parallel_tabs=True,
             instance_id=instance_id,
+            breakers=slot.breakers,
         )
         await driver.connect()
         return driver
@@ -220,7 +240,7 @@ class McpSessionDriverPool:
         """
         logger.info("_materialize_slot entered: session_key=%s", slot.session_key)
         try:
-            driver = await self._create_driver()
+            driver = await self._create_driver(slot)
         except Exception:
             # _create_driver is responsible for cleaning partial resources
             # on failure (the CDPDriver.connect() path handles this).

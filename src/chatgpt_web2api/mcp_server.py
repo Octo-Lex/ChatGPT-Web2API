@@ -1416,6 +1416,87 @@ def build_tools() -> list[mcp_types.Tool]:
 # Server Factory
 # ═══════════════════════════════════════════════════════════════
 
+# ── Shared tool-result formatting + exception mapping ─────────────────────
+# Extracted from the singleton call_tool path so the pooled path reuses
+# exactly the same result shaping and error semantics. (PR #42 review fix #1/#2)
+
+_STATUS_TOOLS = frozenset({
+    ToolName.DELETE_CONVERSATION.value,
+    ToolName.UPDATE_PROJECT_INSTRUCTIONS.value,
+    ToolName.DELETE_PROJECT.value,
+    ToolName.ARCHIVE_CONVERSATION.value,
+    ToolName.DELETE_MEMORY.value,
+})
+
+
+def _format_tool_result(name: str, result) -> object:
+    """Shape the raw handler result into the MCP CallToolResult contract.
+
+    Shared between singleton and pooled paths so both return identical
+    payload shapes for the same tool + result.
+    """
+    # chat_completion and chat_with_gpt return both text + structured output
+    if name in (ToolName.CHAT_COMPLETION.value, ToolName.CHAT_WITH_GPT.value):
+        text_content = [mcp_types.TextContent(type="text", text=result["content"])]
+        return text_content, result
+    # Status operations return status text + structured output
+    if name in _STATUS_TOOLS:
+        status = "succeeded" if result.get("success") else "failed"
+        text_content = [mcp_types.TextContent(type="text", text=f"Operation {status}")]
+        return text_content, result
+    # Everything else returns structured only (SDK auto-wraps as text JSON)
+    return result
+
+
+def _map_tool_exception(exc: Exception) -> object:
+    """Map a tool-execution exception to an isError CallToolResult.
+
+    Shared between singleton and pooled paths. Returns None if the exception
+    type is not mapped (caller should re-raise).
+    """
+    # Lazy imports for circular-dependency avoidance.
+
+    if isinstance(exc, OwnedTabRequiredError):
+        return mcp_types.CallToolResult(
+            content=[mcp_types.TextContent(type="text",
+                text=f"{exc}. Retry later. (owned_tab_required)")],
+            isError=True,
+        )
+    if isinstance(exc, RateLimitError):
+        return mcp_types.CallToolResult(
+            content=[mcp_types.TextContent(type="text",
+                text=(f"ChatGPT rate limit reached. Retry in {exc.retry_after}s. "
+                      f"(rate_limit_exceeded, retry_after={exc.retry_after})"))],
+            isError=True,
+        )
+    if isinstance(exc, CircuitOpenError):
+        return mcp_types.CallToolResult(
+            content=[mcp_types.TextContent(type="text",
+                text=(f"Circuit open for {exc.kind.value} — cooling down. "
+                      f"Retry later. (circuit_open, kind={exc.kind.value})"))],
+            isError=True,
+        )
+    if isinstance(exc, AuthExpiredError):
+        return mcp_types.CallToolResult(
+            content=[mcp_types.TextContent(type="text",
+                text="ChatGPT session expired — re-login required. (auth_expired)")],
+            isError=True,
+        )
+    if isinstance(exc, GenerationStuckError):
+        return mcp_types.CallToolResult(
+            content=[mcp_types.TextContent(type="text",
+                text=(f"Generation stuck in {exc.phase} for {exc.stalled_for_s:.0f}s "
+                      "— no DOM progress. (generation_stuck)"))],
+            isError=True,
+        )
+    if isinstance(exc, LockAcquisitionError):
+        return mcp_types.CallToolResult(
+            content=[mcp_types.TextContent(type="text",
+                text="Browser busy — another operation in progress. Retry later. (lock_timeout)")],
+            isError=True,
+        )
+    return None
+
 
 def create_server() -> Server:
     """Create and configure the MCP server with all capabilities."""
@@ -1580,38 +1661,19 @@ def create_server() -> Server:
                     if is_mutation and _looks_like_account_throttle_warning(result):
                         await _driver_pool.account_breaker.trip()
 
-                    return result
+                    # Shared result formatting (singleton parity, PR #42 fix #1).
+                    return _format_tool_result(name, result)
         except (PoolExhaustedError, PoolShuttingDownError) as e:
             return mcp_types.CallToolResult(
                 content=[mcp_types.TextContent(type="text", text=f"{e}. Retry later.")],
                 isError=True,
             )
-        except OwnedTabRequiredError as e:
-            # Same structured error mapping as the singleton path.
-            return mcp_types.CallToolResult(
-                content=[mcp_types.TextContent(
-                    type="text",
-                    text=f"{e}. Retry later. (owned_tab_required)",
-                )],
-                isError=True,
-            )
-        except RateLimitError as e:
-            # Same structured error mapping as the singleton path.
-            return mcp_types.CallToolResult(
-                content=[mcp_types.TextContent(
-                    type="text",
-                    text=f"{e}. (rate_limited)",
-                )],
-                isError=True,
-            )
-        except CircuitOpenError as e:
-            return mcp_types.CallToolResult(
-                content=[mcp_types.TextContent(
-                    type="text",
-                    text=f"Circuit breaker open: {e}. Retry later. (circuit_open)",
-                )],
-                isError=True,
-            )
+        except Exception as exc:
+            # Shared exception mapping (singleton parity, PR #42 fix #2).
+            mapped = _map_tool_exception(exc)
+            if mapped is not None:
+                return mapped
+            raise
 
     def _build_tool_handler(name, arguments, driver, on_progress):
         """Build a tool handler bound to a specific driver (singleton or leased)."""
@@ -1760,118 +1822,16 @@ def create_server() -> Server:
                     result = await _run()
             else:
                 result = await _run()
-        except OwnedTabRequiredError as e:
-            # Parallel-mode fail-closed: surface as retryable isError with a
-            # machine-readable marker, mirroring the rate-limit/circuit style.
-            return mcp_types.CallToolResult(
-                content=[
-                    mcp_types.TextContent(
-                        type="text",
-                        text=f"{e}. Retry later. (owned_tab_required)",
-                    )
-                ],
-                isError=True,
-            )
-        except RateLimitError as e:
-            # Persistent limit (transparent retries exhausted). Signal it as an
-            # error result with a recognizable marker the agent can parse to
-            # decide "pause, then retry this tool." isError=True with text only
-            # — no structuredContent, because the MCP SDK validates
-            # structuredContent against the tool's outputSchema and this error
-            # payload deliberately doesn't match any tool's success schema.
-            return mcp_types.CallToolResult(
-                content=[
-                    mcp_types.TextContent(
-                        type="text",
-                        text=(
-                            f"ChatGPT rate limit reached. Retry in {e.retry_after}s. "
-                            f"(rate_limit_exceeded, retry_after={e.retry_after})"
-                        ),
-                    )
-                ],
-                isError=True,
-            )
-        except CircuitOpenError as e:
-            # A breaker is open on this process's driver — refuse fast with a
-            # structured error so the agent knows to back off. Mirrors the
-            # RateLimitError shape: isError=True, text only, machine token.
-            return mcp_types.CallToolResult(
-                content=[
-                    mcp_types.TextContent(
-                        type="text",
-                        text=(
-                            f"Circuit open for {e.kind.value} — cooling down. "
-                            f"Retry later. (circuit_open, kind={e.kind.value})"
-                        ),
-                    )
-                ],
-                isError=True,
-            )
-        except AuthExpiredError:
-            # The access token is stale/rejected. Surface a clear signal so the
-            # agent/user can prompt re-login instead of misdiagnosing the
-            # resulting empty reads as a different bug. isError=True with text
-            # content only — no structuredContent, because the MCP SDK validates
-            # structuredContent against the tool's outputSchema and this error
-            # payload deliberately doesn't match any tool's success schema.
-            return mcp_types.CallToolResult(
-                content=[
-                    mcp_types.TextContent(
-                        type="text",
-                        text="ChatGPT session expired — re-login required. (auth_expired)",
-                    )
-                ],
-                isError=True,
-            )
-        except GenerationStuckError as e:
-            # Generation hung (no DOM progress within the stall window). Distinct
-            # from a slow generation (which keeps progressing and is allowed the
-            # full timeout). Phase + duration in the text for diagnosis.
-            return mcp_types.CallToolResult(
-                content=[
-                    mcp_types.TextContent(
-                        type="text",
-                        text=(
-                            f"Generation stuck in {e.phase} for {e.stalled_for_s:.0f}s "
-                            f"— no DOM progress. (generation_stuck)"
-                        ),
-                    )
-                ],
-                isError=True,
-            )
-        except LockAcquisitionError:
-            # Another process holds the cross-process lock for this Chrome tab
-            # and didn't release it within the timeout. The caller should retry.
-            return mcp_types.CallToolResult(
-                content=[
-                    mcp_types.TextContent(
-                        type="text",
-                        text="Browser busy — another operation in progress. Retry later. (lock_timeout)",
-                    )
-                ],
-                isError=True,
-            )
+        except Exception as exc:
+            # Shared exception mapping (extracted from inline chain for
+            # singleton/pooled parity, PR #42 fix #2).
+            mapped = _map_tool_exception(exc)
+            if mapped is not None:
+                return mapped
+            raise
 
-        # chat_completion and chat_with_gpt return both text + structured output
-        if name in (ToolName.CHAT_COMPLETION.value, ToolName.CHAT_WITH_GPT.value):
-            text_content = [mcp_types.TextContent(type="text", text=result["content"])]
-            return text_content, result
-
-        # Status operations return status text + structured output
-        status_tools = (
-            ToolName.DELETE_CONVERSATION.value,
-            ToolName.UPDATE_PROJECT_INSTRUCTIONS.value,
-            ToolName.DELETE_PROJECT.value,
-            ToolName.ARCHIVE_CONVERSATION.value,
-            ToolName.DELETE_MEMORY.value,
-        )
-        if name in status_tools:
-            status = "succeeded" if result.get("success") else "failed"
-            text_content = [mcp_types.TextContent(type="text", text=f"Operation {status}")]
-            return text_content, result
-
-        # Everything else returns structured only (SDK auto-wraps as text JSON)
-        return result
+        # Shared result formatting (singleton/pooled parity, PR #42 fix #1).
+        return _format_tool_result(name, result)
 
     # ── Resources (application-controlled) ────────────────────
 
