@@ -1900,6 +1900,16 @@ def create_server() -> Server:
         """Read a specific resource by URI."""
         uri = str(request.params.uri)
 
+        # B1: in pool mode, resources that need live data require a lease.
+        # For B1, return a clear error rather than materializing — resource
+        # reads are secondary to tool calls and should not eagerly create tabs.
+        if _driver is None and _driver_pool is not None:
+            raise ConnectionError(
+                "Resource reads are not available in pool mode without an "
+                "active session tab. Use a chat tool first to materialize a "
+                "session driver, then retry. (mcp_pool_resource_unavailable)"
+            )
+
         if _driver is None:
             raise ConnectionError("Not connected to Chrome")
 
@@ -1987,6 +1997,9 @@ def create_server() -> Server:
             tool_args: dict[str, Any] = {"message": question}
 
             if project and _driver:
+                # B1: in pool mode, project resolution needs live data but
+                # we don't allocate a tab for prompt resolution. Skip silently.
+                pass  # falls through to no-project path
                 try:
                     projects = await _driver.get_projects()
                     for p in projects:
