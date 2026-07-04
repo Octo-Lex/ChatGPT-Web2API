@@ -674,7 +674,7 @@ _driver: CDPDriver | None = None
 # B1: MCP session-affine driver pool. When non-None, the pool owns driver
 # lifecycle; _driver is None and _breakers is None. Each MCP session gets
 # its own owned CDPDriver/tab on demand (lazy materialization).
-_driver_pool: McpSessionDriverPool | None = None
+_driver_pool = None  # McpSessionDriverPool | None; set in run_mcp when pool enabled
 _config: Config | None = None
 # Phase 4 PR2: per-process breaker registry (MCP-local). MCP has no
 # ChromeProcess, so CHROME_CRASH_LOOP is never tripped here. Auth/composer/CDP
@@ -1484,8 +1484,8 @@ def create_server() -> Server:
         operations per session. The existing MutationLock is resolved against
         lease.driver (not the global _driver).
         """
-        from .session_key import current_mcp_session_key
         from .mcp_driver_pool import PoolExhaustedError, PoolShuttingDownError
+        from .session_key import current_mcp_session_key
 
         # Canary logging — distinguishes failure modes A/B/C/D (see PR #42 review).
         logger.info("_call_tool_pooled entered: name=%s", name)

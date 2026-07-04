@@ -21,8 +21,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from dataclasses import dataclass, field
-from typing import Any, Callable, Awaitable
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -117,7 +118,7 @@ class _LeaseContext:
     a coroutine object as an async context manager.
     """
 
-    def __init__(self, pool: "McpSessionDriverPool", session_key: str) -> None:
+    def __init__(self, pool: McpSessionDriverPool, session_key: str) -> None:
         self._pool = pool
         self._session_key = session_key
         self._lease: DriverLease | None = None
@@ -192,9 +193,9 @@ class McpSessionDriverPool:
         if self._driver_factory is not None:
             return await self._driver_factory(self._config, self._transport, self._port)
         # Real path: construct + connect a CDPDriver.
-        from .cdp_driver import CDPDriver
-        from .tab_registry import TabRegistry
         import os
+
+        from .cdp_driver import CDPDriver
 
         cfg = self._config
         # Per-session tab-registry identity (B1 §12).
@@ -316,7 +317,7 @@ class McpSessionDriverPool:
                             ),
                             timeout=remaining,
                         )
-                    except asyncio.TimeoutError:
+                    except TimeoutError:
                         raise PoolExhaustedError()
 
                     if self._shutting_down:
@@ -332,7 +333,7 @@ class McpSessionDriverPool:
                     await asyncio.wait_for(
                         pending_slot.ready_event.wait(), timeout=remaining
                     )
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     raise PoolExhaustedError()
                 continue
 
@@ -351,7 +352,7 @@ class McpSessionDriverPool:
                     self._create_sem.acquire(), timeout=remaining
                 )
                 sem_acquired = True
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 await self._abandon_pending_slot(materialize_slot)
                 raise PoolExhaustedError()
 
@@ -487,7 +488,7 @@ class McpSessionDriverPool:
             if not slot.ready_event.is_set():
                 try:
                     await asyncio.wait_for(slot.ready_event.wait(), timeout=10.0)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     logger.warning(
                         "shutdown proceeding without waiting for materialize: %s",
                         slot.session_key,

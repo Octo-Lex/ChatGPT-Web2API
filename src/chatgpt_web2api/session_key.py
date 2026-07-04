@@ -18,7 +18,6 @@ Never generates a random per-request key.
 from __future__ import annotations
 
 import logging
-from typing import Literal
 
 logger = logging.getLogger(__name__)
 

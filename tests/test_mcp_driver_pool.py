@@ -24,7 +24,6 @@ import pytest
 from chatgpt_web2api.mcp_driver_pool import (
     AccountThrottleBreaker,
     DriverLease,
-    DriverSlot,
     McpSessionDriverPool,
     PoolExhaustedError,
     PoolShuttingDownError,

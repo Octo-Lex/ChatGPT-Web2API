@@ -10,8 +10,6 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
-import pytest
-
 from chatgpt_web2api.session_key import current_mcp_session_key
 
 
