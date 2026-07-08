@@ -28,6 +28,9 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+# P1.5: cap for lease history records (prevents unbounded growth).
+_LEASE_HISTORY_LIMIT = 100
+
 
 # ── Errors ────────────────────────────────────────────────────────────────
 
@@ -231,7 +234,6 @@ class McpSessionDriverPool:
         # completed records. Pure diagnostics — no behavioral influence.
         self._active_leases: dict[str, LeaseRecord] = {}
         self._lease_history: list[LeaseRecord] = []
-        self._history_cap = 100  # prevent unbounded growth
 
     @property
     def active_leases(self) -> dict[str, LeaseRecord]:
@@ -513,8 +515,13 @@ class McpSessionDriverPool:
         detects double-releases (a correctness bug where the same lease is
         released twice). Double-release logs a warning but does NOT re-decrement
         in_flight (that would undercount).
+
+        Legacy callers without a ``lease_id`` (``lease_id=""``) skip tracking
+        but still get the correct in_flight decrement (review finding A).
         """
-        # P1.5: complete the lease record if we have its ID.
+        # P1.5: lease tracking. For tracked leases (lease_id non-empty),
+        # complete the record or detect double-release.
+        skip_decrement = False
         if lease_id:
             record = self._active_leases.pop(lease_id, None)
             if record is not None:
@@ -523,17 +530,25 @@ class McpSessionDriverPool:
                 record.release_reason = release_reason
                 self._lease_history.append(record)
                 # Cap history to prevent unbounded growth.
-                if len(self._lease_history) > self._history_cap:
-                    self._lease_history = self._lease_history[-self._history_cap:]
+                if len(self._lease_history) > _LEASE_HISTORY_LIMIT:
+                    self._lease_history = self._lease_history[-_LEASE_HISTORY_LIMIT:]
             else:
+                # Confirmed double-release: lease_id was provided but is not in
+                # active_leases. Log and do NOT re-decrement in_flight (review
+                # finding A — re-decrementing would undercount).
                 logger.warning(
                     "Double-release detected: lease_id=%s not in active_leases "
-                    "(session=%s) — lease was already released or never tracked",
+                    "(session=%s) — lease was already released; skipping "
+                    "in_flight decrement to avoid undercount",
                     lease_id, slot.session_key,
                 )
-        async with slot.meta_lock:
-            slot.in_flight = max(0, slot.in_flight - 1)
-            slot.last_used_at = time.monotonic()
+                skip_decrement = True
+        # For untracked releases (lease_id="" — legacy/direct callers) and
+        # normal tracked releases, decrement in_flight. Double-releases skip.
+        if not skip_decrement:
+            async with slot.meta_lock:
+                slot.in_flight = max(0, slot.in_flight - 1)
+                slot.last_used_at = time.monotonic()
 
     async def _sweep_idle(self) -> None:
         """Background loop: close idle slots past TTL.
