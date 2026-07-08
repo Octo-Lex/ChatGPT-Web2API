@@ -116,9 +116,12 @@ PHASE_STALL_SECONDS = 90
 # silent "thinking" phase before the first answer token renders, which the
 # old uniform 90s stall window falsely aborted. Matched case-insensitively
 # against the slug via substring. "thinking" covers gpt-5-*-thinking and
-# gpt-5-*-t-mini (Thinking Mini); "o3" and "research" are the other
-# reasoning-class families.
-_REASONING_MARKERS = ("thinking", "-t-mini", "o3", "research")
+# gpt-5-*-t-mini (Thinking Mini); "o1"/"o3"/"o4" are the o-series reasoning
+# families; "research" is Deep Research; "reasoning" is a catch-all in case
+# OpenAI introduces slugs that name it directly. Inclusive on purpose — a
+# false negative (reasoning model gets the shorter default budget) is worse
+# than a false positive (non-reasoning model gets the longer budget).
+_REASONING_MARKERS = ("thinking", "-t-mini", "o1", "o3", "o4", "research", "reasoning")
 
 
 def classify_model(model: str | None) -> str:
@@ -256,8 +259,11 @@ class CompletionDetector:
         turn-anchoring work to correlate against the correct turn.
 
         On any fetch failure or exception, returns False (let the stall raise)
-        rather than degrading to a silent success.
+        rather than degrading to a silent success. EXCEPT auth expiry: that
+        must surface as auth expiry, not degrade to a generic stall (PR #39
+        review finding #2 invariant — auth failure never degrades).
         """
+        from .cdp_driver import AuthExpiredError
         from .turn_anchor import collapse_to_end_turn_status
 
         if not conv_id:
@@ -269,6 +275,8 @@ class CompletionDetector:
             )
             status = collapse_to_end_turn_status(end_result)
             return status == "complete"
+        except AuthExpiredError:
+            raise  # never swallow auth expiry — it must surface as auth expiry
         except Exception as e:
             logger.debug("Final reconciliation fetch failed: %s", e)
             return False
@@ -589,18 +597,22 @@ class CompletionDetector:
                 if not conv_id_for_check:
                     last_change_time = time.monotonic()
             # P1: track advisory liveness signal for structured error reporting.
-            # True when the DOM shows active generation (thinking indicator or
-            # a generating/stop-button state). This is advisory only — it
-            # informs the structured error and logging, but does NOT pause the
-            # stall clock (a stuck indicator must not create an infinite hang).
+            # True when the DOM shows active generation (thinking indicator).
+            # This is advisory only — it informs the structured error and
+            # logging, but does NOT pause the stall clock (a stuck indicator
+            # must not create an infinite hang).
             generation_active_signal = bool(is_thinking)
             if current != last_dom_text:
                 last_change_time = time.monotonic()
                 # P1: first text content transitions us from awaiting_first_content
                 # to streaming_after_first_content. The stall budget changes with
-                # the state (see the stall check below).
+                # the state (see the stall check below). When the state flips,
+                # reset the stream-idle clock so a long reasoning wait followed
+                # by first text doesn't immediately fail under the shorter
+                # stream-idle budget (review finding A).
                 if current and not first_content_seen:
                     first_content_seen = True
+                    last_change_time = time.monotonic()  # reset stream-idle clock
                 if len(current) > len(last_dom_text):
                     delta = current[len(last_dom_text) :]
                     yield StreamChunk(delta=delta)
@@ -613,9 +625,15 @@ class CompletionDetector:
                 if html_len > 50:
                     had_non_text_content = True
                     self.had_non_text_content = True
-                # P1: non-text content also counts as first-content (images/tool-use).
-                if not first_content_seen:
+                # P1: meaningful non-text content (html_len > 50, the existing
+                # threshold that excludes the bare message wrapper) also counts
+                # as first-content. Do NOT transition on the first poll's
+                # wrapper creation alone — that would prematurely move a
+                # reasoning model from the 300s first-content budget to the
+                # 120s stream-idle budget while still thinking (review finding A).
+                if html_len > 50 and not first_content_seen:
                     first_content_seen = True
+                    last_change_time = time.monotonic()  # reset stream-idle clock
             last_html_len = html_len
             last_child_count = child_count
 
