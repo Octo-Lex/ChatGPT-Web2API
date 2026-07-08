@@ -1664,8 +1664,13 @@ def create_server() -> Server:
                     # Shared result formatting (singleton parity, PR #42 fix #1).
                     return _format_tool_result(name, result)
         except (PoolExhaustedError, PoolShuttingDownError) as e:
+            # Defensive: never let an empty-message exception surface as
+            # ". Retry later." Fall back to the type name so the caller always
+            # gets a diagnosable signal. (The exception classes now carry a
+            # default message, but this guards against future bare raises.)
+            detail = str(e) or type(e).__name__
             return mcp_types.CallToolResult(
-                content=[mcp_types.TextContent(type="text", text=f"{e}. Retry later.")],
+                content=[mcp_types.TextContent(type="text", text=f"{detail}. Retry later.")],
                 isError=True,
             )
         except Exception as exc:

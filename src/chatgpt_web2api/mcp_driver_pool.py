@@ -31,11 +31,29 @@ logger = logging.getLogger(__name__)
 # ── Errors ────────────────────────────────────────────────────────────────
 
 class PoolExhaustedError(RuntimeError):
-    """Pool is full after acquire_timeout."""
+    """Pool is full after acquire_timeout.
+
+    Carries a default human-readable message (mirroring RateLimitError /
+    AuthExpiredError in cdp_driver.py) so the MCP error-formatter can't
+    surface an empty diagnostic. The bare ``raise PoolExhaustedError()``
+    sites below now render as
+    ``"PoolExhaustedError: no driver slot available within acquire_timeout.
+    Retry later."`` rather than ``": . Retry later."``.
+    """
+
+    def __init__(self, message: str | None = None) -> None:
+        if message is None:
+            message = "no driver slot available within acquire_timeout"
+        super().__init__(message)
 
 
 class PoolShuttingDownError(RuntimeError):
     """Pool is shutting down; no new slots can be created."""
+
+    def __init__(self, message: str | None = None) -> None:
+        if message is None:
+            message = "driver pool is shutting down; no new slots can be created"
+        super().__init__(message)
 
 
 class PoolSlotUnavailableError(RuntimeError):

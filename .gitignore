@@ -14,3 +14,6 @@ sentinel_flow.json
 .rest-proxy.log
 .sse-server.log
 
+
+# ChatGPT collaboration binding (local only)
+.chatgpt-collaboration.json
