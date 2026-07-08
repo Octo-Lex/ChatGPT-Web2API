@@ -142,13 +142,51 @@ class GenerationStuckError(RuntimeError):
 
     - ``phase == "phase_1_appear"``: assistant message node never appeared.
     - ``phase == "phase_2_stream"``: streaming started but text stopped changing.
+
+    P1 (2026-07-08): phase-2 stalls now carry richer structured fields for
+    observability and caller-side reconciliation decisions:
+
+    - ``stall_kind``: ``"first_content_timeout"`` (no text appeared within the
+      first-content budget — common for reasoning models in the thinking phase)
+      or ``"stream_idle_timeout"`` (text appeared then stopped progressing) or
+      ``"hard_timeout"`` (absolute wall-clock cap exceeded).
+    - ``model_class``: ``"reasoning"`` or ``"default"`` (from classify_model).
+    - ``elapsed_seconds``: total time spent in phase-2 observation.
+    - ``generation_active_signal``: whether a DOM thinking/generating indicator
+      was present at the moment of the stall (advisory — a liveness hint).
+    - ``turn_id``: the turn anchor's captured UUID if available, for caller-side
+      reconciliation/retry of OBSERVATION (never retry the send).
+
+    The structured fields are optional (keyword-only) so existing phase-1
+    construction sites remain compatible. Callers should NEVER auto-retry the
+    SEND on a phase-2 stall (the generation may still be running and would
+    duplicate the message). Safe retry is observation-only: re-read the
+    conversation and reconcile against the same turn.
     """
 
-    def __init__(self, phase: str, stalled_for_s: float) -> None:
+    def __init__(
+        self,
+        phase: str,
+        stalled_for_s: float,
+        *,
+        stall_kind: str | None = None,
+        model_class: str | None = None,
+        elapsed_seconds: float | None = None,
+        generation_active_signal: bool | None = None,
+        turn_id: str | None = None,
+    ) -> None:
         self.phase = phase
         self.stalled_for_s = float(stalled_for_s)
+        # P1 structured fields (optional for back-compat with phase-1 sites).
+        self.stall_kind = stall_kind
+        self.model_class = model_class
+        self.elapsed_seconds = float(elapsed_seconds) if elapsed_seconds is not None else None
+        self.generation_active_signal = generation_active_signal
+        self.turn_id = turn_id
+        # Human-readable message includes the stall kind if available.
+        kind_str = f" ({stall_kind})" if stall_kind else ""
         super().__init__(
-            f"Generation stalled in {phase} for {stalled_for_s:.0f}s — no DOM progress"
+            f"Generation stalled in {phase}{kind_str} for {stalled_for_s:.0f}s — no DOM progress"
         )
 
 
@@ -1459,7 +1497,14 @@ class CDPDriver:
                 conversation_id_at_capture=conv_id,
             )
 
-    async def send_and_stream(self, text: str, timeout: float = 120) -> AsyncIterator[StreamChunk]:
+    async def send_and_stream(
+        self,
+        text: str,
+        timeout: float = 120,
+        *,
+        budgets=None,
+        model: str | None = None,
+    ) -> AsyncIterator[StreamChunk]:
         """Send a message and yield streaming response chunks.
 
         A2 turn-correlation sequence (peer-reviewed, conv ``6a482cfd``):
@@ -1514,10 +1559,15 @@ class CDPDriver:
             turn_anchor = fallback_anchor.with_captured_id(captured_uuid)
 
             # A2 Step 8: stream + completion with the anchored turn.
+            # P1: pass budgets + model for the model-aware two-state phase-2
+            # machine. When None (no config available), the detector uses the
+            # legacy single PHASE_STALL_SECONDS behavior.
             async for chunk in self._completion.stream_until_complete(
                 initial_count=initial_count,
                 timeout=timeout,
                 turn_anchor=turn_anchor,
+                budgets=budgets,
+                model=model,
             ):
                 yield chunk
 

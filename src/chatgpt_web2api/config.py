@@ -97,6 +97,18 @@ class ChatGPTConfig:
     # Account-level throttle breaker: pauses mutations pool-wide if ChatGPT
     # signals excessive consumption from simultaneous multi-tab use.
     mcp_account_throttle_cooldown_seconds: int = 300
+    # P1: model-aware detector budgets. Phase-2 stall detection splits into
+    # first-content-wait (no text yet) vs stream-idle (text appeared then
+    # stopped), with model-aware budgets. See classify_model /
+    # DetectorBudgets in completion_detector.py. Defaults reproduce the
+    # legacy 90s behavior for non-reasoning models and give reasoning models
+    # a longer first-content window (300s) so their silent thinking phase
+    # isn't falsely aborted.
+    detector_reasoning_first_content_timeout_seconds: float = 300
+    detector_reasoning_stream_idle_timeout_seconds: float = 120
+    detector_default_first_content_timeout_seconds: float = 90
+    detector_default_stream_idle_timeout_seconds: float = 90
+    detector_hard_timeout_seconds: float = 900
 
 
 @dataclass
@@ -262,6 +274,22 @@ class Config:
         c = data.get("mcp_account_throttle_cooldown_seconds")
         if c is not None:
             self.chatgpt.mcp_account_throttle_cooldown_seconds = int(c)
+        # P1 detector budgets
+        c = data.get("detector_reasoning_first_content_timeout_seconds")
+        if c is not None:
+            self.chatgpt.detector_reasoning_first_content_timeout_seconds = float(c)
+        c = data.get("detector_reasoning_stream_idle_timeout_seconds")
+        if c is not None:
+            self.chatgpt.detector_reasoning_stream_idle_timeout_seconds = float(c)
+        c = data.get("detector_default_first_content_timeout_seconds")
+        if c is not None:
+            self.chatgpt.detector_default_first_content_timeout_seconds = float(c)
+        c = data.get("detector_default_stream_idle_timeout_seconds")
+        if c is not None:
+            self.chatgpt.detector_default_stream_idle_timeout_seconds = float(c)
+        c = data.get("detector_hard_timeout_seconds")
+        if c is not None:
+            self.chatgpt.detector_hard_timeout_seconds = float(c)
         c = data.get("request_timeout")
         if c is not None:
             self.server.request_timeout = int(c)
@@ -316,6 +344,17 @@ class Config:
             self.chatgpt.mcp_session_pool_create_concurrency = int(v)
         if v := _env("W2A_MCP_ACCOUNT_THROTTLE_COOLDOWN_SECONDS"):
             self.chatgpt.mcp_account_throttle_cooldown_seconds = int(v)
+        # P1 detector budgets
+        if v := _env("W2A_DETECTOR_REASONING_FIRST_CONTENT_TIMEOUT_SECONDS"):
+            self.chatgpt.detector_reasoning_first_content_timeout_seconds = float(v)
+        if v := _env("W2A_DETECTOR_REASONING_STREAM_IDLE_TIMEOUT_SECONDS"):
+            self.chatgpt.detector_reasoning_stream_idle_timeout_seconds = float(v)
+        if v := _env("W2A_DETECTOR_DEFAULT_FIRST_CONTENT_TIMEOUT_SECONDS"):
+            self.chatgpt.detector_default_first_content_timeout_seconds = float(v)
+        if v := _env("W2A_DETECTOR_DEFAULT_STREAM_IDLE_TIMEOUT_SECONDS"):
+            self.chatgpt.detector_default_stream_idle_timeout_seconds = float(v)
+        if v := _env("W2A_DETECTOR_HARD_TIMEOUT_SECONDS"):
+            self.chatgpt.detector_hard_timeout_seconds = float(v)
         if v := _env("W2A_HEADLESS"):
             self.chrome.headless = v.lower() in ("true", "1", "yes")
         if v := _env("W2A_LOG_LEVEL"):
@@ -347,6 +386,11 @@ class Config:
             "mcp_session_pool_sweep_interval_seconds": self.chatgpt.mcp_session_pool_sweep_interval_seconds,
             "mcp_session_pool_create_concurrency": self.chatgpt.mcp_session_pool_create_concurrency,
             "mcp_account_throttle_cooldown_seconds": self.chatgpt.mcp_account_throttle_cooldown_seconds,
+            "detector_reasoning_first_content_timeout_seconds": self.chatgpt.detector_reasoning_first_content_timeout_seconds,
+            "detector_reasoning_stream_idle_timeout_seconds": self.chatgpt.detector_reasoning_stream_idle_timeout_seconds,
+            "detector_default_first_content_timeout_seconds": self.chatgpt.detector_default_first_content_timeout_seconds,
+            "detector_default_stream_idle_timeout_seconds": self.chatgpt.detector_default_stream_idle_timeout_seconds,
+            "detector_hard_timeout_seconds": self.chatgpt.detector_hard_timeout_seconds,
             "request_timeout": self.server.request_timeout,
             "log_level": self.log.level,
             "ensure_degraded_poll_interval_s": self.ensure.degraded_poll_interval_s,

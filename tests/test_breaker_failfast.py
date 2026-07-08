@@ -75,7 +75,7 @@ def _make_mcp_server_with_open_breaker():
     driver._current_model = None
 
     # If the handler somehow runs, yield a benign chunk (it should NOT).
-    async def _stream(text, timeout=120):
+    async def _stream(text, timeout=120, *, budgets=None, model=None):
         from chatgpt_web2api.cdp_driver import StreamChunk
 
         yield StreamChunk(delta="should-not-reach")
@@ -140,7 +140,7 @@ async def test_mcp_closed_breaker_does_not_fail_fast(monkeypatch):
     driver._current_conv_id = ""
     driver._current_model = None
 
-    async def _stream(text, timeout=120):
+    async def _stream(text, timeout=120, *, budgets=None, model=None):
         from chatgpt_web2api.cdp_driver import StreamChunk
 
         yield StreamChunk(delta="ok")
@@ -200,7 +200,7 @@ async def test_rest_post_lock_check_catches_race(monkeypatch):
     driver.navigate_conversation = AsyncMock()
     driver.ensure_current_conversation = AsyncMock()
 
-    async def _stream(text, timeout=120):
+    async def _stream(text, timeout=120, *, budgets=None, model=None):
         yield MagicMock()
 
     driver.send_and_stream = _stream

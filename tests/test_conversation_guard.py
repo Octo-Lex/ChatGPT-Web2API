@@ -311,7 +311,7 @@ async def test_mcp_auto_continue_invokes_ensure_current():
     driver.navigate_new_chat = AsyncMock()
     driver.navigate_conversation = AsyncMock()
 
-    async def _boom(text, timeout=120):
+    async def _boom(text, timeout=120, *, budgets=None, model=None):
         raise AssertionError("reached past the guard")
         yield  # pragma: no cover (generator signature)
     driver.send_and_stream = _boom

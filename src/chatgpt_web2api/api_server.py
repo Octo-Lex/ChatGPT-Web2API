@@ -530,10 +530,16 @@ class APIServer:
         transparently — the client only sees it (as a 429) if the limit
         persists across all retries.
         """
+        # P1: resolve model-aware detector budgets from config.
+        from .completion_detector import DetectorBudgets
+
+        budgets = DetectorBudgets.from_config(self._config.chatgpt, model)
 
         async def _send_and_collect() -> str:
             collected = ""
-            async for chunk in self._driver.send_and_stream(text, timeout=timeout):
+            async for chunk in self._driver.send_and_stream(
+                text, timeout=timeout, budgets=budgets, model=model,
+            ):
                 collected += chunk.delta
             return collected
 
@@ -577,6 +583,10 @@ class APIServer:
           cleared it), but if one occurs it falls back to the inline
           ``[Error: ...]`` SSE chunk — documented as a known limitation.
         """
+        # P1: resolve model-aware detector budgets from config.
+        from .completion_detector import DetectorBudgets
+
+        budgets = DetectorBudgets.from_config(self._config.chatgpt, model)
 
         async def _preflight() -> None:
             """Raise RateLimitError if the pop-up is present right now."""
@@ -638,7 +648,9 @@ class APIServer:
         )
 
         try:
-            async for chunk in self._driver.send_and_stream(text, timeout=timeout):
+            async for chunk in self._driver.send_and_stream(
+                text, timeout=timeout, budgets=budgets, model=model,
+            ):
                 if chunk.delta:
                     await self._send_sse(
                         resp,

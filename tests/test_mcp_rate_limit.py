@@ -33,7 +33,7 @@ def _make_server_with_raising_driver(raises: Exception | None):
     driver._current_conv_id = ""
     driver._current_model = None
 
-    async def _stream(text, timeout=120):
+    async def _stream(text, timeout=120, *, budgets=None, model=None):
         if raises is not None:
             raise raises
         from chatgpt_web2api.cdp_driver import StreamChunk
@@ -110,7 +110,7 @@ async def test_mcp_chat_transient_rate_limit_retries_transparently(monkeypatch):
 
     attempts = {"n": 0}
 
-    async def _stream(text, timeout=120):
+    async def _stream(text, timeout=120, *, budgets=None, model=None):
         attempts["n"] += 1
         if attempts["n"] == 1:
             raise RateLimitError(retry_after=1)

@@ -26,7 +26,7 @@ def mock_driver():
     driver.select_model = AsyncMock(return_value=True)
 
     # Wire send_and_stream to yield a simple response
-    async def _stream(text, timeout=120):
+    async def _stream(text, timeout=120, *, budgets=None, model=None):
         yield StreamChunk(delta="Hello!")
         yield StreamChunk(delta="", finish_reason="stop")
 
@@ -497,7 +497,7 @@ async def test_api_message_history_includes_assistant():
 
     captured_text = {}
 
-    async def _stream(text, timeout=120):
+    async def _stream(text, timeout=120, *, budgets=None, model=None):
         captured_text["value"] = text
         yield StreamChunk(delta="Response")
         yield StreamChunk(delta="", finish_reason="stop")
@@ -546,7 +546,7 @@ async def test_api_model_selection_called():
     driver._access_token = "test"
     driver.select_model = AsyncMock(return_value=True)
 
-    async def _stream(text, timeout=120):
+    async def _stream(text, timeout=120, *, budgets=None, model=None):
         yield StreamChunk(delta="OK")
         yield StreamChunk(delta="", finish_reason="stop")
 

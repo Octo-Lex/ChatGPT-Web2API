@@ -27,7 +27,7 @@ def _streaming_driver(deltas):
     driver.navigate_conversation = AsyncMock()
     driver.navigate_gpt = AsyncMock()
 
-    async def _stream(text, timeout=120):
+    async def _stream(text, timeout=120, *, budgets=None, model=None):
         for d in deltas:
             yield StreamChunk(delta=d)
         yield StreamChunk(delta="", finish_reason="stop")

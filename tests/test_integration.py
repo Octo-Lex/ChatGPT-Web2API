@@ -43,7 +43,7 @@ def make_mock_driver():
     driver.is_connected = True
     driver._access_token = "test-token"
 
-    async def _stream(text, timeout=120):
+    async def _stream(text, timeout=120, *, budgets=None, model=None):
         yield StreamChunk(delta="Mocked ChatGPT response")
         yield StreamChunk(delta="", finish_reason="stop")
 

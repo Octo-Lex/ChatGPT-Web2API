@@ -778,7 +778,18 @@ async def do_chat_completion(
     full_response = ""
     conv_id = ""
     chunk_count = 0
-    async for chunk in driver.send_and_stream(full_text, timeout=120):
+    # P1: resolve model-aware detector budgets from config. Guard against
+    # config=None (some test paths) by falling back to legacy behavior.
+    from .completion_detector import DetectorBudgets
+
+    _budgets = (
+        DetectorBudgets.from_config(config.chatgpt, validated.model)
+        if config is not None
+        else None
+    )
+    async for chunk in driver.send_and_stream(
+        full_text, timeout=120, budgets=_budgets, model=validated.model,
+    ):
         if chunk.delta:
             full_response += chunk.delta
             chunk_count += 1
