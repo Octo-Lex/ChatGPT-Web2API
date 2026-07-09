@@ -83,6 +83,10 @@ COMPOSER_FALLBACK_SELECTOR = "textarea#prompt-textarea"
 # the legacy testid for older deployments.
 SEND_BUTTON_SELECTOR = 'button[aria-label*="Send" i]:not([data-testid="stop-button"])'
 SEND_BUTTON_FALLBACK_SELECTOR = 'button[data-testid="send-button"]'
+# P2.5: broader fallback — a submit-type button inside the composer form.
+# If ChatGPT changes the aria-label (selector drift), a type=submit button
+# inside the form is still the send affordance. This is the LAST resort.
+SEND_BUTTON_BROAD_SELECTOR = 'form button[type="submit"]'
 
 # Send-button readiness poll. After a prior send completes (or under parallel
 # mode, where the MutationLock releases the instant a send finishes), ChatGPT's
@@ -406,7 +410,8 @@ class ChatGPTDom:
             has_btn = await d._js(
                 "(function() {"
                 f"  var btn = document.querySelector('{SEND_BUTTON_SELECTOR}')"
-                f"       || document.querySelector('{SEND_BUTTON_FALLBACK_SELECTOR}');"
+                f"       || document.querySelector('{SEND_BUTTON_FALLBACK_SELECTOR}')"
+                f"       || document.querySelector('{SEND_BUTTON_BROAD_SELECTOR}');"
                 "  return btn && !btn.disabled ? 'yes' : 'no';"
                 "})()"
             )
@@ -417,7 +422,8 @@ class ChatGPTDom:
         result = await d._js(
             "(function() {"
             f"  var btn = document.querySelector('{SEND_BUTTON_SELECTOR}')"
-            f"       || document.querySelector('{SEND_BUTTON_FALLBACK_SELECTOR}');"
+            f"       || document.querySelector('{SEND_BUTTON_FALLBACK_SELECTOR}')"
+            f"       || document.querySelector('{SEND_BUTTON_BROAD_SELECTOR}');"
             "  if (!btn) return 'no send button';"
             "  if (btn.disabled) return 'button disabled';"
             "  var evts = ['pointerdown','mousedown','pointerup','mouseup','click'];"
@@ -507,23 +513,44 @@ class ChatGPTDom:
     # ── Diagnostics ───────────────────────────────────────────
 
     async def _capture_selector_diagnostic(self, selector_name: str) -> None:
-        """#5: Capture DOM state when a selector fails to match.
+        """#5 / P2.5: Capture DOM state when a selector fails to match.
 
-        Logs a diagnostic snapshot (URL, title, body text preview, button count)
-        so selector drift is diagnosable without W2A_DIAGNOSE=1. Called at the
-        point of selector failure (e.g. 'no send button', 'No textarea').
-        Best-effort — never raises.
+        Logs a rich diagnostic snapshot so selector drift and send-readiness
+        failures are diagnosable without W2A_DIAGNOSE=1. Called at the point of
+        selector failure (e.g. 'no send button', 'No textarea'). Best-effort —
+        never raises.
+
+        P2.5 (2026-07-09): expanded from url/title/body/button_count to include
+        send-readiness-specific fields (ChatGPT's proposed readiness snapshot):
+        - composer_found / composer_text_length / composer_enabled: distinguishes
+          "text didn't land" (injection failed) from "selector drifted"
+        - send_candidates_count / enabled_send_candidates_count: how many buttons
+          match a broad send heuristic, and how many are enabled
+        - stop_button_present / generating_indicator_present: is a generation
+          in progress (the send button is replaced by stop during generation)
         """
         d = self._driver
         try:
             snapshot = await d._js_strict(
                 "(function(){"
+                "  var composer = document.querySelector('" + COMPOSER_SELECTOR + "')"
+                "       || document.querySelector('" + COMPOSER_FALLBACK_SELECTOR + "');"
+                "  var sendCandidates = document.querySelectorAll('button[type=\"submit\"], button[aria-label*=\"Send\" i], button[data-testid=\"send-button\"]');"
+                "  var enabledSend = Array.prototype.filter.call(sendCandidates, function(b){ return !b.disabled; });"
+                "  var stopBtn = document.querySelector('[data-testid=\"stop-button\"], button[aria-label*=\"Stop\" i]');"
                 "  return JSON.stringify({"
                 "    url: location.href,"
                 "    title: document.title,"
                 "    body_preview: (document.body && document.body.innerText || '').slice(0, 300),"
                 "    button_count: document.querySelectorAll('button').length,"
-                "    textarea_count: document.querySelectorAll('textarea').length"
+                "    textarea_count: document.querySelectorAll('textarea').length,"
+                "    composer_found: !!composer,"
+                "    composer_text_length: composer ? (composer.innerText || composer.value || '').length : 0,"
+                "    composer_enabled: composer ? !composer.disabled : false,"
+                "    send_candidates_count: sendCandidates.length,"
+                "    enabled_send_candidates_count: enabledSend.length,"
+                "    stop_button_present: !!stopBtn,"
+                "    generating_indicator_present: !!document.querySelector('[class*=\"result-thinking\"], [class*=\"generating\"]')"
                 "  });"
                 "})()",
                 timeout=5,
