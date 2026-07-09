@@ -85,6 +85,64 @@ from .chatgpt_dom import (  # noqa: E402,F401
 )
 
 
+# ── P2: Navigation readiness probe ────────────────────────────────────────
+#
+# Co-designed with ChatGPT (vision-alignment cycle, conversation 6a4ebb2a).
+# Replaces the opaque "ready composer" poll with a staged probe that captures
+# WHICH readiness stage passed and which failed. When the poll fails, the
+# error message names the stage (e.g. "url correct but composer not present")
+# instead of the old "did not reach a ready composer within the timeout".
+#
+# Stages (each must pass for the next to matter):
+#   url_correct → document_ready → app_shell_present → composer_present
+
+@dataclass
+class NavigationReadinessProbe:
+    """Results of a single navigation-readiness probe poll.
+
+    Captured each poll iteration so the caller can build a diagnostic error
+    message naming the stage that failed. The JS probe evaluates all stages
+    in one ``Runtime.evaluate`` call (no extra round-trips).
+    """
+    url: str
+    ready_state: str
+    app_shell_present: bool
+    composer_present: bool
+
+    @property
+    def document_ready(self) -> bool:
+        return self.ready_state == "complete"
+
+    def is_ready(self, url_correct: bool) -> bool:
+        """All stages passed — page loaded AND composer ready AND URL matches.
+
+        ``url_correct`` is passed by the caller (it knows the target
+        conversation_id; the probe doesn't).
+        """
+        return (
+            url_correct
+            and self.document_ready
+            and self.app_shell_present
+            and self.composer_present
+        )
+
+    def diagnostic_summary(self, url_correct: bool) -> str:
+        """Human-readable description of which stage failed.
+
+        Names the first failing stage so the error message points at the
+        real problem instead of an opaque 'timeout'.
+        """
+        if not url_correct:
+            return f"url displaced (got {self.url[:80]})"
+        if not self.document_ready:
+            return f"document still loading (readyState={self.ready_state})"
+        if not self.app_shell_present:
+            return "app shell not present (ChatGPT nav/sidebar missing)"
+        if not self.composer_present:
+            return "composer not present (selector did not match after page loaded)"
+        return "all stages passed"
+
+
 class RateLimitError(RuntimeError):
     """Raised when ChatGPT shows its 'Too many requests' rate-limit pop-up.
 
@@ -1198,43 +1256,87 @@ class CDPDriver:
         raises — never admits an unverified conversation as current. This
         is the invariant the auto-continue paths depend on: ``_current_conv_id``
         means "the live tab is here", not "we attempted to go here".
+
+        P2 (2026-07-09): the readiness poll is now staged — it probes
+        url → document.readyState → app shell → composer in one JS call
+        and captures which stage failed. The error message names the stage
+        instead of the old opaque "did not reach a ready composer." Also
+        fast-fails with ``nav_displaced`` if the URL moves away from the
+        target mid-poll (detects SPA redirects / access-denied states).
         """
         url = f"https://chatgpt.com/c/{conversation_id}"
         logger.info("Navigate to conversation: %s", url)
         await self._cdp("Page.navigate", {"url": url})
         await asyncio.sleep(3)
 
-        # Wait for composer (new ProseMirror div, or legacy textarea) AND a
-        # verified landing. A for/else means: if the loop completes without
-        # `break` (never became ready at the right URL), the else runs and we
-        # fail rather than falling through to admit an unverified conversation.
+        # P2: staged readiness probe. Evaluates all stages in one JS call
+        # (no extra round-trips). Uses _js_strict so transient JS failures
+        # are visible (logged) rather than silently burning poll iterations.
+        probe_js = (
+            "(function() {"
+            "  return JSON.stringify({"
+            "    url: location.href,"
+            "    ready_state: document.readyState,"
+            f"    app_shell: !!document.querySelector('nav') || !!document.querySelector('[class*=\"sidebar\"]'),"
+            f"    composer: !!document.querySelector('{COMPOSER_SELECTOR}') || !!document.querySelector('{COMPOSER_FALLBACK_SELECTOR}')"
+            "  });"
+            "})()"
+        )
+
+        last_probe: NavigationReadinessProbe | None = None
+        url_was_correct = False  # track if URL was ever correct (for displacement)
+
         for _ in range(30):
-            result = await self._js(
-                "(function() {"
-                "  return JSON.stringify({"
-                f"    ready: !!document.querySelector('{COMPOSER_SELECTOR}') || !!document.querySelector('{COMPOSER_FALLBACK_SELECTOR}'),"
-                "    url: location.href"
-                "  });"
-                "})()"
-            )
             try:
-                state = json.loads(result)
-            except (json.JSONDecodeError, TypeError):
-                state = {}
-            if state.get("ready") and self._is_url_at_conversation(
-                state.get("url", ""), conversation_id
-            ):
-                logger.info("Conversation ready: %s", state.get("url", ""))
+                result = await self._js_strict(probe_js)
+                data = json.loads(result)
+            except Exception as e:
+                # P2: log transient JS failures instead of silently swallowing.
+                logger.debug("Navigation probe JS failed (will retry): %s", e)
+                await asyncio.sleep(0.5)
+                continue
+
+            probe = NavigationReadinessProbe(
+                url=data.get("url", ""),
+                ready_state=data.get("ready_state", ""),
+                app_shell_present=bool(data.get("app_shell")),
+                composer_present=bool(data.get("composer")),
+            )
+            last_probe = probe
+            url_correct = self._is_url_at_conversation(probe.url, conversation_id)
+
+            # P2: fast-fail on URL displacement. If the URL was correct on a
+            # prior poll but is now wrong, the page navigated away (SPA redirect,
+            # access denied, conversation deleted). Don't burn the full 15s.
+            if url_correct:
+                url_was_correct = True
+            elif url_was_correct:
+                if self._current_conv_id == conversation_id:
+                    self._current_conv_id = None
+                raise RuntimeError(
+                    f"Navigation to {conversation_id} displaced — URL moved "
+                    f"to {probe.url[:80]} after initially loading (nav_displaced)"
+                )
+
+            if probe.is_ready(url_correct):
+                logger.info("Conversation ready: %s", probe.url)
                 break
             await asyncio.sleep(0.5)
         else:
             # Loop exhausted without a verified landing. Clear any stale
-            # state that might point here so a later auto-continue can't
-            # reuse a known-unverified id, then surface the failure.
+            # state and raise with P2 staged diagnostics.
             if self._current_conv_id == conversation_id:
                 self._current_conv_id = None
+            if last_probe is not None:
+                url_correct = self._is_url_at_conversation(last_probe.url, conversation_id)
+                stage = last_probe.diagnostic_summary(url_correct)
+                raise RuntimeError(
+                    f"Navigation to {conversation_id} failed after 15s — "
+                    f"stage: {stage}"
+                )
             raise RuntimeError(
-                f"Navigation to {conversation_id} did not reach a ready composer within the timeout"
+                f"Navigation to {conversation_id} failed — all probes errored "
+                f"(no readiness data obtained)"
             )
 
         await asyncio.sleep(1)

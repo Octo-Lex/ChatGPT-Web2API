@@ -196,10 +196,13 @@ async def test_navigate_conversation_sets_id_only_on_verified_landing():
     d = CDPDriver(cdp_port=9222)
     cid = "abc-123"
     d._cdp = AsyncMock()  # Page.navigate
-    # _js returns a ready state at the right URL on first poll.
-    d._js = AsyncMock(return_value=json.dumps({
-        "ready": True,
+    # P2: navigate_conversation now uses _js_strict with a staged probe.
+    # Return a ready state at the right URL on first poll.
+    d._js_strict = AsyncMock(return_value=json.dumps({
         "url": f"https://chatgpt.com/c/{cid}",
+        "ready_state": "complete",
+        "app_shell": True,
+        "composer": True,
     }))
     await d.navigate_conversation(cid)
     assert d._current_conv_id == cid
@@ -214,14 +217,20 @@ async def test_navigate_conversation_raises_and_clears_when_never_ready(monkeypa
     cid = "abc-123"
     d._current_conv_id = cid  # pre-existing (possibly stale) state
     d._cdp = AsyncMock()
-    # Composer never ready / never at the right URL.
-    d._js = AsyncMock(return_value=json.dumps({"ready": False, "url": ""}))
+    # P2: staged probe — composer never ready.
+    d._js_strict = AsyncMock(return_value=json.dumps({
+        "url": f"https://chatgpt.com/c/{cid}",
+        "ready_state": "complete",
+        "app_shell": True,
+        "composer": False,  # composer never appears
+    }))
     # Collapse the sleeps so the 30-iteration loop runs fast.
     async def _fast(_s):
         return None
     monkeypatch.setattr("chatgpt_web2api.cdp_driver.asyncio.sleep", _fast)
 
-    with pytest.raises(RuntimeError, match="did not reach a ready composer"):
+    # P2: error message now names the failed stage instead of the old opaque msg.
+    with pytest.raises(RuntimeError, match="composer"):
         await d.navigate_conversation(cid)
     assert d._current_conv_id is None  # stale id cleared, not admitted
 
