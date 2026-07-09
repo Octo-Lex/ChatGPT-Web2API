@@ -1716,23 +1716,37 @@ class CDPDriver:
                             last_dom_text = result.text
                         break
                     if result.status == "non_text":
-                        break  # placeholder path below
+                        # P2.5 RCA fix: non_text is NOT terminal here. The backend
+                        # propagates intermediary nodes (reasoning_recap, thoughts,
+                        # model_editable_context) BEFORE the final text node.
+                        # Treating non_text as terminal caused an intermittent
+                        # race: the reconciliation saw the intermediaries,
+                        # concluded "non-text", and yielded the placeholder even
+                        # though the text node would appear within seconds.
+                        # Now: keep polling (like not_ready) — the text node may
+                        # still be propagating. Only after the loop exhausts do we
+                        # yield the placeholder.
+                        pass
                     if result.status in ("ambiguous", "degraded_not_fresh", "fetch_failed"):
                         # Keep polling — these may resolve as the backend settles.
                         pass
                     # not_ready → keep polling.
                     await asyncio.sleep(0.5)
                 else:
-                    # Loop exhausted without match — raise typed error.
-                    raise TurnReconciliationError(
-                        conversation_id=conv_id,
-                        anchor_mode=turn_anchor.mode,
-                        last_status=last_status,
-                        diagnostic={
-                            "captured_id": turn_anchor.captured_user_message_id,
-                            "had_non_text_content": had_non_text_content,
-                        },
-                    )
+                    # Loop exhausted without a text match.
+                    # If the last status was non_text (genuinely non-text
+                    # response after full polling), fall through to the
+                    # placeholder below. Otherwise raise a typed error.
+                    if last_status != "non_text":
+                        raise TurnReconciliationError(
+                            conversation_id=conv_id,
+                            anchor_mode=turn_anchor.mode,
+                            last_status=last_status,
+                            diagnostic={
+                                "captured_id": turn_anchor.captured_user_message_id,
+                                "had_non_text_content": had_non_text_content,
+                            },
+                        )
                 # Non-text placeholder (unchanged from pre-A2).
                 if not last_dom_text and had_non_text_content:
                     placeholder = (
