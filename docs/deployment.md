@@ -287,8 +287,49 @@ W2A_PARALLEL_TABS=1 chatgpt-web2api --port 8082 --cdp-port 9222
 
 > **Rollout warning:** do not mix old (port-lock-only) workers and new
 > (`parallel_tabs=true`) workers on the **same CDP port** during a rolling
-> upgrade — their lock files don't exclude each other. Finish the rollout on a
-> port before enabling parallel mode on it.
+> upgrade — their lock files don't exclude each other. Finish the rollout on
+> a port before enabling parallel mode on it.
+
+### Other CDP clients on the same Chrome (Super-Browser, Playwright, etc.)
+
+The bridge creates **owned tabs** (`tab_mode="owned"`, the default) — each
+driver gets its own dedicated tab via `Target.createTarget` and its own
+websocket. A `Page.navigate` issued by one CDP client goes over that client's
+websocket to that client's tab; it **cannot** navigate another client's tab.
+CDP targets are independent.
+
+However, running multiple CDP clients (e.g., 4 Super-Browser MCP servers + the
+bridge + the MCP server = 6+ clients) on one Chrome instance can still
+**degrade reliability** through resource contention:
+
+- **CPU/memory saturation** — each CDP client drives React hydration, DOM
+  polling, and JS evaluation. Under load, the Chrome renderer can slow
+  enough that ChatGPT's SPA fails to hydrate the composer within the
+  bridge's readiness window (see P2 staged readiness diagnostics).
+- **CDP HTTP endpoint queuing** — the `/json/list` and `/json/version`
+  endpoints are served by Chrome's DevTools HTTP server, which is
+  single-threaded. Many clients polling concurrently can introduce latency.
+- **Profile-level state** — all tabs share one Chrome profile (one account,
+  one cookie jar, one service worker). A service-worker update or auth
+  redirect on one tab can briefly affect the others.
+
+**What this means in practice:** the bridge's write path (navigate + send)
+is more sensitive to these effects than the read path (list/get
+conversations via `/backend-api/*`), because the write path requires
+DOM-level readiness (composer hydrated, send button enabled) while the read
+path is a pure HTTP fetch. If you observe "navigation timeout" or "no send
+button" errors that worsen as more clients connect, consider:
+
+1. Running the bridge on a **dedicated Chrome instance** (separate
+   `--user-data-dir` and `--cdp-port`).
+2. Reducing the number of concurrent CDP clients on the shared Chrome.
+3. Enabling `parallel_tabs: true` so the bridge and MCP server each get
+  their own tab (they do by default with `tab_mode="owned"`, but
+  `parallel_tabs` adds per-target locking and fail-closed semantics).
+
+The bridge's error messages now include staged diagnostics (P2) that name
+the failing readiness stage, making this degradation diagnosable rather
+than opaque.
 
 ---
 
