@@ -1284,14 +1284,20 @@ class CDPDriver:
         )
 
         last_probe: NavigationReadinessProbe | None = None
+        last_js_error: str | None = None
         url_was_correct = False  # track if URL was ever correct (for displacement)
+        displacement_count = 0  # P2 review: debounce — require 2 consecutive wrong polls
 
         for _ in range(30):
             try:
                 result = await self._js_strict(probe_js)
                 data = json.loads(result)
+                last_js_error = None  # successful probe clears the error
             except Exception as e:
                 # P2: log transient JS failures instead of silently swallowing.
+                # Distinguish "probe execution failed" from "stage failed" per
+                # ChatGPT review finding C.
+                last_js_error = str(e)
                 logger.debug("Navigation probe JS failed (will retry): %s", e)
                 await asyncio.sleep(0.5)
                 continue
@@ -1305,18 +1311,23 @@ class CDPDriver:
             last_probe = probe
             url_correct = self._is_url_at_conversation(probe.url, conversation_id)
 
-            # P2: fast-fail on URL displacement. If the URL was correct on a
-            # prior poll but is now wrong, the page navigated away (SPA redirect,
-            # access denied, conversation deleted). Don't burn the full 15s.
+            # P2: fast-fail on URL displacement with debounce (review finding B).
+            # If the URL was correct on a prior poll but is now wrong, the page
+            # may have navigated away (SPA redirect, access denied, conversation
+            # deleted). Require 2 CONSECUTIVE wrong-URL polls to avoid
+            # false-positive on SPA route normalization / param stripping.
             if url_correct:
                 url_was_correct = True
+                displacement_count = 0
             elif url_was_correct:
-                if self._current_conv_id == conversation_id:
-                    self._current_conv_id = None
-                raise RuntimeError(
-                    f"Navigation to {conversation_id} displaced — URL moved "
-                    f"to {probe.url[:80]} after initially loading (nav_displaced)"
-                )
+                displacement_count += 1
+                if displacement_count >= 2:
+                    if self._current_conv_id == conversation_id:
+                        self._current_conv_id = None
+                    raise RuntimeError(
+                        f"Navigation to {conversation_id} displaced — URL moved "
+                        f"to {probe.url[:80]} after initially loading (nav_displaced)"
+                    )
 
             if probe.is_ready(url_correct):
                 logger.info("Conversation ready: %s", probe.url)
@@ -1336,7 +1347,7 @@ class CDPDriver:
                 )
             raise RuntimeError(
                 f"Navigation to {conversation_id} failed — all probes errored "
-                f"(no readiness data obtained)"
+                f"(no readiness data obtained, last_js_error={last_js_error})"
             )
 
         await asyncio.sleep(1)

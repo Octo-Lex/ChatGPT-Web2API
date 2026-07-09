@@ -174,10 +174,13 @@ async def test_navigate_fast_fails_on_url_displacement(monkeypatch):
     driver = CDPDriver(cdp_port=9222)
     driver._cdp = AsyncMock()
 
-    # First poll: URL is correct (still loading). Second poll: URL displaced.
+    # First poll: URL is correct (still loading). Then 2 displaced polls
+    # (debounce requires 2 consecutive wrong polls per ChatGPT review finding B).
     polls = [
         _probe_payload(url="https://chatgpt.com/c/conv-123", ready_state="loading",
                        app_shell=False, composer=False),
+        _probe_payload(url="https://chatgpt.com/c/DIFFERENT",
+                       ready_state="complete", app_shell=True, composer=True),
         _probe_payload(url="https://chatgpt.com/c/DIFFERENT",
                        ready_state="complete", app_shell=True, composer=True),
     ]
