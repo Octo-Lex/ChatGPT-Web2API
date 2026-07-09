@@ -83,10 +83,15 @@ COMPOSER_FALLBACK_SELECTOR = "textarea#prompt-textarea"
 # the legacy testid for older deployments.
 SEND_BUTTON_SELECTOR = 'button[aria-label*="Send" i]:not([data-testid="stop-button"])'
 SEND_BUTTON_FALLBACK_SELECTOR = 'button[data-testid="send-button"]'
-# P2.5: broader fallback — a submit-type button inside the composer form.
-# If ChatGPT changes the aria-label (selector drift), a type=submit button
-# inside the form is still the send affordance. This is the LAST resort.
-SEND_BUTTON_BROAD_SELECTOR = 'form button[type="submit"]'
+# P2.5: broader fallback — a submit-type button inside the COMPOSER FORM
+# (scoped to the form containing #prompt-textarea, not page-global, to avoid
+# hitting login/search/feedback forms if the page is displaced). If ChatGPT
+# changes the aria-label (selector drift), a submit-type button inside the
+# composer form is still the send affordance. This is the LAST resort.
+SEND_BUTTON_BROAD_SELECTOR = (
+    'form:has(#prompt-textarea) button[type="submit"],'
+    'form:has(.ProseMirror) button[type="submit"]'
+)
 
 # Send-button readiness poll. After a prior send completes (or under parallel
 # mode, where the MutationLock releases the instant a send finishes), ChatGPT's
