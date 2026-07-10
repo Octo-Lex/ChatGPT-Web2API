@@ -1372,13 +1372,15 @@ class CDPDriver:
         if "chatgpt.com" not in (parsed.netloc or "").lower():
             return False
         parts = [p for p in parsed.path.split("/") if p]
-        # Find the "c" segment — it's the conversation-route marker in both
-        # non-project (["c", "{id}"]) and project-scoped
-        # (["g", "{gizmo}", "c", "{id}"]) URL shapes.
-        for i, part in enumerate(parts):
-            if part == "c" and i + 1 < len(parts):
-                return parts[i + 1] == conversation_id
-        return False
+        # Find the ("c", conversation_id) adjacent pair — the conversation
+        # route marker in both non-project (["c", "{id}"]) and project-scoped
+        # (["g", "{gizmo}", "c", "{id}"]) URL shapes. Using the adjacent pair
+        # (rather than just finding the first "c") avoids false-positives if
+        # a "c" segment appears earlier in a different context.
+        return any(
+            parts[i] == "c" and parts[i + 1] == conversation_id
+            for i in range(len(parts) - 1)
+        )
 
     async def _is_live_conversation_url(self, conversation_id: str) -> bool:
         """Read ``location.href`` and check it is at *conversation_id*.
