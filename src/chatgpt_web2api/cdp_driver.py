@@ -1357,9 +1357,10 @@ class CDPDriver:
     def _is_url_at_conversation(url: str, conversation_id: str) -> bool:
         """Exact path-segment match: is *url* at ``/c/{conversation_id}``?
 
-        Uses urllib to parse the path and compare the second segment, so a
-        high-entropy id can't accidentally match as a substring of another
-        path. Query strings and trailing slashes are tolerated; a different
+        Handles both non-project URLs (``/c/{id}``) and project-scoped URLs
+        (``/g/{gizmo_id}/c/{id}``). Finds the ``c`` path segment and checks
+        if the segment immediately after it matches the conversation ID.
+        Query strings and trailing slashes are tolerated; a different
         conversation id or a non-conversation URL returns False.
         """
         if not url or not conversation_id:
@@ -1371,8 +1372,13 @@ class CDPDriver:
         if "chatgpt.com" not in (parsed.netloc or "").lower():
             return False
         parts = [p for p in parsed.path.split("/") if p]
-        # Expected shape: ["c", "<conversation_id>"]
-        return len(parts) >= 2 and parts[0] == "c" and parts[1] == conversation_id
+        # Find the "c" segment — it's the conversation-route marker in both
+        # non-project (["c", "{id}"]) and project-scoped
+        # (["g", "{gizmo}", "c", "{id}"]) URL shapes.
+        for i, part in enumerate(parts):
+            if part == "c" and i + 1 < len(parts):
+                return parts[i + 1] == conversation_id
+        return False
 
     async def _is_live_conversation_url(self, conversation_id: str) -> bool:
         """Read ``location.href`` and check it is at *conversation_id*.
