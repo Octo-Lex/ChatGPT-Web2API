@@ -561,6 +561,17 @@ class CDPDriver:
                         f"Owned-tab creation failed in parallel mode; refusing "
                         f"shared-tab fallback: {e}"
                     ) from e
+                if self.tab_mode == "owned":
+                    # Owned mode: never adopt an arbitrary tab. The adopt
+                    # fallback (_find_page_ws) picks ANY chatgpt.com tab,
+                    # which could belong to another process — causing two
+                    # drivers to race on the same tab. Fail closed instead;
+                    # the caller (ensure/connect) will retry or surface the
+                    # error. (ChatGPT design review, conv 6a507b4c.)
+                    raise RuntimeError(
+                        f"Owned-tab creation failed and shared-tab fallback "
+                        f"is disabled in owned mode: {e}"
+                    ) from e
                 logger.warning("Tab isolation failed (%s) — falling back to shared tab", e)
                 self._target_id = None
                 self._owns_target = False
@@ -747,6 +758,16 @@ class CDPDriver:
                                 f"Reconnect owned-tab creation failed in "
                                 f"parallel mode; refusing fallback: {create_err}"
                             ) from create_err
+                        if self.tab_mode == "owned":
+                            # Owned mode: tab creation failed and we must not
+                            # fall back to adopting an arbitrary tab. Raise
+                            # OwnedTabRequiredError so the reconnect retry
+                            # loop doesn't swallow it.
+                            raise OwnedTabRequiredError(
+                                f"Reconnect owned-tab creation failed and "
+                                f"shared-tab fallback is disabled in owned "
+                                f"mode: {create_err}"
+                            ) from create_err
                         raise
                 if not ws_url:
                     if self._parallel_tabs:
@@ -754,6 +775,17 @@ class CDPDriver:
                         raise OwnedTabRequiredError(
                             "Reconnect could not obtain an owned tab; refusing "
                             "shared-tab fallback in parallel mode"
+                        )
+                    if self.tab_mode == "owned":
+                        # Owned mode: never adopt an arbitrary tab on reconnect.
+                        # The adopt fallback could steal another process's tab,
+                        # causing two drivers to race on the same DOM. Fail
+                        # closed — raise OwnedTabRequiredError so the reconnect
+                        # retry loop doesn't swallow it (it's in the immediate-
+                        # raise list at line 802).
+                        raise OwnedTabRequiredError(
+                            "Reconnect could not obtain an owned tab and "
+                            "shared-tab fallback is disabled in owned mode"
                         )
                     ws_url = await self._find_page_ws()
                 self._ws = await websockets.connect(

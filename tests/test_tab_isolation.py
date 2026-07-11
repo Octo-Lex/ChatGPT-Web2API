@@ -120,31 +120,33 @@ async def test_close_closes_owned_tab():
 # ── 3. Fallback to shared tab when createTarget fails ─────────────────
 
 @pytest.mark.asyncio
-async def test_connect_falls_back_to_shared_tab():
-    """When _browser_cdp raises, connect() falls back to _find_page_ws()."""
+async def test_connect_owned_mode_fails_closed_on_tab_creation_failure():
+    """When _create_owned_tab fails in owned mode, connect() must NOT fall
+    back to _find_page_ws. It raises — never steals another process's tab.
+
+    (Previously connect fell back to a shared tab; that was removed because
+    it could adopt another process's tab, causing two drivers to race on
+    the same DOM. See ChatGPT design review, conv 6a507b4c.)
+    """
     d = _make_driver()
 
-    # Mock _browser_cdp to fail
+    # Mock _browser_cdp to fail (Target.createTarget fails)
     async def failing_browser_cdp(method, params=None, timeout=10):
         raise ConnectionError("browser WS unavailable")
     d._browser_cdp = failing_browser_cdp
 
-    # Mock _find_page_ws to succeed
-    async def fake_find_page_ws():
-        return "ws://fake/shared-tab"
-    d._find_page_ws = fake_find_page_ws
-    # No tab to adopt — forces the createTarget path, which fails and falls
-    # back to shared-tab mode.
+    # Mock _find_page_ws — it should NOT be called
+    d._find_page_ws = AsyncMock(return_value="ws://fake/shared-tab")
     d._adopt_existing_chatgpt_tab = lambda: None
-    d._wait_for_chatgpt_ready = AsyncMock()  # see test_connect_creates_owned_tab
+    d._wait_for_chatgpt_ready = AsyncMock()
     d._refresh_token = AsyncMock()
     mock_connect, fake_ws = _mock_ws_connect()
     with patch("chatgpt_web2api.cdp_driver.websockets.connect", mock_connect):
-        await d.connect()
+        with pytest.raises(RuntimeError, match="shared-tab fallback is disabled in owned mode"):
+            await d.connect()
 
-    assert d._target_id is None  # no owned tab — using shared
-    assert d._owns_target is False
-    assert d._ws is not None
+    # _find_page_ws must NOT have been called — no tab theft
+    d._find_page_ws.assert_not_called()
 
 
 # ── 4. close does NOT call closeTarget without an owned tab ───────────
