@@ -15,13 +15,12 @@ P2.5 scope:
 import asyncio
 import json
 import logging
-import time as _time
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 
-from chatgpt_web2api.chatgpt_dom import ChatGPTDom
 from chatgpt_web2api.cdp_driver import CDPDriver, SendReadinessError
+from chatgpt_web2api.chatgpt_dom import ChatGPTDom
 
 
 @pytest.fixture(autouse=True)

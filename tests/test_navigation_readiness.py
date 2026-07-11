@@ -219,7 +219,6 @@ async def test_navigate_fast_fails_on_url_displacement(monkeypatch):
 async def test_navigate_waits_for_document_ready(monkeypatch):
     """When readyState='loading', the poll should wait, not count against
     the stall budget. This tests the document.readyState check."""
-    import time
 
     driver = CDPDriver(cdp_port=9222)
     driver._cdp = AsyncMock()

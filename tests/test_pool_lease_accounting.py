@@ -12,9 +12,7 @@ Verifies:
   5. status() includes lease accounting summary.
 """
 
-import asyncio
 import logging
-import time
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -52,7 +50,7 @@ async def test_acquire_creates_lease_record():
     """Acquiring a lease creates a record with lease_id, session_key, timestamp."""
     pool = _make_pool(max_size=2)
     try:
-        async with pool.acquire("session-1") as lease:
+        async with pool.acquire("session-1"):
             # The pool should have exactly one active lease record.
             assert len(pool.active_leases) == 1, (
                 f"expected 1 active lease, got {len(pool.active_leases)}"

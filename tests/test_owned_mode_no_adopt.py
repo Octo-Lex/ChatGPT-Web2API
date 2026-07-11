@@ -11,7 +11,6 @@ These tests verify that in owned mode:
   3. adopt mode still falls back (the legacy behavior is preserved)
 """
 
-import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest

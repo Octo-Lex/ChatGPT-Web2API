@@ -19,9 +19,9 @@ Timing is controlled via a fake clock to keep tests deterministic and fast.
 import asyncio
 import json
 import time
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from unittest.mock import AsyncMock, MagicMock
 
 from chatgpt_web2api.completion_detector import (
     CompletionDetector,

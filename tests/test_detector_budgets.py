@@ -18,7 +18,6 @@ from chatgpt_web2api.completion_detector import (
     classify_model,
 )
 
-
 # ── classify_model ──────────────────────────────────────────────────────
 
 
