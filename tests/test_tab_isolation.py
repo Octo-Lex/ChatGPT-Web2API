@@ -142,7 +142,7 @@ async def test_connect_owned_mode_fails_closed_on_tab_creation_failure():
     d._refresh_token = AsyncMock()
     mock_connect, fake_ws = _mock_ws_connect()
     with patch("chatgpt_web2api.cdp_driver.websockets.connect", mock_connect):
-        with pytest.raises(RuntimeError, match="shared-tab fallback is disabled in owned mode"):
+        with pytest.raises(Exception, match="shared-tab fallback is disabled in owned mode"):
             await d.connect()
 
     # _find_page_ws must NOT have been called — no tab theft

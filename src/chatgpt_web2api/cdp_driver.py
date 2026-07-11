@@ -565,10 +565,11 @@ class CDPDriver:
                     # Owned mode: never adopt an arbitrary tab. The adopt
                     # fallback (_find_page_ws) picks ANY chatgpt.com tab,
                     # which could belong to another process — causing two
-                    # drivers to race on the same tab. Fail closed instead;
-                    # the caller (ensure/connect) will retry or surface the
-                    # error. (ChatGPT design review, conv 6a507b4c.)
-                    raise RuntimeError(
+                    # drivers to race on the same tab. Fail closed with
+                    # OwnedTabRequiredError (consistent with reconnect path)
+                    # so callers have one stable failure contract.
+                    # (ChatGPT design review, conv 6a507b4c + 6a526e19.)
+                    raise OwnedTabRequiredError(
                         f"Owned-tab creation failed and shared-tab fallback "
                         f"is disabled in owned mode: {e}"
                     ) from e

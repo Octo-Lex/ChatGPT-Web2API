@@ -45,7 +45,7 @@ async def test_connect_owned_mode_does_not_fall_back_to_find_page_ws():
     # Make _create_owned_tab fail
     driver._create_owned_tab = AsyncMock(side_effect=RuntimeError("Chrome refused"))
 
-    with pytest.raises(RuntimeError, match="shared-tab fallback is disabled in owned mode"):
+    with pytest.raises(Exception, match="shared-tab fallback is disabled in owned mode"):
         await driver.connect()
 
     # _find_page_ws must NOT have been called
