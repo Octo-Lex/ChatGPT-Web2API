@@ -597,9 +597,15 @@ class McpSessionDriverPool:
                     async with slot.meta_lock:
                         slot.in_flight = 0
                         slot.closing = True
+                    # Only delete the mapping and discard the active key if
+                    # this slot is STILL the current mapping for its session.
+                    # If a replacement was created while we were closing, the
+                    # identity check prevents us from deleting the replacement
+                    # OR discarding the key the replacement needs.
+                    # (ChatGPT review, conv 6a52a623 — closing-slot race.)
                     if self._slots.get(slot.session_key) is slot:
                         del self._slots[slot.session_key]
-                    self._active_keys.discard(slot.session_key)
+                        self._active_keys.discard(slot.session_key)
                     self._capacity_available.notify_all()
 
     async def close_all(self) -> None:
