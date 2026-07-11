@@ -15,8 +15,7 @@ P2.5 scope:
 import asyncio
 import json
 import logging
-import time as _time
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -62,7 +61,7 @@ def _make_dom(diag_json=None):
     driver._cdp = AsyncMock()
     driver._breakers = None
     driver._current_conv_id = "conv-1"
-    return ChatGPTDom(driver), driver
+    return ChatGptDom(driver), driver
 
 
 def _make_scripted_js(*, poll_result="no", send_result="no send button"):
