@@ -171,9 +171,16 @@ class TurnReconciliationError(RuntimeError):
         self.anchor_mode = anchor_mode
         self.last_status = last_status
         self.diagnostic = diagnostic
+        # Include the underlying fetch error in the message string so it's
+        # visible to agents (not just in the diagnostic dict that API paths
+        # don't surface). (ChatGPT review, conv 6a52f0f3.)
+        fetch_detail = ""
+        last_fetch = diagnostic.get("last_fetch_diagnostic") or {}
+        if isinstance(last_fetch, dict) and last_fetch.get("error"):
+            fetch_detail = f", fetch_error={str(last_fetch['error'])[:240]!r}"
         super().__init__(
             f"Turn reconciliation failed for {conversation_id} "
-            f"(mode={anchor_mode}, last_status={last_status})"
+            f"(mode={anchor_mode}, last_status={last_status}{fetch_detail})"
         )
 
 

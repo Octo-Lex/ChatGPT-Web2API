@@ -1545,6 +1545,8 @@ class CDPDriver:
                     elapsed_ms,
                     self._current_conv_id or "(none)",
                 )
+                # Store for send-acknowledgment baseline (ChatGPT review A).
+                self._pre_send_user_count = user_count
                 return count
 
             # Retry or fail-closed.
@@ -1574,26 +1576,35 @@ class CDPDriver:
         # Unreachable (the loop either returns or raises).
         raise SendReadinessError("send_baseline: exhausted retries unexpectedly")
 
-    async def _verify_send_acknowledged(self) -> bool:
+    async def _verify_send_acknowledged(self) -> bool | None:
         """P0 send acknowledgment (ChatGPT review, conv 6a52f0f3).
 
         After click_send dispatches synthetic mouse events, verify the message
         was actually accepted by React — not just that the JS event loop ran.
 
-        Checks two signals (either is sufficient):
-          1. User-message DOM count increased (a new [data-message-author-role=
-             "user"] node appeared), AND
-          2. Composer cleared (the prompt-textarea is empty).
+        Composite condition: user-message count increased AND composer cleared.
+        Uses the pre-send user count baseline (self._pre_send_user_count) to
+        detect the delta, not just "userCount > 0" (which is always true on
+        existing conversations).
 
-        Polls briefly (3s at 0.5s intervals) to allow React to process the
-        submission. Returns True if acknowledged, False if no signal appears.
+        Tri-state return:
+          - True: acknowledged (count increased AND composer cleared)
+          - False: conclusively NOT acknowledged (valid probes showed no delta)
+          - None: probe inconclusive (CDP errors, no valid probe obtained,
+            missing composer, or no pre-send baseline) — non-blocking
 
-        Never raises — the caller decides what to do with a False result.
+        Polls briefly (3s at 0.5s intervals). Never raises.
         """
         import time as _time
         from .chatgpt_dom import COMPOSER_SELECTOR, COMPOSER_FALLBACK_SELECTOR
 
+        pre_send_count = getattr(self, "_pre_send_user_count", None)
+        if pre_send_count is None:
+            # No baseline — can't verify a delta. Non-blocking.
+            return None
+
         deadline = _time.monotonic() + 3.0
+        valid_probe_seen = False
         while _time.monotonic() < deadline:
             try:
                 result = await self._js_strict(
@@ -1602,23 +1613,31 @@ class CDPDriver:
                     "    '[data-message-author-role=\"user\"]').length;"
                     f"  var composer = document.querySelector('{COMPOSER_SELECTOR}')"
                     f"       || document.querySelector('{COMPOSER_FALLBACK_SELECTOR}');"
-                    "  var composerEmpty = composer ? !(composer.innerText || composer.value || '').trim() : true;"
-                    "  return JSON.stringify({userCount: userMsgs, composerEmpty: composerEmpty});"
+                    "  var composerPresent = !!composer;"
+                    "  var composerEmpty = composer ? !(composer.innerText || composer.value || '').trim() : false;"
+                    "  return JSON.stringify({userCount: userMsgs, composerPresent: composerPresent, composerEmpty: composerEmpty});"
                     "})()"
                 )
                 if not result or not result.strip().startswith("{"):
-                    # Not a JSON object (empty, number, string, mock returning
-                    # detector data). Return None to signal "probe inconclusive".
-                    return None
+                    return None  # inconclusive — not a JSON object
                 state = json.loads(result)
                 if not isinstance(state, dict) or "userCount" not in state:
-                    return None
-                if state.get("userCount", 0) > 0 and state.get("composerEmpty"):
+                    return None  # inconclusive — unexpected shape
+                valid_probe_seen = True
+                # Composite: count increased AND composer present AND cleared.
+                # Missing composer (composerPresent=False) is inconclusive, not
+                # acknowledged — could be navigation, selector drift, wrong page.
+                if not state.get("composerPresent"):
+                    continue  # wait for next poll — might be transient
+                current_count = state.get("userCount", 0)
+                if current_count > pre_send_count and state.get("composerEmpty"):
                     return True
             except Exception:
                 pass
             await asyncio.sleep(0.5)
-        return False
+        # If we got valid probes but none showed acknowledgment, return False.
+        # If no valid probe was ever obtained (all CDP errors), return None.
+        return False if valid_probe_seen else None
 
     async def _capture_pre_send_fallback_anchor(self, text: str):
         """A2: build the pre-send fallback TurnAnchor (NO captured UUID yet).

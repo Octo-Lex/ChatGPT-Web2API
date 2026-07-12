@@ -59,19 +59,20 @@ async def test_send_not_acknowledged_raises_when_no_signals(monkeypatch):
     driver._identity_listener = None  # no UUID capture possible
     driver._capture_pre_send_fallback_anchor = AsyncMock(return_value=MagicMock())
     driver._assert_owned_tab_required = MagicMock()
+    # Set pre-send user count baseline so the delta check works
+    driver._pre_send_user_count = 2  # existing conversation with 2 user msgs
 
-    # After send: user count stays 0 (message didn't land), composer not cleared
+    # After send: user count stays 2 (message didn't land), composer NOT cleared
     call_count = {"n": 0}
 
     async def fake_js_strict(expr, timeout=15):
         call_count["n"] += 1
-        # Send acknowledgment probe: user count stays 0, composer NOT empty
+        # Send acknowledgment probe: count stays at 2 (no increase), composer present but NOT empty
         if "userCount" in expr and "composerEmpty" in expr:
-            return json.dumps({"userCount": 0, "composerEmpty": False})
+            return json.dumps({"userCount": 2, "composerPresent": True, "composerEmpty": False})
         if "assistant" in expr and "length" in expr:
             return "0"  # no new assistant messages
         if "prompt-textarea" in expr or "ProseMirror" in expr:
-            # Composer still has text (not cleared)
             return json.dumps({"text": "the message that should have been sent"})
         return "0"
 
@@ -98,6 +99,7 @@ async def test_send_acknowledged_when_user_count_increases(monkeypatch):
     driver._read_assistant_count_baseline = AsyncMock(return_value=0)
     driver._identity_listener = None
     driver._assert_owned_tab_required = MagicMock()
+    driver._pre_send_user_count = 0  # fresh chat, no prior user messages
 
     # Mock the anchor + fallback
     from chatgpt_web2api.turn_anchor import TurnAnchor
@@ -108,9 +110,9 @@ async def test_send_acknowledged_when_user_count_increases(monkeypatch):
     poll_count = {"n": 0}
 
     async def fake_js_strict(expr, timeout=15):
-        # Send acknowledgment check: user count + composer empty
+        # Send acknowledgment check: user count + composer present + empty
         if "userCount" in expr and "composerEmpty" in expr:
-            return json.dumps({"userCount": 1, "composerEmpty": True})
+            return json.dumps({"userCount": 1, "composerPresent": True, "composerEmpty": True})
         if "assistant" in expr and "length" in expr:
             return "1"  # assistant appeared too (completion)
         if "prompt-textarea" in expr or "ProseMirror" in expr:
@@ -147,7 +149,10 @@ async def test_send_acknowledged_when_user_count_increases(monkeypatch):
 
 def test_turn_reconciliation_error_preserves_diagnostic():
     """TurnReconciliationError must include the last fetch result's diagnostic
-    so operators can distinguish CDP timeout from HTTP error from projection failure."""
+    so operators can distinguish CDP timeout from HTTP error from projection failure.
+
+    The diagnostic must be in BOTH the .diagnostic dict AND the error string
+    (ChatGPT review: agents only see str(exc) via the API)."""
     err = TurnReconciliationError(
         conversation_id="conv-123",
         anchor_mode="fresh_chat",
@@ -155,11 +160,14 @@ def test_turn_reconciliation_error_preserves_diagnostic():
         diagnostic={
             "captured_id": "uuid-abc",
             "had_non_text_content": False,
-            "last_fetch_error": "CDP timeout: Runtime.evaluate",
             "last_fetch_diagnostic": {"error": "execution context destroyed"},
         },
     )
     msg = str(err)
     diag = err.diagnostic
-    assert "last_fetch_error" in diag, "Diagnostic must include the underlying fetch error"
-    assert "last_fetch_diagnostic" in diag, "Diagnostic must include the fetch result diagnostic"
+    # Diagnostic dict must include the underlying fetch error
+    assert "last_fetch_diagnostic" in diag, "Diagnostic dict must include the fetch diagnostic"
+    # Error string must also include it (agents see str(exc), not .diagnostic)
+    assert "execution context destroyed" in msg, (
+        f"Error string must include the fetch error, got: {msg}"
+    )
