@@ -84,7 +84,6 @@ from .chatgpt_dom import (  # noqa: E402,F401
     SEND_BUTTON_SELECTOR,
 )
 
-
 # ── P2: Navigation readiness probe ────────────────────────────────────────
 #
 # Co-designed with ChatGPT (vision-alignment cycle, conversation 6a4ebb2a).
