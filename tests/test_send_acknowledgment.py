@@ -1,16 +1,5 @@
-"""Tests: send acknowledgment + diagnostic preservation.
-
-ChatGPT code review (conv 6a52f0f3) found two defects:
-
-1. click_send dispatches events but doesn't verify React accepted the
-   submission. If the page is overloaded, the click fires but no message
-   is sent. The bridge silently enters completion detection which finds
-   nothing → reconciliation failure with no diagnostic.
-
-2. TurnReconciliationError discards the underlying fetch_failed diagnostic.
-   The actual error (CDP timeout, destroyed context, HTTP error) is lost.
-
-Fix 1: after click_send + UUID wait, verify at least one acknowledgment:
+"""
+after click_send + UUID wait, verify at least one acknowledgment:
   - UUID captured, OR
   - user-message DOM count increased AND composer cleared
   If none → raise SendNotAcknowledgedError before entering completion detection.
@@ -49,8 +38,6 @@ async def test_send_not_acknowledged_raises_when_no_signals(monkeypatch):
     """When click_send fires but no acknowledgment appears (no UUID, no DOM
     count increase, composer not cleared), the bridge must raise a typed error
     instead of silently entering completion detection."""
-    from chatgpt_web2api.cdp_driver import CDPDriver
-
     driver = _make_driver()
     # Mock the send path
     driver.type_message = AsyncMock()
