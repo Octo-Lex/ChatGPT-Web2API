@@ -2209,7 +2209,7 @@ async def _run_sse(server: Server, init_options, config: Config, port: int) -> N
     import uvicorn
     from mcp.server.sse import SseServerTransport
     from starlette.applications import Starlette
-    from starlette.responses import Response
+    from starlette.responses import Response, JSONResponse
     from starlette.routing import Mount, Route
 
     warn_non_loopback(config.server.host, "SSE")
@@ -2221,12 +2221,30 @@ async def _run_sse(server: Server, init_options, config: Config, port: int) -> N
             await server.run(streams[0], streams[1], init_options, raise_exceptions=True)
         return Response()
 
+    async def handle_health(request):
+        """Health + pool status endpoint for the SSE server.
+
+        Returns pool diagnostics (active leases, recent history, slot state)
+        when the session pool is enabled, or a minimal status when running in
+        singleton mode. Does NOT affect the MCP protocol — clients only use
+        /sse and /messages.
+        """
+        if _driver_pool is not None:
+            return JSONResponse(_driver_pool.status())
+        # Singleton mode — no pool to report on
+        return JSONResponse({
+            "enabled": False,
+            "mode": "singleton",
+            "shutting_down": False,
+        })
+
     # handle_post_message is a raw ASGI app (scope, receive, send) that
     # sends its own HTTP response. Mount it directly — not as a Starlette
     # endpoint, which would try to wrap it in a second response.
     app = Starlette(
         routes=[
             Route("/sse", endpoint=handle_sse, methods=["GET"]),
+            Route("/health", endpoint=handle_health, methods=["GET"]),
             Mount("/messages", app=sse.handle_post_message),
         ]
     )
