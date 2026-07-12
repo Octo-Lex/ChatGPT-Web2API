@@ -194,19 +194,8 @@ async def test_missing_composer_returns_none_not_false():
 
     driver._js_strict = fake_js_strict
 
-    import time as _time
-    import chatgpt_web2api.cdp_driver as cdp_mod
-    _t = [0.0]
-    _real_sleep = asyncio.sleep
-
-    async def fast_sleep(d):
-        _t[0] += d
-        await _real_sleep(0)
-
-    # Patch sleep + monotonic to make the 3s poll window instant
-    original_monotonic = _time.monotonic
-    driver_module = cdp_mod
-    # Can't easily monkeypatch the import inside the method — test directly
+    # The 3s polling window uses real asyncio.sleep, so this test takes ~3s.
+    # Acceptable for a regression test that verifies a critical safety path.
     result = await driver._verify_send_acknowledged()
 
     # Should be None (inconclusive), not False (blocking)
