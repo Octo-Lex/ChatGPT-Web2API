@@ -1,19 +1,13 @@
-"""Tests: send acknowledgment + diagnostic preservation.
+"""
+Test suite for send acknowledgment reliability and diagnostic preservation.
 
-ChatGPT code review (conv 6a52f0f3) found two defects:
+Critical invariants:
 
-1. click_send dispatches events but doesn't verify React accepted the
-   submission. If the page is overloaded, the click fires but no message
-   is sent. The bridge silently enters completion detection which finds
-   nothing → reconciliation failure with no diagnostic.
-
-2. TurnReconciliationError discards the underlying fetch_failed diagnostic.
-   The actual error (CDP timeout, destroyed context, HTTP error) is lost.
-
-Fix 1: after click_send + UUID wait, verify at least one acknowledgment:
-  - UUID captured, OR
-  - user-message DOM count increased AND composer cleared
-  If none → raise SendNotAcknowledgedError before entering completion detection.
+1. Send acknowledgment:
+   After click_send + UUID wait, verify at least one acknowledgment:
+   - UUID captured, OR
+   - user-message DOM count increased AND composer cleared
+   If none → raise SendNotAcknowledgedError before entering completion detection.
 
 Fix 2: include last_result.diagnostic in TurnReconciliationError.
 """
@@ -110,6 +104,7 @@ async def test_send_acknowledged_when_user_count_increases(monkeypatch):
     poll_count = {"n": 0}
 
     async def fake_js_strict(expr, timeout=15):
+        poll_count["n"] += 1
         # Send acknowledgment check: user count + composer present + empty
         if "userCount" in expr and "composerEmpty" in expr:
             return json.dumps({"userCount": 1, "composerPresent": True, "composerEmpty": True})
@@ -126,7 +121,6 @@ async def test_send_acknowledged_when_user_count_increases(monkeypatch):
     driver._js_strict = fake_js_strict
 
     # Mock the detector to return immediately
-    from chatgpt_web2api.completion_detector import CompletionDetector
     driver._completion = MagicMock()
     driver._completion.stream_until_complete = MagicMock()
 
