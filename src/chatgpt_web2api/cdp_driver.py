@@ -1623,12 +1623,14 @@ class CDPDriver:
                 state = json.loads(result)
                 if not isinstance(state, dict) or "userCount" not in state:
                     return None  # inconclusive — unexpected shape
-                valid_probe_seen = True
-                # Composite: count increased AND composer present AND cleared.
-                # Missing composer (composerPresent=False) is inconclusive, not
-                # acknowledged — could be navigation, selector drift, wrong page.
+                # Missing composer (composerPresent=False) is inconclusive —
+                # could be navigation, selector drift, wrong page. Don't count
+                # it as a valid probe; continue polling. (ChatGPT review C.)
                 if not state.get("composerPresent"):
                     continue  # wait for next poll — might be transient
+                # Only count as a valid probe when the composer is present
+                # and we can actually evaluate the acknowledgment condition.
+                valid_probe_seen = True
                 current_count = state.get("userCount", 0)
                 if current_count > pre_send_count and state.get("composerEmpty"):
                     return True

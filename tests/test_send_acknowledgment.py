@@ -171,3 +171,45 @@ def test_turn_reconciliation_error_preserves_diagnostic():
     assert "execution context destroyed" in msg, (
         f"Error string must include the fetch error, got: {msg}"
     )
+
+
+# ── 3. Missing-composer regression (ChatGPT review finding C) ────────────
+
+
+@pytest.mark.asyncio
+async def test_missing_composer_returns_none_not_false():
+    """When the composer is missing on every poll (navigation, selector drift),
+    the acknowledgment probe should return None (inconclusive) not False (blocking).
+
+    ChatGPT found that valid_probe_seen was set BEFORE the composerPresent
+    check, so an all-missing-composer run incorrectly returned False."""
+    driver = _make_driver()
+    driver._pre_send_user_count = 0
+
+    async def fake_js_strict(expr, timeout=15):
+        # Every probe returns valid JSON but composer is missing
+        if "userCount" in expr and "composerEmpty" in expr:
+            return json.dumps({"userCount": 1, "composerPresent": False, "composerEmpty": False})
+        return "0"
+
+    driver._js_strict = fake_js_strict
+
+    import time as _time
+    import chatgpt_web2api.cdp_driver as cdp_mod
+    _t = [0.0]
+    _real_sleep = asyncio.sleep
+
+    async def fast_sleep(d):
+        _t[0] += d
+        await _real_sleep(0)
+
+    # Patch sleep + monotonic to make the 3s poll window instant
+    original_monotonic = _time.monotonic
+    driver_module = cdp_mod
+    # Can't easily monkeypatch the import inside the method — test directly
+    result = await driver._verify_send_acknowledged()
+
+    # Should be None (inconclusive), not False (blocking)
+    assert result is None, (
+        f"Missing composer should return None (inconclusive), got {result!r}"
+    )
