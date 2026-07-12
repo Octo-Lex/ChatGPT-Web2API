@@ -1574,6 +1574,52 @@ class CDPDriver:
         # Unreachable (the loop either returns or raises).
         raise SendReadinessError("send_baseline: exhausted retries unexpectedly")
 
+    async def _verify_send_acknowledged(self) -> bool:
+        """P0 send acknowledgment (ChatGPT review, conv 6a52f0f3).
+
+        After click_send dispatches synthetic mouse events, verify the message
+        was actually accepted by React — not just that the JS event loop ran.
+
+        Checks two signals (either is sufficient):
+          1. User-message DOM count increased (a new [data-message-author-role=
+             "user"] node appeared), AND
+          2. Composer cleared (the prompt-textarea is empty).
+
+        Polls briefly (3s at 0.5s intervals) to allow React to process the
+        submission. Returns True if acknowledged, False if no signal appears.
+
+        Never raises — the caller decides what to do with a False result.
+        """
+        import time as _time
+        from .chatgpt_dom import COMPOSER_SELECTOR, COMPOSER_FALLBACK_SELECTOR
+
+        deadline = _time.monotonic() + 3.0
+        while _time.monotonic() < deadline:
+            try:
+                result = await self._js_strict(
+                    "(function() {"
+                    "  var userMsgs = document.querySelectorAll("
+                    "    '[data-message-author-role=\"user\"]').length;"
+                    f"  var composer = document.querySelector('{COMPOSER_SELECTOR}')"
+                    f"       || document.querySelector('{COMPOSER_FALLBACK_SELECTOR}');"
+                    "  var composerEmpty = composer ? !(composer.innerText || composer.value || '').trim() : true;"
+                    "  return JSON.stringify({userCount: userMsgs, composerEmpty: composerEmpty});"
+                    "})()"
+                )
+                if not result or not result.strip().startswith("{"):
+                    # Not a JSON object (empty, number, string, mock returning
+                    # detector data). Return None to signal "probe inconclusive".
+                    return None
+                state = json.loads(result)
+                if not isinstance(state, dict) or "userCount" not in state:
+                    return None
+                if state.get("userCount", 0) > 0 and state.get("composerEmpty"):
+                    return True
+            except Exception:
+                pass
+            await asyncio.sleep(0.5)
+        return False
+
     async def _capture_pre_send_fallback_anchor(self, text: str):
         """A2: build the pre-send fallback TurnAnchor (NO captured UUID yet).
 
@@ -1708,6 +1754,38 @@ class CDPDriver:
             if capture_scope is not None:
                 captured_uuid = await self._identity_listener.wait_for_captured_uuid(timeout=5.0)
 
+            # P0 send acknowledgment (ChatGPT review, conv 6a52f0f3):
+            # click_send dispatches synthetic mouse events — that proves the
+            # JS ran, not that React accepted the submission. Under load, the
+            # click can fire without producing a user message. Before entering
+            # completion detection, verify at least one acknowledgment signal:
+            #   1. UUID was captured, OR
+            #   2. user-message count increased AND composer cleared
+            # If none → raise before entering completion detection (which would
+            # waste time polling for a response that will never come).
+            #
+            # Graceful: if the acknowledgment probe fails (JS error, mock
+            # environment, unusual DOM), DON'T block the send. The check is a
+            # safety net for the overloaded-page case, not a hard gate that
+            # could prevent sends in edge cases we haven't seen.
+            if not captured_uuid:
+                try:
+                    acknowledged = await self._verify_send_acknowledged()
+                    if acknowledged is False:  # explicitly False, not None
+                        raise SendReadinessError(
+                            "Send not acknowledged — click dispatched but no user "
+                            "message appeared (no UUID captured, user count unchanged, "
+                            "composer not cleared). The page may be overloaded or the "
+                            "send was rejected. Do NOT retry automatically."
+                        )
+                except SendReadinessError:
+                    raise
+                except Exception as ack_err:
+                    # Probe failed (JS error, mock, unusual DOM). Don't block
+                    # the send — let completion detection proceed. Log so the
+                    # failure is traceable.
+                    logger.debug("Send acknowledgment probe failed (non-blocking): %s", ack_err)
+
             # A2 Step 7: build the final anchor (fallback + captured UUID).
             turn_anchor = fallback_anchor.with_captured_id(captured_uuid)
 
@@ -1747,9 +1825,11 @@ class CDPDriver:
                 # or dual-anchor fallback); stale text from a prior turn is
                 # never accepted.
                 last_status = "not_ready"
+                last_diagnostic = {}
                 for _ in range(60):
                     result = await self._fetch_text_for_turn(conv_id, turn_anchor)
                     last_status = result.status
+                    last_diagnostic = result.diagnostic or {}
                     if result.status == "matched" and result.text:
                         if len(result.text) > len(last_dom_text):
                             yield StreamChunk(delta=result.text[len(last_dom_text):])
@@ -1785,6 +1865,7 @@ class CDPDriver:
                             diagnostic={
                                 "captured_id": turn_anchor.captured_user_message_id,
                                 "had_non_text_content": had_non_text_content,
+                                "last_fetch_diagnostic": last_diagnostic,
                             },
                         )
                 # Non-text placeholder (unchanged from pre-A2).
