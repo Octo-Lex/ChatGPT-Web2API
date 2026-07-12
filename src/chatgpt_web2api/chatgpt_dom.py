@@ -360,9 +360,23 @@ class ChatGPTDom:
                 "  if (!el) return '';"
                 "  if (el.tagName === 'TEXTAREA') return el.value;"
                 # Recursive DOM extractor: walks all descendant nodes,
-                # emitting \n for <br> elements and block boundaries.
-                # This correctly handles <p>line1<br>line2</p> which
-                # textContent would render as "line1line2".
+                # emitting \n for <br> elements. Correctly handles
+                # <p>line1<br>line2</p> which textContent renders as
+                # "line1line2". (ChatGPT review, conv 6a52f0f3.)
+                #
+                # Scope: handles root-level <p>/<div> blocks with inline
+                # descendants (what Input.insertText produces). Does NOT
+                # reconstruct nested block boundaries (blockquote, lists) —
+                # if ChatGPT changes its composer to nest blocks, this needs
+                # a block-aware recursion update.
+                "  function isPlaceholderBreakBlock(node) {"
+                "    return ("
+                "      node.nodeType === 1 &&"
+                "      node.childNodes.length === 1 &&"
+                "      node.firstChild.nodeType === 1 &&"
+                "      node.firstChild.tagName === 'BR'"
+                "    );"
+                "  }"
                 "  function extractText(node) {"
                 "    if (node.nodeType === 3) return (node.nodeValue || '').replace(/\\u00a0/g, ' ');"
                 "    if (node.nodeType !== 1) return '';"
@@ -374,8 +388,10 @@ class ChatGPTDom:
                 "    return text;"
                 "  }"
                 # Walk immediate children of the composer element.
-                # Each block-level child (<p>, <div>) contributes its text.
-                # Join blocks with \n to reconstruct paragraph boundaries.
+                # Each block-level child contributes its extracted text.
+                # A placeholder <br>-only block (<p><br></p>) is treated as
+                # an empty string so the join produces the correct number of
+                # newlines (one from the join, not one from the <br> too).
                 "  var parts = [];"
                 "  for (var i = 0; i < el.childNodes.length; i++) {"
                 "    var child = el.childNodes[i];"
@@ -383,7 +399,7 @@ class ChatGPTDom:
                 "      var t = (child.nodeValue || '').replace(/\\u00a0/g, ' ');"
                 "      if (t) parts.push(t);"
                 "    } else if (child.nodeType === 1) {"
-                "      parts.push(extractText(child));"
+                "      parts.push(isPlaceholderBreakBlock(child) ? '' : extractText(child));"
                 "    }"
                 "  }"
                 "  return parts.join('\\n');"
