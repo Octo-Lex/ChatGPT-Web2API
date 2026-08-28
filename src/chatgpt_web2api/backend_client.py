@@ -38,10 +38,26 @@ import asyncio
 import json
 import logging
 import time
+import uuid
 
 from .breakers import BreakerKind
 
 logger = logging.getLogger(__name__)
+
+
+def normalize_conversation_id(conversation_id: str) -> str:
+    """Return the native UUID from a UI/backend conversation identifier.
+
+    Some ChatGPT Web surfaces expose IDs with a transport namespace such as
+    ``WEB:<uuid>``. The backend endpoint accepts only the UUID path segment.
+    """
+    value = str(conversation_id or "").strip()
+    if value.startswith("WEB:"):
+        value = value[4:]
+    try:
+        return str(uuid.UUID(value))
+    except (ValueError, AttributeError, TypeError) as exc:
+        raise ValueError(f"invalid conversation id: {conversation_id!r}") from exc
 
 
 class _Transient404(Exception):
@@ -280,6 +296,7 @@ class BackendClient:
         from .cdp_driver import AuthExpiredError, CDPJSError
 
         d = self._driver
+        conversation_id = normalize_conversation_id(conversation_id)
         await self._driver.ensure_token()
         raw = await d._js_with_data_strict(
             CONVERSATION_PROJECTION_JS,
