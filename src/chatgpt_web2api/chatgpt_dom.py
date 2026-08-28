@@ -450,20 +450,83 @@ class ChatGPTDom:
                 break
             await asyncio.sleep(SEND_BUTTON_POLL_INTERVAL_S)
 
-        result = await d._js(
-            "(function() {"
-            f"  var btn = document.querySelector('{SEND_BUTTON_SELECTOR}')"
-            f"       || document.querySelector('{SEND_BUTTON_FALLBACK_SELECTOR}')"
-            f"       || document.querySelector('{SEND_BUTTON_BROAD_SELECTOR}');"
-            "  if (!btn) return 'no send button';"
-            "  if (btn.disabled) return 'button disabled';"
-            "  var evts = ['pointerdown','mousedown','pointerup','mouseup','click'];"
-            "  for (var i = 0; i < evts.length; i++) {"
-            "    btn.dispatchEvent(new MouseEvent(evts[i], {bubbles:true, cancelable:true, view:window}));"
-            "  }"
-            "  return 'sent';"
-            "})()"
-        )
+        if getattr(d, "_file_upload_active", False) is True:
+            rect_raw = await d._js(
+                """(function() {
+                  var btn = document.querySelector('button[aria-label*="Send" i]:not([data-testid="stop-button"])')
+                    || document.querySelector('button[data-testid="send-button"]');
+                  if (!btn) return '';
+                  var r = btn.getBoundingClientRect();
+                  return JSON.stringify({x:r.left + r.width / 2, y:r.top + r.height / 2});
+                })()"""
+            )
+            try:
+                rect = json.loads(rect_raw)
+                mouse_params = {
+                    "x": rect["x"],
+                    "y": rect["y"],
+                    "button": "left",
+                    "clickCount": 1,
+                }
+                for event_type in ("mousePressed", "mouseReleased"):
+                    await d._cdp(
+                        "Input.dispatchMouseEvent",
+                        {"type": event_type, "buttons": 1 if event_type == "mousePressed" else 0, **mouse_params},
+                    )
+
+                # With attachments, ChatGPT starts the upload on the first send
+                # click. The button remains enabled, but the UI briefly exposes
+                # "File upload pending" and ignores that click as a submission.
+                # Wait for that transition and click again only after it clears.
+                saw_pending = False
+                for _ in range(60):
+                    state = await d._js(
+                        """(function() {
+                          return /file upload pending/i.test((document.body && document.body.innerText) || '')
+                            ? 'pending' : 'ready';
+                        })()"""
+                    )
+                    if state == "pending":
+                        saw_pending = True
+                    elif saw_pending:
+                        break
+                    await asyncio.sleep(0.5)
+                if saw_pending:
+                    rect_raw = await d._js(
+                        """(function() {
+                          var btn = document.querySelector('button[aria-label*="Send" i]:not([data-testid="stop-button"])')
+                            || document.querySelector('button[data-testid="send-button"]');
+                          if (!btn) return '';
+                          var r = btn.getBoundingClientRect();
+                          return JSON.stringify({x:r.left + r.width / 2, y:r.top + r.height / 2});
+                        })()"""
+                    )
+                    rect = json.loads(rect_raw)
+                    mouse_params.update({"x": rect["x"], "y": rect["y"]})
+                    for event_type in ("mousePressed", "mouseReleased"):
+                        await d._cdp(
+                            "Input.dispatchMouseEvent",
+                            {"type": event_type, "buttons": 1 if event_type == "mousePressed" else 0, **mouse_params},
+                        )
+                d._file_upload_active = False
+                result = "sent"
+            except (json.JSONDecodeError, KeyError, TypeError):
+                result = "send button coordinates unavailable"
+        else:
+            result = await d._js(
+                "(function() {"
+                f"  var btn = document.querySelector('{SEND_BUTTON_SELECTOR}')"
+                f"       || document.querySelector('{SEND_BUTTON_FALLBACK_SELECTOR}')"
+                f"       || document.querySelector('{SEND_BUTTON_BROAD_SELECTOR}');"
+                "  if (!btn) return 'no send button';"
+                "  if (btn.disabled) return 'button disabled';"
+                "  var evts = ['pointerdown','mousedown','pointerup','mouseup','click'];"
+                "  for (var i = 0; i < evts.length; i++) {"
+                "    btn.dispatchEvent(new MouseEvent(evts[i], {bubbles:true, cancelable:true, view:window}));"
+                "  }"
+                "  return 'sent';"
+                "})()"
+            )
         if result != "sent":
             await d._capture_selector_diagnostic("send-button (click_send)")
             if d._breakers:

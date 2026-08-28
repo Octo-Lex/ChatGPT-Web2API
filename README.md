@@ -267,7 +267,25 @@ setups, local development, and debugging (logs go straight to stderr):
 
 Every tool includes rich descriptions with domain knowledge, Pydantic-validated input, structured output schemas, and proper `ToolAnnotations` — agents understand *how* and *when* to use each one without prompting.
 
-### 🔒 MCP Tool Access Control
+### File attachments
+
+The REST endpoint also accepts `multipart/form-data`. Send the `messages` field as
+JSON and repeat the `file` field for every attachment:
+
+```bash
+curl http://localhost:8080/v1/chat/completions \
+  -F 'messages=[{"role":"user","content":"Inspect these files"}]' \
+  -F 'model=auto' \
+  -F 'file=@server.log' \
+  -F 'file=@diagnostics.zip' \
+  -F 'file=@screenshot.png'
+```
+
+The MCP `chat_completion` tool accepts `files`, a list of local paths, in addition
+to `message`. File extensions and MIME types are not hard-coded: ChatGPT's web UI
+makes the final acceptance decision. The bridge validates that every path is a
+regular file and enforces `W2A_MAX_UPLOAD_BYTES` (default 50 MiB) per file.
+
 
 The MCP server has **no authentication of its own** — any client that can reach it can call its tools. Since several tools mutate or delete data on your *real* ChatGPT account, tools are gated by risk tier so the dangerous ones are never exposed by accident:
 
@@ -548,11 +566,11 @@ Key docs:
 - **Cookie expiry** — auth cookies expire ~2 weeks; re-login needed
 - **Serial requests** — one chat at a time through the browser *by default* (concurrent reads are fine). For per-tab parallelism on one shared Chrome, set `parallel_tabs: true` (requires `tab_mode: "owned"`); see [docs/deployment.md](docs/deployment.md) → "Parallel mode (one Chrome, many tabs)".
 - **Memory writes** — ChatGPT's `/backend-api/memories` is read-only; creating memories works via chat interface
-- **No image input** — text only (CDP file upload not yet implemented)
+- **File acceptance** — the web UI decides which file types are accepted; the bridge does not hard-code extensions. Each local file is limited by `W2A_MAX_UPLOAD_BYTES` (default 50 MiB)
 
 ## Roadmap
 
-- [ ] Image/file upload to conversations via CDP drag-and-drop
+- [x] Image/file upload to conversations via CDP file input
 - [ ] Headless mode with anti-detection patches
 - [ ] Concurrent chat pooling across multiple Chrome instances (per-tab parallelism on one Chrome landed via `parallel_tabs`; the cross-instance pool/router is still future work)
 - [ ] Web search mode (trigger ChatGPT's built-in search)
