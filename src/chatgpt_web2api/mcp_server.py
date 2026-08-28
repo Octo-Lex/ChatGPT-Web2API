@@ -51,6 +51,7 @@ from .cdp_driver import (
 )
 from .config import Config
 from .cross_process_lock import LockAcquisitionError
+from .file_upload import UploadError
 from .lock_resolver import (
     MutationLock,
     OwnedTabRequiredError,
@@ -82,6 +83,14 @@ class ChatCompletionInput(BaseModel):
     """Input schema for chat_completion tool."""
 
     message: str = Field(description="The user message to send to ChatGPT")
+    files: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Optional local file paths to attach before sending the message. "
+            "ChatGPT decides whether each file type is accepted; paths must be regular "
+            "files and are limited by W2A_MAX_UPLOAD_BYTES."
+        ),
+    )
     system_prompt: str | None = Field(
         default=None,
         description=(
@@ -768,6 +777,9 @@ async def do_chat_completion(
         await driver.ensure_current_conversation(driver._current_conv_id)
     else:
         await driver.navigate_new_chat(gizmo_id=project_id)
+
+    if validated.files:
+        await driver.upload_files(validated.files)
 
     # Send and collect response. Progress notifications reset the MCP client's
     # idle timer during long generations so the tool call isn't killed at
@@ -1498,6 +1510,11 @@ def _map_tool_exception(exc: Exception) -> object:
             content=[mcp_types.TextContent(type="text",
                 text=(f"Generation stuck in {exc.phase} for {exc.stalled_for_s:.0f}s "
                       "— no DOM progress. (generation_stuck)"))],
+            isError=True,
+        )
+    if isinstance(exc, UploadError):
+        return mcp_types.CallToolResult(
+            content=[mcp_types.TextContent(type="text", text=f"{exc} (upload_error)")],
             isError=True,
         )
     if isinstance(exc, LockAcquisitionError):

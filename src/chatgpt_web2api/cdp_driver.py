@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import time
 import urllib.parse
@@ -1448,6 +1449,12 @@ class CDPDriver:
 
     # ── Message Input ─────────────────────────────────────────
 
+    async def upload_files(self, paths: list[str | os.PathLike[str]]) -> list:
+        """Attach local files to the current ChatGPT composer."""
+        from .file_upload import upload_files_to_composer
+
+        return await upload_files_to_composer(self, paths)
+
     async def type_message(self, text: str) -> None:
         """Type text into the ChatGPT composer.
 
@@ -1596,7 +1603,8 @@ class CDPDriver:
         Polls briefly (3s at 0.5s intervals). Never raises.
         """
         import time as _time
-        from .chatgpt_dom import COMPOSER_SELECTOR, COMPOSER_FALLBACK_SELECTOR
+
+        from .chatgpt_dom import COMPOSER_FALLBACK_SELECTOR, COMPOSER_SELECTOR
 
         pre_send_count = getattr(self, "_pre_send_user_count", None)
         if pre_send_count is None:

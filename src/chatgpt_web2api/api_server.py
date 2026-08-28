@@ -12,8 +12,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import tempfile
 import time
 import uuid
+from pathlib import Path
 
 from aiohttp import web
 
@@ -27,6 +29,7 @@ from .cdp_driver import (
 )
 from .config import Config
 from .cross_process_lock import LockAcquisitionError
+from .file_upload import UploadError, validate_upload_files
 from .lock_resolver import MutationLock, OwnedTabRequiredError, resolve_mutation_lock
 from .resilience import retry_on_rate_limit
 
@@ -230,6 +233,54 @@ class APIServer:
             projects = []
         return web.json_response({"object": "list", "data": projects})
 
+    async def _parse_chat_request(self, request: web.Request) -> tuple[dict, list[Path]]:
+        """Parse JSON or multipart chat input and materialize uploaded files."""
+        content_type = getattr(request, "content_type", "")
+        if not isinstance(content_type, str) or not content_type.startswith("multipart/"):
+            return await request.json(), []
+
+        reader = await request.multipart()
+        fields: dict[str, str] = {}
+        upload_paths: list[Path] = []
+        try:
+            while part := await reader.next():
+                if part.name in {"file", "files"} and part.filename:
+                    suffix = Path(part.filename).suffix
+                    handle = tempfile.NamedTemporaryFile(
+                        prefix="chatgpt-web2api-upload-", suffix=suffix, delete=False
+                    )
+                    path = Path(handle.name)
+                    try:
+                        while chunk := await part.read_chunk():
+                            handle.write(chunk)
+                    finally:
+                        handle.close()
+                    upload_paths.append(path)
+                else:
+                    fields[part.name] = await part.text()
+            if "messages" in fields:
+                body = {"messages": json.loads(fields["messages"])}
+                for name in ("model", "stream", "project_id", "gizmo_id", "conversation_id"):
+                    if name in fields:
+                        value = fields[name]
+                        body[name] = json.loads(value) if name == "stream" else value
+            elif "body" in fields:
+                body = json.loads(fields["body"])
+            else:
+                raise UploadError("Multipart requests must include a JSON 'messages' field")
+            if upload_paths:
+                validate_upload_files(upload_paths)
+            return body, upload_paths
+        except Exception:
+            for path in upload_paths:
+                path.unlink(missing_ok=True)
+            raise
+
+    @staticmethod
+    def _cleanup_uploads(paths: list[Path]) -> None:
+        for path in paths:
+            path.unlink(missing_ok=True)
+
     async def _handle_chat(self, request: web.Request) -> web.Response:
         if err := self._check_auth(request):
             return err
@@ -237,10 +288,10 @@ class APIServer:
         self._request_count += 1
 
         try:
-            body = await request.json()
-        except json.JSONDecodeError:
+            body, upload_paths = await self._parse_chat_request(request)
+        except (json.JSONDecodeError, UploadError, ValueError) as exc:
             return web.json_response(
-                {"error": {"message": "Invalid JSON", "type": "invalid_request_error"}},
+                {"error": {"message": str(exc), "type": "invalid_request_error"}},
                 status=400,
             )
 
@@ -387,12 +438,18 @@ class APIServer:
                     await self._driver.navigate_new_chat(gizmo_id=project_id)
                     self._last_project_id = project_id
 
+                if upload_paths:
+                    await self._driver.upload_files([str(path) for path in upload_paths])
                 if stream:
-                    return await self._stream_response(request, model_slug, full_text, timeout)
+                    response = await self._stream_response(request, model_slug, full_text, timeout)
                 else:
-                    return await self._full_response(request, model_slug, full_text, timeout)
+                    response = await self._full_response(request, model_slug, full_text, timeout)
+                self._cleanup_uploads(upload_paths)
+                upload_paths = []
+                return response
 
         except Exception as e:
+            self._cleanup_uploads(upload_paths)
             logger.error("Chat error: %s", e, exc_info=True)
             self._last_error = f"{type(e).__name__}: {e}"
             return self._error_response(e)
