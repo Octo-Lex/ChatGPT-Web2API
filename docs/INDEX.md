@@ -19,14 +19,15 @@ read, start with the [routing table](#which-doc-should-i-read) below.
 | **call the REST or MCP API from code** | [api-reference.md](api-reference.md) |
 | **understand how the codebase is structured** | [architecture.md](architecture.md) |
 | **understand why we drive Chrome via CDP** | [adr-0001-automation-backend.md](adr-0001-automation-backend.md) |
-| **see what's planned / what already landed** | [ROADMAP.md](ROADMAP.md) |
+| **see what's planned next** | [ROADMAP.md](ROADMAP.md) |
+| **see the completed June–July roadmap** | [ROADMAP-HISTORY.md](ROADMAP-HISTORY.md) |
 | **reverse-engineer a new ChatGPT endpoint** | [protocol-reference.md](protocol-reference.md) + [reverse-engineering-notes.md](reverse-engineering-notes.md) |
 
 ---
 
-## Operating guides (Phase 6)
+## Operating guides
 
-These four are the day-to-day operator surface — start here for running a
+These are the day-to-day operator surface — start here for running a
 deployment.
 
 | Doc | Purpose |
@@ -35,7 +36,7 @@ deployment.
 | [os-supervision.md](os-supervision.md) | **Always-on supervision.** systemd (Linux), launchd (macOS), Task Scheduler + NSSM (Windows); `ensure`-on-a-timer and REST+MCP split-service styles. |
 | [runbook.md](runbook.md) | **Operating a running deployment.** Startup checklist, `/health` interpretation, failure modes, breaker states, auth recovery, safe restart, post-deploy validation, logs. Source-cited. |
 | [operational-validation.md](operational-validation.md) | **Accepting a feature into production.** The live validation checklist for `parallel_tabs` (default-off smoke, parallel canary, failure modes, observability). Tracks the "merged" → "operationally accepted" promotion. |
-| [api-reference.md](api-reference.md) | **Calling the API.** OpenAI-compatible REST endpoints and the MCP server surface (tools, transports). |
+| [api-reference.md](api-reference.md) | **Calling the API.** REST endpoints and the MCP server surface (tools, transports). |
 
 ---
 
@@ -45,7 +46,8 @@ deployment.
 |-----|---------|
 | [architecture.md](architecture.md) | **Codebase structure.** Module layout, the `CDPDriver` orchestration/interception hub + extracted collaborators (`backend_client`, `cdp_transport`, `chatgpt_dom`, `completion_detector`), data flow. |
 | [adr-0001-automation-backend.md](adr-0001-automation-backend.md) | **Decision record.** Why the automation backend stays on CDP (drives a real Chrome) and defers a Chrome-extension approach. |
-| [ROADMAP.md](ROADMAP.md) | **Project plan & history.** Phases 1–6, what landed, follow-ups, and the explicit deferral of Group C lifecycle extraction. |
+| [ROADMAP.md](ROADMAP.md) | **Active execution plan.** Stabilize current reality, canonical runtime model, ChatGPT Web contracts, shared session runtime, recovery/backpressure, attachments, compatibility testing, hardened operation, then feature expansion. |
+| [ROADMAP-HISTORY.md](ROADMAP-HISTORY.md) | **Historical roadmap.** Completed Phases 0–7 and the architectural principles that carried forward into the active plan. |
 
 ---
 
