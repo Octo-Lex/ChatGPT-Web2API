@@ -1,504 +1,944 @@
 # ChatGPT-Web2API Roadmap
 
-> **Status:** Active. Authored 2026-06-25 after a scope-correction review that
-> removed work already shipped (honest `/health`, rate-limit retry) and moved
-> `ensure` earlier because `/health` is already trustworthy.
+> **Status:** Active. Refreshed 2026-09-01 after a deep-dive of current
+> `master`, the reliability/session-pool work, active branches, and PR #49.
 >
-> This document is the single source of truth for sequencing. Do not start work
-> out of order without updating this file first.
+> This document is the **single source of truth for forward sequencing**.
+> Completed Phases 0–7 and their detailed rationale are archived in
+> [ROADMAP-HISTORY.md](ROADMAP-HISTORY.md).
+>
+> Do not start major work out of order without updating this file first.
+
+## North star
+
+ChatGPT-Web2API is a **deterministic, capability-aware, fail-closed session
+runtime over ChatGPT Web**. REST and MCP are adapters around that runtime; they
+are not the architecture itself.
+
+The project should optimize for correctness, isolation, diagnosability, bounded
+resource use, and safe degradation before expanding feature breadth.
+
+---
+
+## Work classes
+
+Every roadmap item should be classified as one of:
+
+| Class | Meaning |
+|---|---|
+| **BLOCKER** | Correctness or security work that must be resolved before dependent features merge. |
+| **FOUNDATION** | Shared runtime infrastructure that later features should build on. |
+| **OPERATIONS** | Release, health, recovery, deployment, observability, or security hardening. |
+| **FEATURE** | User-facing capability that should not bypass required blockers/foundations. |
+
+A feature may carry more than one class.
+
+---
 
 ## Guiding principles
 
-- **Stabilize behavior before moving code.** The `cdp_driver.py` split (Phase 5)
-  comes *after* the breaker policy (Phase 4). We instrument the monolith, prove
-  the behavior is stable, then move it.
-- **Lifecycle logic lives in the repo-owned CLI, not in hooks.** ZCode hooks are
-  thin one-liners. Testable, idempotent logic belongs in `chatgpt-web2api ensure`.
-- **REST owns Chrome. SSE attaches.** This invariant holds across every phase.
-  Nothing else launches Chrome.
-- **Don't re-scope shipped work.** If a phase's deliverable already exists in
-  code, the phase is reduced to only its genuine gaps (see Phase 1 and Phase 4).
+1. **Correctness and security before feature breadth.** A feature that can
+   return the wrong turn, leak host data, corrupt session state, or consume
+   unbounded resources is not merge-ready.
+2. **Fail closed rather than guess.** Uncertain tab ownership, turn identity,
+   attachment state, or capability state must produce a typed failure rather
+   than silent fallback.
+3. **Observe effects, not attempted actions.** A CDP click or navigation call is
+   not success. Confirm browser/backend state and use the existing send
+   acknowledgment + turn-reconciliation machinery.
+4. **Retry observation when safe; never blindly resend a mutation.** Recovery
+   may repeat reads, probes, or reconciliation. A send must not be replayed just
+   because observation timed out.
+5. **Browser/session resources are bounded.** Tabs, leases, queues, upload bytes,
+   and recovery attempts require explicit limits and backpressure.
+6. **Local host authority is privileged.** Server-local filesystem access,
+   browser profiles, cookies, and CDP are credentials/capabilities, not ordinary
+   chat inputs.
+7. **Treat ChatGPT Web drift as normal.** External selectors, routes, response
+   shapes, and timing assumptions need named contracts, probes, and evidence.
+8. **Do not refactor for line count alone.** The current `CDPDriver` facade is an
+   intentional orchestration/interception seam. Further extraction needs a
+   concrete reliability or ownership benefit.
+9. **One active roadmap.** Historical planning is archived; overlapping forward
+   plans should be folded into this document or retired.
 
 ---
 
-## Phase 0 — Merge PR #9  ✅ MERGED 2026-06-25
+# Shipped baseline — Phases 0–7
 
-**Goal:** close the broad stabilization branch.
+The following capabilities are already part of the repository baseline and are
+not future roadmap work:
 
-PR #9 (`fix/phase2-nontext`) — composer redesign, Phase-2 completion, tab
-isolation — merged as squash commit `9ebb236`. All 9 CI checks green
-(lint, secret-scan, build, 6× test matrix across ubuntu/macos/windows ×
-3.11/3.12). The blocking tab-isolation concern raised in review was
-**already resolved** in the branch: `owned` is the default tab mode, the
-`adopt` path is gated behind explicit opt-in (`config.py`, `cdp_driver.py`).
+- real-Chrome/CDP browser automation;
+- honest four-state REST `/health`;
+- persistent MCP/SSE transport;
+- `chatgpt-web2api ensure` reconciliation;
+- typed circuit breakers for auth, composer readiness, CDP reconnect, and
+  Chrome crash loops;
+- `CDPDriver` decomposition into backend, transport, DOM, and completion
+  collaborators while preserving the driver facade;
+- OS-supervision and production-runbook documentation;
+- owned-tab isolation and per-target parallel locking;
+- IdentityListener capture of the client-generated user-message UUID;
+- TurnAnchor-based exact-turn reconciliation with conservative fallbacks;
+- model-aware first-content / stream-idle completion budgets;
+- experimental MCP session-affine driver pooling with bounded leases, TTL,
+  capacity accounting, and account-level throttling;
+- reactive drift diagnostics and redacted evidence capture.
 
-### Pre-merge gates (all passed)
-
-```text
-pytest -m "not e2e"               ✅
-ruff check .                      ✅
-gitleaks / static gates           ✅
-clean working tree                ✅
-CI: 9/9 jobs SUCCESS              ✅
-```
-
-**Constraint honored:** no lifecycle / SSE / bootstrap work in PR #9. Those
-start in Phase 2+.
-
----
-
-## Phase 1 — Finish observability gaps
-
-**Scope correction:** honest `/health` is **already shipped**
-(`api_server.py:_handle_health`). It computes `chrome_running` and
-`driver_connected` fresh on each call, returns all 8 fields, and distinguishes
-`starting` / `healthy` / `degraded` / `broken`. Do not rebuild it.
-
-### Remaining work only
-
-1. **Regression tests for zombie states** — ✅ largely done. The pinned cases
-   already exist in `tests/test_health.py`:
-   - listener alive, Chrome alive, driver disconnected → `/health` returns
-     `degraded` (`test_health_degraded_when_chrome_alive_but_driver_disconnected`)
-   - listener alive, Chrome dead → `/health` returns `broken`
-     (`test_health_broken_when_chrome_dead`)
-   - PR3 added further coverage: an open breaker never forces `broken`, a
-     disconnect-degraded is not worsened, and `starting`/`healthy` downgrade
-     correctly. Audit remaining gaps before adding more; most are covered.
-
-2. **Targeted debug logging for meaningful silent failures.** Many
-   `except Exception: pass` exist (~20, mostly `cdp_driver.py`). Most are
-   defensible best-effort cleanup, but several swallow errors that mask real
-   failures. Add `logger.debug` (not warning — these are best-effort paths) at:
-   - token refresh swallowed exceptions
-   - heartbeat failure
-   - CDP reader task exit
-   - reconnect classification / skip decisions
-   - tab registry reclaim / record / clear failures
-   - best-effort cleanup failures (debug level only)
-
-**Home for the silent-exception work is here, not split across Phase 5.** Phase 5
-may move the code, but Phase 1 makes failures visible first.
+See [ROADMAP-HISTORY.md](ROADMAP-HISTORY.md) for the historical phase record.
 
 ---
 
-## Phase 2 — Make SSE the recommended ZCode transport  ✅ DONE
+# Current known gaps
 
-**Goal:** replace stdio-per-session as the recommended mode. Eliminate the
-process multiplier (N ZCode sessions × stdio = N MCP children × N tabs).
+These are not a second roadmap; they are the concrete facts driving Phase 8.
 
-### Deliverables — all shipped
-
-1. ✅ **Document SSE config** (recommended) — README now presents SSE first
-   with the `chatgpt-web2api-sse` snippet and launch command.
-2. ✅ **Document stdio** as compatibility / dev-debug mode only — README
-   repositions stdio under "Alternative," noting one MCP child per session.
-3. ✅ **Integration tests** for SSE (`tests/test_e2e_sse.py`, e2e-gated) —
-   real `sse_client` + uvicorn over a non-8090 port:
-   - initialize handshake
-   - list tools
-   - list models
-   - one chat call (also the live regression for the #10/#11 deadlock)
-   - repeated fresh connections (asserts no per-connection CDP target growth)
-
-### Reframed constraint
-
-```text
-Recommended ZCode mode is SSE-only:
-  one persistent MCP server
-  no per-session MCP child
-  no per-session Chrome/tab spawning
-```
-
-The vague "detect many stdio processes and warn" item is **dropped from v1** —
-under-specified, cross-cutting. Optional later.
-
-### Known follow-up — ✅ RESOLVED (was discovered Phase 0, 2026-06-25)
-
-```text
-MCP/SSE chat_completion can complete server-side but timeout client-side on
-response delivery. Short SSE tools work.
-```
-
-**Resolved by #11** (fix `70f014a`): root cause was a completion-detection
-deadlock — on a new chat, `conv_id_for_check` was empty for the whole poll
-loop, disabling the backend `end_turn` fallback. With the DOM action-button
-selector drifted (3rd time), no completion signal fired and the loop ran to
-the 120s deadline. Fix resolves `conv_id_for_check` mid-loop from the live
-URL. Live SSE `chat_completion` now completes in 2–12s (was 120s+/timeout).
-
-Diagnosis details: [issue #10 comment](https://github.com/Octo-Lex/ChatGPT-Web2API/issues/10#issuecomment-4796158081).
-Remaining follow-up: the DOM `has_action` selector is still dead — tracked in #12.
+1. **`master` must be made green again.** The latest inspected CI run had all
+   six OS/Python functional test jobs and secret scan passing, but lint failed
+   and the build was skipped.
+2. **Repository truth has drifted.** Version/release metadata and several docs
+   lag the actual architecture/test surface.
+3. **Fresh-chat HTTP 500 needs a current live canary.** A regression was observed
+   in August; no source fix has landed on `master` since the July baseline, so
+   current runtime behavior must be re-certified rather than assumed fixed.
+4. **MCP pool health work already exists on
+   `feat/sse-pool-status-endpoint`.** Review that implementation before
+   designing another observability path.
+5. **PR #49 is not merge-ready as currently designed.** Local path attachments
+   can expose readable host files through an always-visible chat capability;
+   multipart size enforcement happens after spooling; cleanup/state handling
+   and the attachment E2E also need correction.
 
 ---
 
-## Phase 3 — Add `chatgpt-web2api ensure`  ✅ DONE
+# Phase 8 — Stabilize current reality
 
-**Goal:** let ZCode hooks bootstrap the full stack with a thin one-liner.
+**Class:** BLOCKER + OPERATIONS
 
-Shipped as `chatgpt-web2api ensure` in `src/chatgpt_web2api/ensure.py`, wired
-into the `__main__.py` subcommand dispatch. Point-in-time reconcile: checks
-REST + SSE, starts whichever is missing, verifies SSE via real MCP handshake,
-exits 0 when ready. Lock-protected (SSE-port-keyed startup lock, bounded
-contention). Degraded-REST policy honored (20s poll before restart). No
-watchdog loop. 30 unit tests in `tests/test_ensure.py`.
+**Goal:** restore a trustworthy baseline before adding more architecture or
+features.
 
-Restart hardening (#16): Unix listener discovery uses a `lsof` → `ss` → `fuser`
-fallback chain (no single-tool dependency); `_stop_listener` returns False (and
-logs an error) when a port is occupied but no PID can be found, so the caller
-aborts the restart instead of launching into an occupied port. SSE
-handshake-failed path stops the existing listener before relaunch.
+## Deliverables
 
-### Command
+### 8.1 Re-certify fresh-chat behavior
+
+Run the minimal live fresh-chat canary against current `master`:
 
 ```text
-chatgpt-web2api ensure [--rest-port 8080] [--mcp-sse-port 8090]
+new chat
+→ exact known prompt
+→ send acknowledgment
+→ conversation-id resolution
+→ exact-turn reconciliation
+→ successful REST/MCP result
 ```
 
-Slots into the existing `{"start", "inject-cookies", "doctor"}` subcommand
-dispatch in `__main__.py`.
+If the August HTTP 500 reproduces, treat it as the highest-priority runtime
+regression and fix it before roadmap foundation work. If it no longer
+reproduces, record the result as an upstream-drift incident and retain a
+regression canary.
 
-### Contract
+### 8.2 Restore green `master`
 
-1. Check REST `/health`.
-2. Reconcile REST per the **degraded-REST policy** below.
-3. Wait until REST is ready (`healthy`, or `starting` + Chrome/CDP/driver
-   all connected — a cold bootstrap that hasn't served a chat yet is ready
-   enough for SSE to attach).
-4. Check MCP/SSE on `:8090`.
-5. If missing, start MCP/SSE.
-6. Verify MCP/SSE: initialize succeeds + list tools succeeds.
-7. Exit: `0` when ready, nonzero with clear diagnostic when not.
+- fix current lint failure(s);
+- ensure all normal CI jobs complete successfully;
+- keep E2E opt-in and separate from ordinary CI;
+- do not cut the baseline release from a red branch.
 
-### Degraded-REST policy  *(PINNED — do not restart REST immediately)*
+### 8.3 Review existing MCP pool health branch
 
-REST owns Chrome. Restarting REST runs `taskkill /F /T` on Chrome
-(`chrome.py`) — visible window flash, 10–15s cold restart, may lose an
-in-progress page. A naive restart on `degraded` is destructive flap.
+Review `feat/sse-pool-status-endpoint` rather than rebuilding it. Its existing
+SSE `/health` surface reports pool capacity, slot state, leases, account
+breaker, and shutdown state.
 
-```text
-status=missing    → start REST
-status=broken     → restart REST (Chrome is down; REST will relaunch Chrome)
-status=degraded   → WAIT + re-poll first; restart only after repeated failed polls
-status=healthy    → no-op
-```
+Before landing, decide:
 
-**v1 degraded policy:**
+- which fields are operator-safe to expose remotely;
+- whether session keys need redaction/hashing;
+- how this independent MCP health surface will later participate in aggregate
+  runtime health.
 
-```text
-degraded:
-  poll every 2s for up to 20s
-    if becomes healthy → continue
-    if still degraded after 20s → restart REST
-```
+### 8.4 Resolve repository truth drift
 
-Reason: `degraded` (Chrome alive, driver disconnected) may be a transient CDP
-reconnect. REST has reconnect logic (`dbc7985`); give it room before bouncing
-the browser.
+Update documentation and metadata to match current `master`, including at least:
 
-### SSE watchdog scope  *(PINNED — point-in-time, not continuous)*
+- README test/status claims;
+- architecture/module descriptions;
+- MCP session-pool status and limitations;
+- changelog/release status;
+- roadmap references;
+- stale automated policy assumptions (for example branch-name expectations).
 
-`ensure` is a **point-in-time reconcile**, not a supervisor.
+### 8.5 Cut a representative baseline release
 
-```text
-ZCode hook runs ensure
-  → ensure makes REST + SSE healthy NOW
-  → ensure exits
-if SSE dies later → next hook / next session reruns ensure
-```
+After green CI and doc reconciliation, cut the next non-1.0 release representing
+what the repository actually ships. Release engineering details may be improved
+incrementally, but versioning must stop lagging the codebase by multiple major
+capability generations.
 
-- Do **not** add a Python watchdog loop in v1.
-- The SSE/MCP path currently has **no** crash-recovery (unlike REST's
-  `start_monitor` for Chrome). This is acceptable for v1: SSE crash is rare and
-  the hook re-runs on next session.
-- Continuous supervision belongs in Phase 6 (optional OS-service docs), not here.
-
-### Design constraints
+## Exit criteria
 
 ```text
-idempotent
-lock-protected (lock files prevent duplicate starts)
-safe to run repeatedly from ZCode hooks
-no complex lifecycle logic in hook config
-REST remains Chrome owner
-MCP/SSE remains one persistent attaching process
+fresh-chat canary status known and recorded
+master normal CI green
+existing MCP health branch reviewed/dispositioned
+docs/version describe current architecture accurately
+new baseline release cut from a green commit
 ```
 
 ---
 
-## Phase 4 — Non-rate-limit breaker policy  ✅ DONE
+# Phase 9 — Canonical runtime model
 
-**Scope correction:** rate-limit retry/backoff is **already substantially
-implemented** in `resilience.py` (transparent retry, `Retry-After` respected,
-jitter, `max_attempts=3`, dismiss-popup, persistent-limit escape → parseable
-`RateLimitError`). Do not rebuild it.
+**Class:** FOUNDATION
 
-### Breaker classes — all shipped
+**Goal:** make browser/session semantics independent of REST/MCP transport
+objects.
 
-1. **Auth expired** (`auth_required`)
-   - trips immediately on `AuthExpiredError`; no retry storm
-   - sticky (no half-open) — requires human browser login
-   - exposed as `auth_required` in `/health`
-2. **Composer / send-readiness** (`composer_send_readiness`)
-   - trip after 3 failures in a 120s window; 300s cooldown
-3. **CDP reconnect failures** (`cdp_reconnect`)
-   - 5 failures in a 120s window → 120s cooldown
-4. **Chrome crash loop** (`chrome_crash_loop`)
-   - 3 restarts in a 300s window → 300s cooldown
+External adapters should translate into a small internal domain model instead
+of reaching directly into browser mechanics.
 
-Thresholds/windows/cooldowns are hardcoded in `_DEFAULT_POLICIES`
-(`breakers.py`); see the deferred follow-up E below before making them
-configurable.
+## Core types
 
-### Exposure
+Names are illustrative; keep the model narrow and behavior-driven.
 
 ```text
-/health          status downgrade + open_breakers + per-breaker snapshot
-REST errors      503 circuit_open (with kind)
-MCP errors       isError result (circuit_open, kind=...)
-logs
+ChatTurnRequest
+ChatMessage / ContentPart
+ConversationRef
+AttachmentSpec
+TurnContext
+TurnResult
+CapabilitySet
+BridgeError
 ```
 
-**Kept before the big refactor (Phase 5).** Behavior is now instrumented and
-proven stable; Phase 5 may move the code.
+The model must represent facts the runtime actually needs:
 
-### Sequencing — three PRs (all merged)
+- message/system context;
+- requested conversation/project/GPT context;
+- model selection intent;
+- attachments and their provenance;
+- session/affinity identity;
+- streaming/progress preference where relevant;
+- the final correlated conversation/turn identity;
+- typed failure information.
 
-Phase 4 was split to keep review tight: ship the infrastructure with no
-behavior change, then wire the real failure signals, then add operator-facing
-status policy.
+## Stable error taxonomy
 
-- ✅ **PR1 (#18) — breaker registry + `/health` exposure.** Shipped
-  `src/chatgpt_web2api/breakers.py`: a `BreakerRegistry` keyed by `BreakerKind`
-  with `record_failure` / `record_success` / `trip` / `is_open` / `snapshot`.
-  `/health` gained a `breakers` snapshot field. Zero behavior change at the
-  time: `/health` always reported all breakers closed. Proved the plumbing
-  risk-free.
-- ✅ **PR2 (#19) — wire failure signals + fail-fast + half-open recovery.** Added
-  the typed exceptions the composer/CDP paths need (`SendReadinessError`,
-  `CDPReconnectError`), wired `record_failure`/`trip` at the detection sites,
-  enforced thresholds, added REST fail-fast (`_error_response` 503
-  `circuit_open`) + MCP `(circuit_open, kind=...)` result, and wired half-open
-  recovery (`record_success` after a confirmed send / successful reconnect; auth
-  stays indefinite until explicit `reset()` via `recover_auth()`). Includes the
-  post-lock re-check and AUTH_EXPIRED recovery probe in REST/MCP preflight. The
-  registry is per-process (driver-owned via DI). `CircuitOpenError` lives in
-  `breakers.py`. Runtime-validated on `dd97f91`.
-- ✅ **PR3 (#20) — `/health` status policy + breaker-aware ensure.** An open
-  breaker now **downgrades** `starting`/`healthy` → `degraded` (never `broken`;
-  a disconnect-degraded stays degraded). New `/health` fields: a top-level
-  `open_breakers` current-state list (distinct from the historical/latching
-  `last_error`) and a per-breaker `cooldown_seconds_remaining` duration (not an
-  opaque monotonic timestamp) so `ensure.py` can reason about cooldown across
-  the process boundary. `ensure` is breaker-aware: degraded + open
-  `auth_required` → **exit 2** (login needed, no REST restart, no SSE
-  reconcile); degraded + open timed breaker → wait cooldown+grace then
-  recover/restart (with a cooldown-boundary re-fetch); degraded without breaker
-  info → legacy 20s-poll-then-restart. Adds narrow **ensure-only** config
-  tunables (`EnsureConfig`: poll interval/budget, cooldown grace) via
-  `ensure_*` flat keys + `W2A_ENSURE_*` env; config `port`/`cdp_port` never
-  override explicit `run_ensure` args. Exit codes: `0` ready, `1` generic
-  failure, `2` auth/login needed. Runtime-validated on `2668243`.
-
-```
-PR1 (#18) →  registry + snapshot (no behavior change)
-PR2 (#19) →  signals + typed exceptions + fail-fast + half-open recovery
-PR3 (#20) →  status policy + breaker-aware ensure + ensure-only tunables
-```
-
-> **Tunables scope note:** PR3 shipped **ensure-only** tunables, NOT
-> `BreakerPolicy` threshold/window/cooldown config. `W2A_BREAKER_*` keys do not
-> exist. Threshold constants stay in `breakers.py` until real-world tuning data
-> shows the defaults need adjustment (deferred follow-up E).
-
-### Known follow-ups (not yet roadmap phases)
-
-Discovered during Phase 4 runtime validation. Each is a separate, small PR — do
-not bundle them into the Phase 5 refactor.
+Subsystem boundaries should use typed errors/codes rather than bare
+`RuntimeError` where practical. Initial vocabulary:
 
 ```text
-A. _fetch_text transient 404 retry   ✅ RESOLVED (#23)
-   cdp_driver._fetch_text can hit a backend 404 immediately after send, before
-   the just-created conversation is persisted server-side. Treated as a bounded
-   transient retry (NOT a breaker). Landed in backend_client.py (#22 extraction)
-   via #23 — the recommended sequence (extract first, then fix in the new module)
-   was followed exactly.
+AUTH_REQUIRED
+UPSTREAM_RATE_LIMIT
+UPSTREAM_SCHEMA_CHANGED
+DOM_CONTRACT_BROKEN
+CDP_DISCONNECTED
+OWNED_TAB_REQUIRED
+TAB_LOST
+SESSION_CAPACITY_EXHAUSTED
+GENERATION_TIMEOUT
+TURN_RECONCILIATION_FAILED
+CAPABILITY_UNSUPPORTED
+UPLOAD_REJECTED
+UPLOAD_TIMEOUT
+LOCAL_FILE_FORBIDDEN
+RESOURCE_LIMIT_EXCEEDED
+```
 
-B. requests_served semantics
-   /health.requests_served currently counts requests accepted/handled, not
-   successful responses. Either document it as "accepted/handled" or add a
-   distinct successful_requests counter. Do NOT change the existing counter's
-   meaning silently.
+Do not create a giant hierarchy speculatively. Add codes when a caller or
+operator can take a meaningfully different action.
 
-C. Non-401 backend-error observability
-   Only HTTP 401 trips a breaker (AUTH_EXPIRED). Other backend errors (404/5xx)
-   raise a bare RuntimeError and never fail-fast. Decide whether persistent
-   backend 5xx/404 should stay observability-only, become a breaker signal, or
-   get a distinct /health field. Keep transient errors out of breakers unless
-   persistence is proven.
+## Boundary rule
 
-D. MCP /messages trailing-slash redirect
-   The SSE-announced endpoint is /messages?session_id=... but the server 307-
-   redirects to /messages/?... (trailing slash); a 307 can drop the JSON body
-   depending on the client. Harden (announce the canonical URL) or document the
-   redirect. Real MCP clients add the slash today.
+```text
+REST adapter ─┐
+              ├─> canonical runtime request ─> browser/session runtime
+MCP adapter ──┘
+```
 
-E. BreakerPolicy threshold config
-   Still defer W2A_BREAKER_* threshold/window/cooldown tunables unless
-   production data shows the defaults need tuning. Do NOT add them speculatively.
+The browser/session runtime must not need to know which adapter originated the
+turn.
+
+## Exit criteria
+
+- chat send paths for REST and MCP translate into the shared request model;
+- browser send/reconciliation consumes shared turn context;
+- new attachment/session work has one internal representation;
+- typed error mapping exists at adapter boundaries;
+- no behavior regression in existing tests/live canary.
+
+---
+
+# Phase 10 — ChatGPT Web compatibility contract
+
+**Class:** FOUNDATION
+
+**Goal:** centralize and continuously validate assumptions about the volatile
+ChatGPT Web surface.
+
+## 10.1 Contract registry
+
+Create a focused compatibility layer for observed upstream behavior:
+
+```text
+chatgpt_contract/
+  selectors.py
+  routes.py
+  shapes.py
+  capabilities.py
+  probes.py
+  fingerprints.py
+```
+
+The exact module layout can differ; the important rule is that external
+assumptions become named contracts rather than scattered literals.
+
+## 10.2 Selector contracts
+
+Prefer three tiers:
+
+```text
+1. stable attributes/test IDs
+2. accessibility semantics
+3. structural/behavioral inference
+```
+
+Avoid accumulating arbitrary fallback selectors. Each contract should be able
+to report what strategies were attempted and what matched.
+
+Examples:
+
+```text
+composer
+send_button
+stop_button
+action_button
+attachment_button
+attachment_input
+attachment_pending_state
+conversation_route
+```
+
+## 10.3 Startup / preflight probes
+
+Before declaring mutation capability healthy, probe facts such as:
+
+```text
+session/auth available
+owned target valid
+composer discoverable
+composer accepts text
+send affordance discoverable
+conversation route recognizable
+identity listener ready
+backend conversation projection readable
+```
+
+Do not perform destructive sends as a startup probe.
+
+## 10.4 Per-capability health
+
+Represent partial drift explicitly:
+
+```text
+chat: healthy
+auth: healthy
+projects: degraded
+memories: healthy
+attachments: unavailable
+turn_reconciliation: healthy
+```
+
+A broken optional capability must not automatically take down unrelated chat
+operations.
+
+## 10.5 Observed contract version
+
+Expose a bridge-owned certification identifier such as:
+
+```text
+2026-09-a
+```
+
+This is **not** an upstream ChatGPT version. It means “the observed web contract
+against which this build/fixture set was last certified.”
+
+## Exit criteria
+
+- critical selectors/routes/shapes have named contracts;
+- capability probes produce structured diagnostics;
+- optional feature drift can degrade independently;
+- contract fixtures can be tagged to an observed-contract identifier.
+
+---
+
+# Phase 11 — Transport-neutral session runtime
+
+**Class:** FOUNDATION
+
+**Goal:** generalize the existing MCP session-affine pool into shared browser
+session infrastructure rather than building a second pool.
+
+## Starting point
+
+Reuse the proven MCP pool concepts already in `master`:
+
+```text
+PENDING → ACTIVE → CLOSING → DISOWNED
+bounded capacity
+owned tabs
+per-session call lock
+lease accounting
+TTL cleanup
+account-level throttle breaker
+```
+
+The next abstraction should be transport-neutral, for example:
+
+```text
+BrowserSessionManager
+or
+SessionRouter
+```
+
+Naming matters less than ownership semantics.
+
+## Responsibilities
+
+- allocate/reuse owned tabs/drivers;
+- preserve conversation/session affinity;
+- issue bounded leases;
+- serialize operations that share one session;
+- allow independent sessions to run in parallel when safe;
+- count pending/active/closing capacity correctly;
+- expire idle sessions;
+- drain gracefully on shutdown;
+- expose lease/capacity diagnostics;
+- enforce account-wide throttling independently from per-session locks.
+
+## Non-goals
+
+- do not equate tab count with account quota;
+- do not create unlimited sessions because Chrome can create more tabs;
+- do not duplicate pool implementations for REST and MCP;
+- do not weaken owned-tab fail-closed behavior.
+
+## Exit criteria
+
+- REST and MCP can acquire browser/session context from the same runtime layer;
+- session affinity survives adapter differences;
+- capacity and lease lifecycle are observable;
+- shutdown cannot silently abandon owned tabs/leases;
+- singleton mode remains available and behavior-compatible.
+
+---
+
+# Phase 12 — Recovery coordinator and backpressure
+
+**Class:** FOUNDATION + OPERATIONS
+
+**Goal:** make retries, recovery, capacity, and overload behavior one coherent
+policy rather than independent local loops.
+
+## 12.1 Recovery coordinator
+
+Coordinate:
+
+```text
+breaker state
+CDP reconnect
+owned-tab reacquisition
+Chrome restart ownership
+session rematerialization
+auth-required state
+turn observation/reconciliation
+```
+
+Possible high-level states:
+
+```text
+HEALTHY
+DEGRADED
+RECOVERING
+HUMAN_ACTION_REQUIRED
+FAILED
+```
+
+Do not force all existing breakers into one monolithic breaker. The coordinator
+orchestrates recovery decisions while preserving failure-class-specific state.
+
+## 12.2 Recovery budgets
+
+Bound repeated repair attempts. Examples of limits that may be configurable:
+
+```text
+reconnect attempts / window
+session rematerializations / window
+Chrome restarts / window
+total recovery wall time
+```
+
+When the budget is exhausted, fail clearly instead of entering a
+restart/reconnect loop.
+
+## 12.3 Backpressure
+
+All session/worker capacity must be bounded:
+
+```text
+max active sessions
+max pending acquisitions
+acquire timeout
+optional bounded request queue
+```
+
+When capacity is exhausted, surface an explicit retryable failure. Do not let
+requests accumulate invisibly.
+
+## 12.4 Idempotency rule
+
+This remains non-negotiable:
+
+```text
+safe: retry reads / probes / reconciliation
+unsafe: automatically resend a user mutation because observation timed out
+```
+
+## Exit criteria
+
+- overload produces bounded, explicit backpressure;
+- recovery loops have finite budgets;
+- send retries cannot duplicate turns;
+- recovery/capacity state appears in diagnostics/health;
+- failure codes tell callers whether retry, wait, or human action is appropriate.
+
+---
+
+# Phase 13 — Attachment subsystem
+
+**Class:** BLOCKER + FOUNDATION + FEATURE
+
+**Goal:** land file attachments as a first-class turn capability without
+introducing host-file disclosure, unbounded spooling, cross-request state, or
+ambiguous send behavior.
+
+PR #49 is useful implementation research but should not merge unchanged.
+
+## 13.1 Separate attachment provenance
+
+Two fundamentally different capabilities must remain distinct:
+
+### Client-provided attachment
+
+```text
+client bytes
+→ bridge-owned bounded staging file/object
+→ ChatGPT composer
+```
+
+This is ordinary attachment input.
+
+### Server-local file
+
+```text
+caller names host pathname
+→ bridge reads server filesystem
+→ ChatGPT composer
+```
+
+This is privileged host authority.
+
+Server-local paths must be **disabled by default**. If supported, require an
+explicit gate (for example `W2A_ENABLE_LOCAL_FILES=1`) plus configured allowed
+roots. Resolve real paths and enforce containment after symlink resolution.
+
+## 13.2 Resource limits during ingestion
+
+Enforce limits while bytes are being received/written, not after the complete
+part is on disk:
+
+```text
+per-file bytes
+aggregate request bytes
+file count
+field/body limits where appropriate
+```
+
+Abort and clean the partial object immediately on limit violation.
+
+## 13.3 Deterministic ownership and cleanup
+
+Temporary attachment resources need one lifecycle owner and a structural
+`try/finally` covering success, errors, early validation returns, client
+disconnects, and task cancellation.
+
+## 13.4 Per-turn attachment state
+
+Do not use a persistent driver-global `_file_upload_active` flag.
+
+Attachment state belongs to the current turn/session context, with an explicit
+state machine such as:
+
+```text
+ATTACHING
+→ ATTACHED
+→ UPLOADING
+→ READY_TO_SEND
+→ SUBMITTED
+```
+
+Timeout while pending must fail; it must not trigger a speculative second send.
+
+## 13.5 Browser evidence
+
+Observe concrete UI state where possible:
+
+- requested attachment input accepted;
+- expected attachment chips/cards appeared;
+- upload/progress state settled;
+- send control is ready;
+- existing send acknowledgment confirms submission.
+
+English body text such as `File upload pending` may remain a fallback signal,
+not the sole state machine.
+
+## 13.6 E2E validity
+
+The live attachment E2E must prove file **contents** reached the model. Generate
+an unpredictable token only inside the attachment, ask for the token contained
+in the file, and assert that token in the response. Never put the expected token
+in the prompt itself.
+
+## Exit criteria
+
+```text
+no host-path access by default
+allowed-root containment for privileged local files
+streaming/count/aggregate resource bounds
+cleanup on cancellation and every terminal path
+per-turn attachment state (no driver-global flag)
+no second-click on pending timeout
+content-dependent live E2E
+attachment-specific typed errors
 ```
 
 ---
 
-## Phase 5 — Split `cdp_driver.py`  ✅ COMPLETE 2026-06-27
+# Phase 14 — Compatibility laboratory
 
-**Goal:** reduce bug density *after* behavior is stable. `cdp_driver.py` was
-~2986 lines mixing CDP transport, ChatGPT DOM logic, completion detection, and
-token/session/conversation fetch. **Reduced to 1558 lines** (nearly halved);
-the rest was extracted into focused, singly-responsible modules with **no
-behavior change**. Each extraction was verified by a full test pass, a green CI
-matrix, and a live `"ok"` send against a real ChatGPT account.
+**Class:** FOUNDATION + OPERATIONS
 
-### Landed PRs
+**Goal:** detect upstream drift before it becomes an opaque production failure.
+
+## Four test layers
+
+### Layer 1 — unit/state-machine tests
+
+Continue strong deterministic coverage for:
 
 ```text
-#22 backend_client.py   token / session / conversation fetch (+ project/memory CRUD)
-#23 _fetch_text 404 retry   bounded transient-404 retry (follow-up A, in backend_client)
-#24 cdp_transport.py     CDP websocket / session / reconnect primitives
-#25 chatgpt_dom.py       composer / selectors / send-readiness / rate-limit dismiss
-#26 completion_detector.py   Phase-1 appear loop + Phase-2 stream/completion loop
+selectors/contracts
+turn anchors
+completion states
+breakers
+locks
+leases
+recovery policy
+attachment lifecycle
 ```
 
-### Final architecture — hub-and-spoke interception
+### Layer 2 — recorded/replay fixtures
 
-`CDPDriver` is now an **orchestration facade + interception hub** plus the
-lifecycle/tab-ownership core. The extracted modules (`backend_client`,
-`cdp_transport`, `chatgpt_dom`, `completion_detector`) hold a back-reference
-to the driver and route every transport/state/peer call through
-`self._driver.<method>` — *not* their own implementations. This is deliberate:
-`CDPDriver` remains the single monkeypatch seam, so test patches on
-`driver.X` propagate into the collaborators. This contract is asserted by
-`tests/test_chatgpt_dom.py` and `tests/test_completion_detector.py` and
-documented in each module's docstring.
-
-### Post-extraction audit — remaining delegators are load-bearing
-
-A full import-site audit (every method on `CDPDriver`, across `src/` and
-`tests/`) found **zero delete-safe facade methods**. The remaining
-driver-facing methods are the intentional compatibility/interception seams used
-by collaborator modules and the test suite — they are **not** technical debt in
-this architecture. Keeping them is what made #22–#26 safe. `cdp_driver.py` is
-at its natural floor for the hub-and-spoke design; further line reduction is
-not available without restructuring the interception contract.
-
-### Deferred — Group C lifecycle / tab-ownership (separate initiative)
-
-The only remaining extraction target is the **lifecycle core**: `connect` /
-`reconnect` / `close`, heartbeat (`_heartbeat_loop`, `_live_target_ids`), tab
-ownership (`_create_owned_tab`, `_find_owned_tab_ws`, `_adopt_existing_chatgpt_tab`,
-`_find_page_ws`, `_browser_cdp`), token refresh, and the breaker-policy touch
-points. This is **deferred as a separate high-risk initiative**, not a Phase 5
-continuation. It is the first extraction that simultaneously crosses lifecycle
-ownership, reconnect semantics, heartbeat, the target registry, browser-domain
-CDP, and breaker policy. It should not be started on the momentum of the
-facade-split work; it deserves a fresh "should we do this at all?" decision
-after Phase 5 is closed.
+Capture sanitized evidence such as:
 
 ```text
-Phase 5 complete. The driver has been reduced to an orchestration/interception
-hub plus lifecycle/tab-ownership core. A post-extraction audit found no
-delete-safe facade methods: the remaining driver-facing methods are intentional
-compatibility and monkeypatch seams used by collaborator modules and tests.
-Further extraction would require moving lifecycle/tab ownership and reconnect
-policy, which is deferred as a separate high-risk initiative.
+CDP events
+DOM compatibility snapshots
+backend projection shapes
+conversation graphs
+navigation/readiness states
 ```
 
-### Rules (honored)
+Store fixtures by observed-contract version.
+
+### Layer 3 — named contract tests
+
+Examples:
 
 ```text
-no behavior changes in any split PR             ✅
-tests moved/added with modules                  ✅
-public CDPDriver facade kept stable (no caller breakage)  ✅
+test_contract_composer
+test_contract_send_button
+test_contract_conversation_route
+test_contract_identity_capture
+test_contract_conversation_projection
+test_contract_attachment_input
+```
+
+A drift failure should say which external assumption moved.
+
+### Layer 4 — minimal live certification
+
+Keep the live suite deliberately small and high-signal:
+
+```text
+session/auth
+fresh chat
+streaming completion
+conversation continuation
+exact-turn correlation
+project-scoped navigation
+parallel/session isolation
+attachment content verification
+```
+
+Do not replace deterministic tests with a large live-prompt suite.
+
+## Primary correctness metric
+
+The most important metric is not raw availability. It is:
+
+```text
+silent wrong-turn response rate = 0
+```
+
+If exact causal correlation cannot be established, fail instead of returning a
+plausible stale answer.
+
+## Exit criteria
+
+- contract fixtures exist for critical upstream assumptions;
+- live certification can be run as a small explicit canary;
+- drift failures identify the moved contract;
+- recorded fixtures support regression testing without a live account.
+
+---
+
+# Phase 15 — Hardened operation
+
+**Class:** OPERATIONS
+
+**Goal:** make controlled network/server deployments explicit about authority,
+identity, and resource boundaries.
+
+## Required areas
+
+### Network exposure
+
+- preserve loopback-safe defaults;
+- bring MCP network exposure closer to REST's fail-closed posture;
+- require deliberate authentication/authorization for hardened remote mode;
+- keep Chrome CDP private to localhost/private runtime boundaries.
+
+### Scoped authority
+
+Evolve beyond an all-or-nothing reachable MCP client. Preserve the existing
+READ / WRITE / DESTRUCTIVE distinction and add separate treatment for host-local
+capabilities such as local files.
+
+### Auditability
+
+Record structured security-relevant events without logging sensitive content:
+
+```text
+principal/session
+operation class
+conversation/project target where safe
+local-file capability use
+result/error code
+resource/capacity decisions
+```
+
+### Browser credentials
+
+Treat the Chrome profile, cookies/session data, and CDP access as credentials:
+
+- dedicated OS user/profile;
+- restrictive filesystem permissions;
+- no unrelated-user profile sharing;
+- documented revoke/cleanup procedure.
+
+### Resource limits
+
+Document and enforce safe bounds for:
+
+```text
+sessions/tabs
+queues
+uploads
+diagnostics artifacts
+recovery attempts
+browser/worker resources
+```
+
+### Observability
+
+Define how REST health, MCP/SSE pool health, breakers, session leases, and
+compatibility status are viewed together. This may be aggregation rather than a
+single process owning every health fact.
+
+## Exit criteria
+
+- remote operation requires an explicit hardened security posture;
+- host-local capabilities have independent authorization/gating;
+- CDP is never the public control surface;
+- security-relevant operations are auditable;
+- resource limits and health semantics are documented and testable.
+
+---
+
+# Phase 16 — Feature expansion
+
+**Class:** FEATURE
+
+**Goal:** resume broad ChatGPT Web feature work only after the runtime can absorb
+upstream drift and new browser state safely.
+
+Candidate work includes:
+
+- web search mode;
+- image generation workflows;
+- richer project/file operations;
+- additional Custom GPT capabilities;
+- other ChatGPT Web features discovered through the compatibility-contract
+  process.
+
+Every new browser feature must ship with:
+
+```text
+capability contract
+startup/runtime probe where appropriate
+typed errors
+resource/security classification
+deterministic tests
+minimal live certification
+independent degradation behavior
+```
+
+Do not add a feature merely by inserting another selector or retry loop into
+`CDPDriver`.
+
+---
+
+# Sequencing and gates
+
+```text
+Phase 8  Stabilize current reality
+   ↓
+Phase 9  Canonical runtime model
+   ↓
+Phase 10 ChatGPT Web compatibility contract
+   ↓
+Phase 11 Transport-neutral session runtime
+   ↓
+Phase 12 Recovery coordinator + backpressure
+   ↓
+Phase 13 Attachment subsystem
+   ↓
+Phase 14 Compatibility laboratory
+   ↓
+Phase 15 Hardened operation
+   ↓
+Phase 16 Feature expansion
+```
+
+Some test-fixture work from Phase 14 may begin earlier when it directly protects
+Phases 9–13, but Phase 14 remains the point where the compatibility laboratory
+becomes a supported subsystem.
+
+Security fixes for an active feature PR do **not** wait for their numbered
+phase. For example, PR #49 must not merge with unrestricted host-local path
+access simply because the full attachment subsystem is Phase 13.
+
+---
+
+# Merge gates for roadmap work
+
+## General
+
+Every non-doc roadmap PR should answer:
+
+1. What runtime invariant does this change establish or preserve?
+2. What failure mode is now typed/observable instead of guessed?
+3. What resource/state does this code own, and where is cleanup guaranteed?
+4. Can this change duplicate a user mutation during retry/recovery?
+5. What deterministic regression test proves the invariant?
+6. What live certification is necessary, if any?
+
+## Browser-facing changes
+
+Require:
+
+```text
+named compatibility contract
+structured diagnostic on mismatch
+fail-closed behavior
+recorded fixture where practical
+live canary for high-risk send/navigation/attachment changes
+```
+
+## Concurrency changes
+
+Require:
+
+```text
+explicit ownership
+lock-order documentation
+bounded capacity
+cancellation-safe lease cleanup
+shutdown/drain behavior
+no shared-tab fallback in parallel mode
+```
+
+## Attachment/local-file changes
+
+Require:
+
+```text
+proven provenance model
+no unrestricted server-local paths
+streaming resource enforcement
+deterministic cleanup
+per-turn state
+content-dependent E2E
 ```
 
 ---
 
-## Phase 6 — Optional OS-level supervision docs
+# Not priorities right now
 
-**Goal:** support always-on deployments outside ZCode. Comes last because ZCode
-hooks are the primary path.
+The following should not displace Phases 8–15 without new evidence:
 
-✅ **PR1 (#28) — OS supervision guide.** Added `docs/os-supervision.md` covering
-systemd (Linux), launchd (macOS), and Task Scheduler / NSSM (Windows), with two
-styles: `ensure` on a timer (mirrors the ZCode hook) and `start` as a long-lived
-service. Documents the recommended reconcile command
-(`chatgpt-web2api ensure --rest-port 8080 --mcp-sse-port 8090 --cdp-port 9222`),
-the `/health`-gated restart policy (restart on process exit, not on `degraded`),
-log capture, and the env-var reference. **Docs only** — no supervisor scripts
-installed, no daemonization code, no package entrypoint changes. Linked from
-`docs/deployment.md` (Option 4).
-
-✅ **PR2 (#29) — Production runbook.** Added `docs/runbook.md`: startup
-checklist, `/health` field reference with exact `status` conditions, common
-failure modes mapped to symptoms/fixes, the four breakers with thresholds and
-cooldowns (source-cited, hardcoded — no env override), the auth-recovery flow,
-the safe-restart rule (restart on process exit, not on `degraded`), log
-collection, and post-deploy validation (incl. the exact-output `"Reply with
-exactly: ok"` sanity send). Linked from `docs/deployment.md` (Option 5). All
-field names/state values/thresholds verified against source.
-
-✅ **PR3 (#30) — Documentation index.** Added `docs/INDEX.md`: a "which doc
-should I read?" routing table plus grouped listings (operating guides,
-architecture/decisions, reverse-engineering/internals) with one-line purposes
-for every doc in `docs/`. Linked from `README.md` (Documentation section
-refreshed) and `docs/deployment.md` (top pointer). Makes the Phase 6 ops docs
-(os-supervision, runbook) discoverable without adding operational surface.
-
-Docs only — no code:
-
-```text
-Windows Scheduled Task
-NSSM / service wrapper
-Linux systemd
-macOS launchd
-```
-
-### Positioning
-
-```text
-ZCode users       → use the ensure hook (Phase 3)
-always-on / server users → use OS supervision (this phase)
-```
+- another large `CDPDriver` line-count refactor;
+- more ad-hoc selector fallbacks without compatibility contracts;
+- speculative breaker tunables without field data;
+- unbounded browser/tab scaling;
+- broad new UI features before attachments/session/recovery foundations are
+  correct;
+- a second session pool rather than generalizing the one already shipped.
 
 ---
 
-## Final sequencing
+# Success criteria for the next architecture cycle
+
+The cycle is successful when all of the following are true:
 
 ```text
-0. Merge PR #9                              ✅
-1. Observability gaps: zombie regression tests + silent-failure logging   (partial — see Phase 1)
-2. SSE recommended transport (docs + integration tests)  ✅
-3. ensure command + ZCode hook docs                        ✅
-4. non-rate-limit breaker policy                           ✅ (PR1 #18 / PR2 #19 / PR3 #20)
-5. split cdp_driver.py                                     ✅ (#22–#26; complete 2026-06-27)
-6. optional OS-supervision docs                            (last, docs-only)
-7. parallel multi-tab on one Chrome                        ✅ (PR1–5; per-target locks +
-   _owns_chrome lifecycle + MutationLock/resolver + parallel_tabs bundle + docs)
+master is green and released from a truthful baseline
+fresh-chat behavior has a current certification result
+REST and MCP share canonical turn/session semantics
+critical ChatGPT Web assumptions are named and probed
+session capacity/leases are transport-neutral and bounded
+recovery has finite budgets and cannot auto-resend mutations
+local host files are inaccessible by default
+attachments have deterministic cleanup and per-turn state
+upstream drift fails by capability instead of taking down unrelated features
+record/replay + minimal live certification exist
+silent wrong-turn responses remain a hard zero-tolerance failure class
+hardened remote operation has explicit auth/authority/resource boundaries
 ```
 
-The parallel-tabs phase (7) shipped as five stacked PRs: `CrossProcessLock`
-`lock_key` generalization → `_owns_chrome` lifecycle ownership → `MutationLock`
-+ resolver (inert) → `parallel_tabs` config + enforcement + wiring → docs. The
-safety invariant — the `parallel_tabs` bundle becomes usable in the same PR
-where fail-closed owned-tab enforcement lands — held across the sequence. The
-cross-instance pool/router (single endpoint) remains future work.
-
-Known follow-ups (A–E, listed under Phase 4) slot in around Phase 5 as small
-standalone PRs — do not bundle them into the refactor. The recommended
-post-Phase-4 order: extract `backend_client.py` (Phase 5 PR1, no behavior
-change) → fix `_fetch_text` 404 (follow-up A) in the new module.
-
-This version removes the stale health work, avoids duplicate rate-limit work,
-drops the under-specified stdio-process warning, moves `ensure` earlier
-(`/health` is trustworthy), and pins the two Phase 3 ambiguities (degraded
-restart, SSE watchdog) before any `ensure` code is written.
+That is the point at which expanding the ChatGPT Web feature surface becomes the
+safe next optimization target.
