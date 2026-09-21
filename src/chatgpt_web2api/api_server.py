@@ -467,9 +467,10 @@ class APIServer:
             # applied" status. The body carries the machine-readable
             # distinction: retry_safe=False and the preserved causal
             # evidence (captured_user_id) when the in-flight capture
-            # resolved. NOTE: some OpenAI SDKs retry 409 by default —
-            # client retry is client policy; the code field is the stop
-            # signal a single_send caller must honor.
+            # resolved. The x-should-retry:false header below is what
+            # prevents official OpenAI SDKs from auto-retrying the 409 —
+            # they check it before their status rules. Retry-After is
+            # deliberately absent: the instruction is "do not resend".
             payload: dict = {
                 "message": f"{exc} (outcome unknown — do not blindly re-request; "
                            "reconcile via the conversation if captured_user_id is set)",
