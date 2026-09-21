@@ -77,6 +77,13 @@ ignore = ["E501", "E402"]
 # conftest redefines event_loop for pytest-asyncio — intentional fixture override.
 "tests/conftest.py" = ["F811"]
 
+[tool.ruff.lint.isort]
+# Deterministic import classification for every environment. Without this,
+# ruff infers first-party from whether the src-layout package happens to be
+# installed, so local runs and the CI lint job disagreed on I001 (PR #52
+# review: local ruff 0.15.16 clean, CI ruff 0.16.8 failing).
+known-first-party = ["chatgpt_web2api"]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 markers = [

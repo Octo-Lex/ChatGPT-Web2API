@@ -20,7 +20,6 @@ from chatgpt_web2api.api_server import _resolve_single_send
 from chatgpt_web2api.cdp_driver import RateLimitError
 from chatgpt_web2api.resilience import chat_retry_attempts, retry_on_rate_limit
 
-
 # ── resilience helper ────────────────────────────────────────────────
 
 def test_chat_retry_attempts_default_is_three():
