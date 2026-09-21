@@ -63,10 +63,28 @@ dispatch sites) wrapped their full mutating operation in it.
    `[Error: send_outcome_unknown …]` marker chunk with the same evidence,
    mirroring the established rate-limit marker precedent. MCP
    `_map_tool_exception` returns a structured isError result carrying the
-   code, the UUID when preserved, and do-not-resend guidance. Caveat,
-   stated plainly: some OpenAI SDKs retry 409/5xx by default — client
-   retry is client policy; the `code` field is the stop signal a
-   single_send caller must honor.
+   code, the UUID when preserved, and do-not-resend guidance.
+   **Independent-review fix (82a37d7)**: the 409 also sends
+   `x-should-retry: false` — the official OpenAI SDKs check that header
+   BEFORE their retryable-status rules (409 is otherwise auto-retried by
+   default), so without it the SDK layer re-enabled the replay this patch
+   removes. Pinned by test alongside `Retry-After` absence. Review also
+   tightened the transport test's no-reconnect assertion (explicit
+   counter, replacing a tautological socket-identity check) and fixed the
+   sync `_assert_owned_tab_required` seam mock.
+
+   Independent-review fixes continued (0a5dd0d, f94f02e): the committed
+   recon harness now reproduces the report's authenticated projection
+   method (in-page Bearer token; the committed script had been
+   cookie-only, which the report itself records as masked-404), data
+   injection uses the IIFE-parameter pattern instead of top-level
+   `var __D` (page-global collision, a known bug class), exp1b sets its
+   completion event on the event-loop thread (asyncio.Event is not
+   thread-safe), and the lint gate went deterministic:
+   `known-first-party = ["chatgpt_web2api"]` (the local-0.15/CI-0.16 I001
+   disagreement was classification drift, not rule drift) plus the
+   inherited baseline cleared so the lint job — and the build job it
+   gates — can pass.
 
 ## Claim boundary (for the PR description)
 
