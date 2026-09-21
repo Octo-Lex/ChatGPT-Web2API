@@ -139,49 +139,73 @@ def tab_ids():
     return {t["id"]: t for t in d if t.get("type") == "page"}
 
 
-async def tab_network_observer(ws_url: str, events: list, stop_at: float):
-    """Record /backend-api/ traffic on the experiment tab (request urls,
-    wallTime); remember the f/conversation requestId for body retrieval."""
-    async with websockets.connect(ws_url, max_size=10**7, open_timeout=5) as ws:
-        await ws.send(json.dumps({"id": 1, "method": "Network.enable"}))
-        mid = 100
-        while time.monotonic() < stop_at:
-            try:
-                raw = await asyncio.wait_for(ws.recv(), timeout=0.5)
-            except asyncio.TimeoutError:
-                continue
-            m = json.loads(raw)
-            if m.get("method") == "Network.requestWillBeSent":
-                p = m["params"]
-                url = p.get("request", {}).get("url", "")
-                if "/backend-api/" in url:
-                    events.append({"kind": "req", "wall": p.get("wallTime"),
-                                   "method": p.get("request", {}).get("method"),
-                                   "url": url[:110], "rid": p.get("requestId")})
-                    if p["request"].get("method") == "POST" and url.endswith("/f/conversation"):
-                        STATE["f_conversation_posts"] += 1
-            elif m.get("method") == "Network.responseReceived":
-                p = m["params"]
-                url = p.get("response", {}).get("url", "")
-                if url.endswith("/f/conversation"):
-                    events.append({"kind": "resp",
-                                   "status": p.get("response", {}).get("status"),
-                                   "rid": p.get("requestId")})
+class TabObserver:
+    """Network observer bound to ONE CDP session on the experiment tab.
 
+    Review fix: Network.getResponseBody must be issued by the SAME session
+    that enabled Network and tracked the request — a fresh connection has
+    neither. Commands therefore go through this observer's own live socket
+    (single-reader loop routes responses to caller futures).
+    """
 
-async def get_response_body(ws_url: str, rid: str) -> dict:
-    """Fetch the f/conversation response body (for conversation_id)."""
-    async with websockets.connect(ws_url, max_size=10**7, open_timeout=5) as ws:
-        await ws.send(json.dumps({"id": 1, "method": "Network.getResponseBody",
-                                  "params": {"requestId": rid}}))
-        while True:
-            m = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
-            if m.get("id") == 1:
-                body = (m.get("result") or {}).get("body") or ""
+    def __init__(self, ws_url: str):
+        self._ws_url = ws_url
+        self._ws = None
+        self._cmds: dict[int, asyncio.Future] = {}
+        self._next_cmd = 1000
+        self.f_conversation_posts = 0
+        self.resp_events: list[dict] = []
+
+    async def run(self, stop_at: float) -> None:
+        async with websockets.connect(self._ws_url, max_size=10**7,
+                                       open_timeout=5) as ws:
+            self._ws = ws
+            await ws.send(json.dumps({"id": 1, "method": "Network.enable"}))
+            while time.monotonic() < stop_at:
                 try:
-                    return json.loads(body)
-                except Exception:
-                    return {"_raw": body[:200]}
+                    raw = await asyncio.wait_for(ws.recv(), timeout=0.5)
+                except TimeoutError:
+                    continue
+                m = json.loads(raw)
+                mid = m.get("id")
+                if mid is not None and mid in self._cmds:
+                    fut = self._cmds.pop(mid)
+                    if not fut.done():
+                        fut.set_result(m)
+                    continue
+                if m.get("method") == "Network.requestWillBeSent":
+                    p = m["params"]
+                    url = p.get("request", {}).get("url", "")
+                    if url.endswith("/f/conversation") and \
+                            p["request"].get("method") == "POST":
+                        self.f_conversation_posts += 1
+                elif m.get("method") == "Network.responseReceived":
+                    p = m["params"]
+                    if p.get("response", {}).get("url", "").endswith("/f/conversation"):
+                        self.resp_events.append(
+                            {"rid": p.get("requestId"),
+                             "status": p.get("response", {}).get("status")})
+
+    async def call(self, method: str, params: dict, timeout: float = 10) -> dict:
+        if self._ws is None:
+            raise RuntimeError("observer session not running")
+        self._next_cmd += 1
+        cid = self._next_cmd
+        fut = asyncio.get_running_loop().create_future()
+        self._cmds[cid] = fut
+        await self._ws.send(json.dumps(
+            {"id": cid, "method": method, "params": params}))
+        return await asyncio.wait_for(fut, timeout)
+
+
+async def get_response_body(observer: TabObserver, rid: str) -> dict:
+    """Fetch the f/conversation response body VIA THE OBSERVER SESSION."""
+    m = await observer.call("Network.getResponseBody", {"requestId": rid})
+    body = (m.get("result") or {}).get("body") or ""
+    try:
+        return json.loads(body)
+    except Exception:
+        return {"_raw": body[:200]}
 
 
 async def projection_lookup(ws_url: str, conv_id: str) -> dict:
@@ -284,6 +308,18 @@ async def main() -> None:
             await asyncio.sleep(0.5)
     print("experiment bridge started on 8081 (PR #52 tree, in-process)")
 
+    # Honest reconnect counter (review fix): count the DRIVER's reconnect
+    # calls directly — total websockets.connect creations conflate the
+    # harness observer and browser-level startup sockets.
+    STATE["driver_reconnect_calls"] = 0
+    _orig_reconnect = service._driver.reconnect
+
+    async def _counting_reconnect():
+        STATE["driver_reconnect_calls"] += 1
+        return await _orig_reconnect()
+
+    service._driver.reconnect = _counting_reconnect
+
     # The experiment tab: the driver's OWN tab (may be reclaimed from the
     # registry by id — no NEW tab appears in that case, so diffing is wrong).
     exp = None
@@ -304,22 +340,23 @@ async def main() -> None:
     ws_url = exp["webSocketDebuggerUrl"]
     print(f"experiment tab: {exp['id'][:12]} {exp['url'][:60]}")
 
-    events: list = []
+    observer = TabObserver(ws_url)
     stop_at = time.monotonic() + 200
-    obs = asyncio.create_task(tab_network_observer(ws_url, events, stop_at))
+    obs = asyncio.create_task(observer.run(stop_at))
 
     await asyncio.sleep(2.0)
     rest = await asyncio.to_thread(fire_rest)
     print(f"REST: status={rest.get('status')} elapsed={rest.get('elapsed_s')}s "
           f"x-should-retry={rest.get('x_should_retry')}")
     await asyncio.sleep(4.0)  # let any aftermath settle; observer keeps recording
+    STATE["f_conversation_posts"] = observer.f_conversation_posts
 
-    # conversation id from the f/conversation response body
+    # conversation id from the f/conversation response body — fetched VIA
+    # the observer session (same CDP session that tracked the request).
     conv_id = None
-    resp_ev = next((e for e in events if e["kind"] == "resp"), None)
-    if resp_ev:
+    if observer.resp_events:
         try:
-            rb = await get_response_body(ws_url, resp_ev["rid"])
+            rb = await get_response_body(observer, observer.resp_events[0]["rid"])
             conv_id = rb.get("conversation_id")
             if not conv_id:
                 c = rb.get("c")  # {conversation_id: ...} keyed shape fallback
@@ -340,19 +377,21 @@ async def main() -> None:
     service.request_shutdown()
     try:
         await asyncio.wait_for(svc_task, timeout=20)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         print("service.start() did not return after shutdown request")
     try:
         await asyncio.wait_for(service.stop(), timeout=20)
     except Exception as e:
         print(f"service stop: {e}")
-    # close leftover owned tab if the service did not
+    # Review fix (safety contract): close ONLY the positively owned
+    # experiment tab — never any new ChatGPT tab, which could be the
+    # user's. The owned target id comes from the experiment driver itself.
+    owned_tid = getattr(service._driver, "_target_id", None)
     now = tab_ids()
-    leftover = [tid for tid in now if tid not in pre and "chatgpt.com" in now[tid].get("url", "")]
-    for tid in leftover:
+    if owned_tid and owned_tid in now and "chatgpt.com" in now[owned_tid].get("url", ""):
         try:
-            urllib.request.urlopen(f"{CDP_HTTP}/json/close/{tid}", timeout=5).read()
-            print(f"closed leftover experiment tab {tid[:12]}")
+            urllib.request.urlopen(f"{CDP_HTTP}/json/close/{owned_tid}", timeout=5).read()
+            print(f"closed owned experiment tab {owned_tid[:12]}")
         except Exception:
             pass
 
@@ -373,8 +412,13 @@ async def main() -> None:
         "counters": {
             "mutating_Runtime_evaluate_frames": STATE["mutating_frames"],
             "fault_injected": STATE["injected"],
-            "websocket_connections_created": STATE["ws_connections"],
-            "reconnect_calls": max(0, STATE["ws_connections"] - 1),
+            # Honest reconnect accounting (review fix): the DRIVER's own
+            # reconnect calls, counted by wrapping driver.reconnect.
+            "driver_reconnect_calls": STATE.get("driver_reconnect_calls", 0),
+            # Informational only: total websockets.connect creations in this
+            # process — conflates the page socket, browser-level startup
+            # sockets, and the harness observer. NOT a reconnect measure.
+            "websockets_created_total_informational": STATE["ws_connections"],
             "f_conversation_posts": STATE["f_conversation_posts"],
             "rest_status": rest.get("status"),
             "x_should_retry": rest.get("x_should_retry"),
@@ -388,7 +432,7 @@ async def main() -> None:
                         n.get("message_id") == captured_user_id for n in nodes)),
         },
         "rest": {k: rest.get(k) for k in ("status", "elapsed_s")},
-        "network_events": [e for e in events if e["kind"] == "req"][:20],
+        "f_conversation_responses": observer.resp_events[:5],
         "projection": proj,
     }
     ts = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")

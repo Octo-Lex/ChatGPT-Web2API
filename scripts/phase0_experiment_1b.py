@@ -114,13 +114,32 @@ def tab_ws_for(target_id: str) -> str | None:
 
 
 def find_experiment_tab() -> str:
-    pre = set((OUT_DIR / "pre-1b-tabids.txt").read_text().split())
-    d = json.loads(urllib.request.urlopen(f"{CDP_HTTP}/json/list", timeout=5).read())
-    for t in d:
-        if (t.get("type") == "page" and t["id"] not in pre
-                and "chatgpt.com" in t.get("url", "")):
+    """Positively identify the experiment bridge's owned tab (review fix).
+
+    The bridge's own log names its owned tab — 'Created owned tab: <ID>' or
+    'Reclaimed owned tab from registry: <ID>' — which is authoritative and
+    committed with the run. The previous snapshot-file diff could select a
+    wrong tab if the snapshot was stale or missing.
+    """
+    import re as _re
+
+    log = pathlib.Path("captures/phase0/exp1b-bridge.log")
+    owned = None
+    for line in log.read_text(encoding="utf-8", errors="replace").splitlines():
+        m = _re.search(
+            r"(?:Created owned tab|Reclaimed owned tab from registry): ([0-9A-F]{32})",
+            line)
+        if m:
+            owned = m.group(1)
+    if owned is None:
+        raise SystemExit("owned tab id not found in captures/phase0/exp1b-bridge.log")
+    targets = json.loads(
+        urllib.request.urlopen(f"{CDP_HTTP}/json/list", timeout=5).read())
+    for t in targets:
+        if t.get("id") == owned and "chatgpt.com" in t.get("url", "") \
+                and t.get("webSocketDebuggerUrl"):
             return t["id"]
-    raise SystemExit("experiment tab not found (diff against pre-1b-tabids.txt)")
+    raise SystemExit(f"log-derived owned tab {owned} not present in /json/list")
 
 
 async def network_recorder(ws_url: str, events: list, stop_at: float) -> None:
