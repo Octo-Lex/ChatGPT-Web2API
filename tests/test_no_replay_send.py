@@ -202,6 +202,72 @@ async def test_single_send_post_mutation_rate_limit_does_not_repeat_operation():
     assert calls["mutations"] == 1
 
 
+# ── Cancellation semantics (Codex P1 review) ─────────────────────────
+
+
+class HangingSendSocket:
+    """Socket whose send() records the frame and then hangs until cancelled
+    — the frame WAS handed toward the transport before cancellation."""
+
+    def __init__(self):
+        self.sent: list[dict] = []
+        self.entered = asyncio.Event()
+
+    async def send(self, raw):
+        self.sent.append(json.loads(raw))
+        self.entered.set()
+        await asyncio.Event().wait()  # never set — hang until cancelled
+
+    async def recv(self):
+        await asyncio.sleep(3600)
+
+    async def close(self):
+        pass
+
+
+async def test_cancelled_mutation_propagates_cancellation_and_records_unknown():
+    """Cancelling DURING the mutating evaluate: the frame may already have
+    reached Chrome, so this is outcome-unknown — but asyncio's cancellation
+    contract forbids converting CancelledError into another type. The
+    deliberate design: CancelledError propagates UNCHANGED and the
+    UNKNOWN/do-not-resend classification is recorded on the driver side
+    channel (note_send_outcome_unknown)."""
+    transport, driver = _make_transport()
+    sock = HangingSendSocket()
+    driver._ws = sock
+
+    task = asyncio.get_running_loop().create_task(
+        transport._js_mutation("(function(){ return 'sent'; })()"))
+    await asyncio.wait_for(sock.entered.wait(), timeout=2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    driver.note_send_outcome_unknown.assert_called_once()
+    kwargs = driver.note_send_outcome_unknown.call_args.kwargs
+    assert kwargs.get("stage") == "send_mutation"
+    frames = [f for f in sock.sent if f.get("method") == "Runtime.evaluate"]
+    assert len(frames) == 1  # still exactly one mutation frame
+    driver.reconnect.assert_not_awaited()
+
+
+async def test_cancelled_read_does_not_record_unknown():
+    """Scope check: cancellation during a READ (_js) also propagates
+    unchanged, but must NOT be classified as an outcome-unknown mutation."""
+    transport, driver = _make_transport()
+    sock = HangingSendSocket()
+    driver._ws = sock
+
+    task = asyncio.get_running_loop().create_task(
+        transport._js("(function(){ return 'r'; })()"))
+    await asyncio.wait_for(sock.entered.wait(), timeout=2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    driver.note_send_outcome_unknown.assert_not_called()
+
+
 async def test_default_retry_mode_remains_backward_compatible():
     """Default mode: the wrapper still retries (success on attempt 2), for
     callers that did not opt into single-send."""

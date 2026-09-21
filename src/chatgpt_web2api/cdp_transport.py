@@ -232,6 +232,25 @@ class CDPTransport:
                 "the mutation frame was dispatched; it may have executed. "
                 "Reconcile (read) only — never resend."
             ) from exc
+        except asyncio.CancelledError:
+            # Deliberate cancellation semantics (Codex P1 review): the frame
+            # may ALREADY have reached Chrome — cancellation can land after
+            # the transport write — so this is an outcome-unknown mutation.
+            # But swallowing or converting CancelledError would break the
+            # asyncio cancellation contract (a cancelled task must surface
+            # CancelledError; converting it would turn a client-disconnect
+            # cancellation into a 409 response). So: cancellation propagates
+            # UNCHANGED, and the UNKNOWN/do-not-resend classification is
+            # recorded as an observable side channel on the driver instead.
+            # No evidence-window wait here — cancellation must not be
+            # delayed; the scope still closes in send_and_stream's finally.
+            self._driver.note_send_outcome_unknown(
+                stage="send_mutation",
+                reason="cancelled during dispatch — the mutation frame may "
+                       "have reached Chrome; do not resend without "
+                       "reconciliation",
+            )
+            raise
         except Exception as exc:
             if self._should_reconnect(exc):
                 from .cdp_driver import SendOutcomeUnknownError

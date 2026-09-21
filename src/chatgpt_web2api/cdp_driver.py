@@ -424,6 +424,10 @@ class CDPDriver:
         self._last_refresh_attempt_at: float = 0.0
         self._current_conv_id: str | None = None
         self._current_model: str | None = None
+        # #51 cancellation side channel: outcome-unknown record for the most
+        # recent send (set by note_send_outcome_unknown; cleared at each
+        # send_and_stream start). See CDPTransport._js_mutation.
+        self.last_send_outcome_unknown: dict | None = None
         # CDP response routing (#7): id-keyed futures + background reader
         self._pending: dict[int, asyncio.Future] = {}
         self._reader_task: asyncio.Task | None = None
@@ -1132,6 +1136,33 @@ class CDPDriver:
 
         return CDPTransport._should_reconnect(exc)
 
+    def note_send_outcome_unknown(self, *, stage: str, reason: str) -> None:
+        """Record an outcome-unknown send mutation without raising (#51).
+
+        Used by the cancellation path in ``CDPTransport._js_mutation``:
+        ``asyncio.CancelledError`` must propagate unchanged (cancellation
+        contract), so the UNKNOWN/do-not-resend classification cannot travel
+        on the exception — it lands here, observable for reconciliation:
+
+          - ``self.last_send_outcome_unknown`` (dict; cleared at the start
+            of each send in ``send_and_stream``) — reflects the most recent
+            send only.
+          - a structured ERROR log line with code=send_outcome_unknown.
+        """
+        self.last_send_outcome_unknown = {
+            "code": "send_outcome_unknown",
+            "stage": stage,
+            "reason": reason,
+            "at": time.time(),
+            "retry_safe": False,
+            "reconciliation_safe": True,
+        }
+        logger.error(
+            "send_outcome_unknown(cancelled): stage=%s reason=%s — do not "
+            "resend without reconciliation",
+            stage, reason,
+        )
+
     async def _js(self, expr: str, timeout: float = 15) -> str:
         """Soft ``Runtime.evaluate`` — returns "" on failure.
 
@@ -1796,6 +1827,9 @@ class CDPDriver:
         from .identity_listener import hash_sent_text
         from .turn_anchor import TurnReconciliationError
 
+        # #51 cancellation side channel reflects the most recent send only.
+        self.last_send_outcome_unknown = None
+
         # PR4 belt-and-suspenders: refuse to mutate the DOM in parallel mode.
         self._assert_owned_tab_required()
         # A1: count existing assistants BEFORE sending (fail-closed baseline).
@@ -1912,6 +1946,17 @@ class CDPDriver:
                 model=model,
             ):
                 yield chunk
+
+            # Breaker downstream-success fallback (Codex P2 review): a turn
+            # that reached FULL generation completion is submission evidence
+            # even when the UUID capture missed AND the DOM acknowledgment
+            # probe was inconclusive (acknowledged is None). Without this,
+            # successful sends never clear COMPOSER_SEND_READINESS failure
+            # history in that path, and the breaker can trip despite
+            # interleaved successes. Reached only on stream COMPLETION — a
+            # raised/failed stream is not evidence.
+            if self._breakers and not (captured_uuid or acknowledged is True):
+                self._breakers.record_success(BreakerKind.COMPOSER_SEND_READINESS)
 
             # Wait for URL to become /c/{id}
             conv_id = ""

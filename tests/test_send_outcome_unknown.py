@@ -37,10 +37,14 @@ class _StopStream(Exception):
     reconciliation) is out of scope for these tests."""
 
 
-def _make_send_driver(*, captured_uuid, click_raises=None, dom_ack=None):
+def _make_send_driver(*, captured_uuid, click_raises=None, dom_ack=None,
+                      stream="raise"):
     """A CDPDriver whose send_and_stream collaborators are mocked so the
     orchestration up to (and including) the breaker-success point runs
-    genuinely; the completion stream raises _StopStream immediately after."""
+    genuinely. stream="raise" ends at the boundary point via _StopStream;
+    stream="complete" runs a full successful turn through reconciliation."""
+    from types import SimpleNamespace
+
     d = CDPDriver(cdp_port=9222)
     d._ws = MagicMock()
     reg = BreakerRegistry()
@@ -68,12 +72,23 @@ def _make_send_driver(*, captured_uuid, click_raises=None, dom_ack=None):
         d.click_send = AsyncMock()
     d._verify_send_acknowledged = AsyncMock(return_value=dom_ack)
 
-    async def _raising_stream(**kwargs):
-        raise _StopStream()
-        yield  # pragma: no cover — makes this an async generator
+    if stream == "raise":
+        async def _raising_stream(**kwargs):
+            raise _StopStream()
+            yield  # pragma: no cover — makes this an async generator
 
-    d._completion = MagicMock()
-    d._completion.stream_until_complete = _raising_stream
+        d._completion.stream_until_complete = _raising_stream
+    else:
+        async def _completing_stream(**kwargs):
+            yield MagicMock()
+
+        d._completion.stream_until_complete = _completing_stream
+        d._completion.last_dom_text = ""
+        d._completion.had_non_text_content = False
+        d._js_strict = AsyncMock(
+            return_value="https://chatgpt.com/c/conv-p2")
+        d._fetch_text_for_turn = AsyncMock(return_value=SimpleNamespace(
+            status="matched", text="hello world", diagnostic=None))
     return d, listener, scope, successes
 
 
@@ -162,6 +177,51 @@ async def test_breaker_no_success_on_unknown_outcome():
     raised = await _driven_send(d)
 
     assert isinstance(raised, SendOutcomeUnknownError)
+    assert successes == []
+
+
+# ── C2. Breaker downstream-success fallback (Codex P2 review) ────────
+
+async def test_inconclusive_ack_completed_turn_clears_breaker_failures():
+    """No UUID + an inconclusive DOM probe (acknowledged=None) + a turn that
+    reaches FULL completion → the fallback records COMPOSER_SEND_READINESS
+    success exactly once, so successful sends clear prior failure history."""
+    from chatgpt_web2api.breakers import BreakerKind
+
+    d, listener, scope, successes = _make_send_driver(
+        captured_uuid=None, dom_ack=None, stream="complete")
+    d.last_send_outcome_unknown = {"stale": True}  # cleared at send start
+
+    raised = await _driven_send(d)
+
+    assert raised is None  # full successful turn
+    assert successes == [BreakerKind.COMPOSER_SEND_READINESS]
+    assert d.last_send_outcome_unknown is None  # side channel cleared at start
+
+
+async def test_uuid_evidence_completed_turn_records_success_once():
+    """UUID already recorded the success at submission evidence; the
+    downstream fallback must not double-record."""
+    from chatgpt_web2api.breakers import BreakerKind
+
+    d, listener, scope, successes = _make_send_driver(
+        captured_uuid="uuid-1", stream="complete")
+
+    raised = await _driven_send(d)
+
+    assert raised is None
+    assert successes == [BreakerKind.COMPOSER_SEND_READINESS]
+
+
+async def test_inconclusive_ack_failed_stream_records_no_success():
+    """An inconclusive probe plus a stream that RAISES is not evidence —
+    no breaker success (fallback unreachable on failure)."""
+    d, listener, scope, successes = _make_send_driver(
+        captured_uuid=None, dom_ack=None, stream="raise")
+
+    raised = await _driven_send(d)
+
+    assert isinstance(raised, _StopStream)
     assert successes == []
 
 

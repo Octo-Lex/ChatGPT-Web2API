@@ -109,3 +109,76 @@ async def test_mcp_default_argument_still_retries():
 
     assert result == {"ok": True}
     assert calls["attempts"] == 2
+
+
+# ── Streaming path: the mutating generator is consumed exactly once ──
+# (GitWire asserted streaming might wrap the send in retry_on_rate_limit.
+# It does not: _stream_response retries only the read-only rate-limit
+# preflight, then consumes send_and_stream once. Pinned behaviorally.)
+
+def _stream_test_server(driver):
+    from chatgpt_web2api.api_server import APIServer
+    from chatgpt_web2api.breakers import BreakerRegistry
+    from chatgpt_web2api.config import Config
+
+    server = APIServer.__new__(APIServer)
+    server._config = Config.load(None)
+    server._breakers = BreakerRegistry()
+    server._last_conv_id = None
+    server._last_project_id = None
+    server._last_successful_send_at = None
+    server._driver = driver
+    driver._js_strict = AsyncMock(return_value='{"text":"normal text"}')
+    return server
+
+
+async def test_stream_response_consumes_send_and_stream_exactly_once():
+    from aiohttp.test_utils import make_mocked_request
+
+    from chatgpt_web2api.cdp_driver import StreamChunk
+
+    driver = MagicMock()
+    driver._current_conv_id = "conv-stream-1"
+    sends = {"n": 0}
+
+    async def send_and_stream(text, timeout=120, *, budgets=None, model=None):
+        sends["n"] += 1
+        yield StreamChunk(delta="hello")
+        yield StreamChunk(delta="", finish_reason="stop")
+
+    driver.send_and_stream = send_and_stream
+    server = _stream_test_server(driver)
+
+    request = make_mocked_request("POST", "/v1/chat/completions")
+    resp = await server._stream_response(request, "auto", "hi", 30)
+
+    assert sends["n"] == 1
+    assert resp.status == 200
+
+
+async def test_stream_response_rate_limit_midstream_does_not_restart_send():
+    """The GitWire-disproving property: a RateLimitError surfacing AFTER
+    the mutating generator started must not re-invoke it — streaming has
+    no outer retry around the send (the inline SSE marker is the channel)."""
+    from aiohttp.test_utils import make_mocked_request
+
+    from chatgpt_web2api.cdp_driver import RateLimitError as RL
+    from chatgpt_web2api.cdp_driver import StreamChunk
+
+    driver = MagicMock()
+    driver._current_conv_id = "conv-stream-2"
+    sends = {"n": 0}
+
+    async def send_and_stream(text, timeout=120, *, budgets=None, model=None):
+        sends["n"] += 1
+        yield StreamChunk(delta="partial")
+        raise RL("rate limited", retry_after=30)  # mid-stream throttle
+
+    driver.send_and_stream = send_and_stream
+    server = _stream_test_server(driver)
+
+    request = make_mocked_request("POST", "/v1/chat/completions")
+    resp = await server._stream_response(request, "auto", "hi", 30)
+
+    assert sends["n"] == 1  # NOT restarted — one business-send invocation
+    assert resp.status == 200  # SSE committed; the marker chunk is the channel
