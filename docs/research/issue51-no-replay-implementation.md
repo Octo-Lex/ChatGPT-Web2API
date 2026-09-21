@@ -129,7 +129,7 @@ draft while they were addressed.
   new cancellation and breaker-fallback paths are deterministically tested
   only.
 
-
+## Claim boundary (for the PR description)
 
 Claim: **the bridge now provides an opt-in at-most-one automatic USER-send
 mutation attempt across both transport reconnect ambiguity and outer
