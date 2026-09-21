@@ -20,6 +20,7 @@ covered in test_no_replay_send.py and are not duplicated here.
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 from chatgpt_web2api.breakers import BreakerKind, BreakerRegistry
@@ -181,3 +182,81 @@ def test_single_send_scoped_to_chat_send_tools():
     # Defaults unchanged when the flag is absent.
     assert _chat_tool_attempts("chat_completion", {}) == 3
     assert _chat_tool_attempts("create_memory", {}) == 3
+
+
+# ── D. Surface mappings preserve the UNKNOWN distinction ────────────
+
+def test_rest_error_response_maps_unknown_to_409_with_evidence():
+    """#51: an ambiguous outcome must not surface as a bare 500 (the status
+    class SDKs blindly retry). It maps to 409 with code send_outcome_unknown,
+    retry_safe=false, and the preserved captured_user_id when present."""
+    import json as _json
+
+    from chatgpt_web2api.api_server import APIServer
+
+    server = object.__new__(APIServer)  # _error_response is pure (no self use)
+
+    exc = SendOutcomeUnknownError("ambiguous dispatch")
+    exc.captured_user_id = "uuid-causal-9"
+    resp = server._error_response(exc)
+    assert resp.status == 409
+    body = _json.loads(resp.text)
+    assert body["error"]["code"] == "send_outcome_unknown"
+    assert body["error"]["retry_safe"] is False
+    assert body["error"]["captured_user_id"] == "uuid-causal-9"
+
+
+def test_rest_error_response_unknown_without_evidence_omits_field():
+    import json as _json
+
+    from chatgpt_web2api.api_server import APIServer
+
+    server = object.__new__(APIServer)
+    resp = server._error_response(SendOutcomeUnknownError("ambiguous dispatch"))
+    assert resp.status == 409
+    body = _json.loads(resp.text)
+    assert body["error"]["code"] == "send_outcome_unknown"
+    assert "captured_user_id" not in body["error"]
+
+
+def test_mcp_maps_unknown_to_structured_do_not_resend_error():
+    from chatgpt_web2api.mcp_server import _map_tool_exception
+
+    exc = SendOutcomeUnknownError("ambiguous dispatch")
+    exc.captured_user_id = "uuid-causal-7"
+    result = _map_tool_exception(exc)
+    assert result is not None and result.isError
+    text = result.content[0].text
+    assert "send_outcome_unknown" in text
+    assert "uuid-causal-7" in text
+    assert "NOT send it again" in text
+
+
+# ── E. Cancellation during the ambiguity window ─────────────────────
+
+async def test_cancellation_during_ambiguity_window_still_closes_scope():
+    """Cancelling while the preservation wait is in flight must propagate
+    CancelledError (never swallowed by the evidence wait) and still reach
+    the finally that closes the capture scope."""
+    err = SendOutcomeUnknownError("ambiguous dispatch")
+    d, listener, scope, successes = _make_send_driver(
+        captured_uuid=None, click_raises=err)
+
+    async def slow_capture(**kwargs):
+        await asyncio.sleep(5)
+        return "too-late-uuid"
+
+    listener.wait_for_captured_uuid = slow_capture
+
+    task = asyncio.get_running_loop().create_task(_driven_send(d))
+    await asyncio.sleep(0.3)  # inside the 1s window wait now
+    task.cancel()
+    try:
+        await task
+        raised = None
+    except asyncio.CancelledError:
+        raised = "cancelled"
+
+    assert raised == "cancelled"  # the wait did not convert cancellation
+    scope.close.assert_called_once()  # finally still ran
+    assert successes == []

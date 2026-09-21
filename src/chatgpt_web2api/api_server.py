@@ -23,6 +23,7 @@ from .cdp_driver import (
     CDPDriver,
     GenerationStuckError,
     RateLimitError,
+    SendOutcomeUnknownError,
     is_rate_limited_text,
 )
 from .config import Config
@@ -460,6 +461,26 @@ class APIServer:
                 status=429,
                 headers={"Retry-After": retry_after},
             )
+        if isinstance(exc, SendOutcomeUnknownError):
+            # #51: an ambiguous send outcome is NOT a plain server error.
+            # 409 Conflict is the idempotency-aware "request may have been
+            # applied" status. The body carries the machine-readable
+            # distinction: retry_safe=False and the preserved causal
+            # evidence (captured_user_id) when the in-flight capture
+            # resolved. NOTE: some OpenAI SDKs retry 409 by default —
+            # client retry is client policy; the code field is the stop
+            # signal a single_send caller must honor.
+            payload: dict = {
+                "message": f"{exc} (outcome unknown — do not blindly re-request; "
+                           "reconcile via the conversation if captured_user_id is set)",
+                "type": "server_error",
+                "param": None,
+                "code": "send_outcome_unknown",
+            }
+            if exc.captured_user_id:
+                payload["captured_user_id"] = exc.captured_user_id
+            payload["retry_safe"] = exc.retry_safe
+            return web.json_response({"error": payload}, status=409)
         if isinstance(exc, AuthExpiredError):
             return web.json_response(
                 {
@@ -760,6 +781,35 @@ class APIServer:
                             "index": 0,
                             "delta": {
                                 "content": f"\n\n[Error: generation_stuck — stalled in {e.phase} for {e.stalled_for_s:.0f}s]"
+                            },
+                            "finish_reason": "error",
+                        }
+                    ],
+                },
+            )
+        except SendOutcomeUnknownError as e:
+            # #51: ambiguous send outcome mid-stream (status locked at 200 —
+            # the inline marker is the only channel). Same precedent as the
+            # rate-limit marker above. The code + captured_user_id let a
+            # client reconcile instead of blindly re-requesting.
+            logger.warning("Mid-stream send outcome unknown: %s", e)
+            evidence = f", captured_user_id={e.captured_user_id}" if e.captured_user_id else ""
+            await self._send_sse(
+                resp,
+                {
+                    "id": cid,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {
+                                "content": (
+                                    f"\n\n[Error: send_outcome_unknown — the send may "
+                                    f"or may not have been applied; do not blindly "
+                                    f"re-request{evidence}]"
+                                )
                             },
                             "finish_reason": "error",
                         }

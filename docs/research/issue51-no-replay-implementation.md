@@ -55,6 +55,18 @@ dispatch sites) wrapped their full mutating operation in it.
    at +139 ms) for the in-flight IdentityListener capture and attaches it
    as `exc.captured_user_id`. Evidence preservation only — the outcome
    stays UNKNOWN; this is not reconciliation and never resends.
+8. Surface mappings preserve the UNKNOWN distinction (pre-push review):
+   REST non-stream maps `SendOutcomeUnknownError` to **HTTP 409** with
+   `code=send_outcome_unknown`, `retry_safe=false`, and
+   `captured_user_id` when preserved — not a bare 500. REST streaming
+   (status locked at 200 once SSE starts) emits an inline
+   `[Error: send_outcome_unknown …]` marker chunk with the same evidence,
+   mirroring the established rate-limit marker precedent. MCP
+   `_map_tool_exception` returns a structured isError result carrying the
+   code, the UUID when preserved, and do-not-resend guidance. Caveat,
+   stated plainly: some OpenAI SDKs retry 409/5xx by default — client
+   retry is client policy; the `code` field is the stop signal a
+   single_send caller must honor.
 
 ## Claim boundary (for the PR description)
 
@@ -63,6 +75,14 @@ mutation attempt across both transport reconnect ambiguity and outer
 rate-limit retry; ambiguous outcomes surface explicitly rather than being
 replayed.** Do NOT claim exactly-once delivery or automatic reconciliation
 of ambiguous sends — UNKNOWN→CONFIRMED backend lookup remains future work.
+
+Default-mode status, stated as legacy rather than safe: with
+`single_send` absent (the default), the transport fix applies (the send
+click is never replayed), but the outer wrapper retains its legacy
+three-attempt budget — a `RateLimitError` surfacing after a dispatched
+send may therefore re-run the whole turn, including the USER send. That
+behavior is unchanged from master and is precisely the policy decision
+(`single_send` opt-in vs default) that remains open after certification.
 
 ## Verification
 

@@ -48,6 +48,7 @@ from .cdp_driver import (
     CDPDriver,
     GenerationStuckError,
     RateLimitError,
+    SendOutcomeUnknownError,
 )
 from .config import Config
 from .cross_process_lock import LockAcquisitionError
@@ -1518,6 +1519,20 @@ def _map_tool_exception(exc: Exception) -> object:
             content=[mcp_types.TextContent(type="text",
                 text=(f"ChatGPT rate limit reached. Retry in {exc.retry_after}s. "
                       f"(rate_limit_exceeded, retry_after={exc.retry_after})"))],
+            isError=True,
+        )
+    if isinstance(exc, SendOutcomeUnknownError):
+        # #51: ambiguous send outcome — surface the code, the preserved
+        # causal evidence, and the do-not-resend guidance. An agent must
+        # reconcile (read) rather than re-send.
+        evidence = (f", captured_user_id={exc.captured_user_id}"
+                    if exc.captured_user_id else "")
+        return mcp_types.CallToolResult(
+            content=[mcp_types.TextContent(type="text",
+                text=(f"Send outcome unknown — the message may or may not have "
+                      f"been sent. Do NOT send it again; inspect the "
+                      f"conversation and reconcile instead"
+                      f"{evidence}. (send_outcome_unknown, retry_safe=false)"))],
             isError=True,
         )
     if isinstance(exc, CircuitOpenError):
