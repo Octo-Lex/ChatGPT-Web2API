@@ -18,14 +18,13 @@ Fix 1: after click_send + UUID wait, verify at least one acknowledgment:
 Fix 2: include last_result.diagnostic in TurnReconciliationError.
 """
 
-import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from chatgpt_web2api.cdp_driver import CDPDriver, SendReadinessError
-from chatgpt_web2api.turn_anchor import TurnReconciliationError, TurnTextResult
+from chatgpt_web2api.cdp_driver import CDPDriver
+from chatgpt_web2api.turn_anchor import TurnReconciliationError
 
 
 def _make_driver():
@@ -49,7 +48,6 @@ async def test_send_not_acknowledged_raises_when_no_signals(monkeypatch):
     """When click_send fires but no acknowledgment appears (no UUID, no DOM
     count increase, composer not cleared), the bridge must raise a typed error
     instead of silently entering completion detection."""
-    from chatgpt_web2api.cdp_driver import CDPDriver
 
     driver = _make_driver()
     # Mock the send path
@@ -106,9 +104,6 @@ async def test_send_acknowledged_when_user_count_increases(monkeypatch):
     anchor = TurnAnchor(sent_text="test", mode="fresh_chat")
     driver._capture_pre_send_fallback_anchor = AsyncMock(return_value=anchor)
 
-    # After send: user count goes from 0 to 1 (message landed)
-    poll_count = {"n": 0}
-
     async def fake_js_strict(expr, timeout=15):
         # Send acknowledgment check: user count + composer present + empty
         if "userCount" in expr and "composerEmpty" in expr:
@@ -126,7 +121,6 @@ async def test_send_acknowledged_when_user_count_increases(monkeypatch):
     driver._js_strict = fake_js_strict
 
     # Mock the detector to return immediately
-    from chatgpt_web2api.completion_detector import CompletionDetector
     driver._completion = MagicMock()
     driver._completion.stream_until_complete = MagicMock()
 

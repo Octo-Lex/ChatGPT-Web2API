@@ -37,6 +37,26 @@ T = TypeVar("T")
 _DEFAULT_CAP = 120
 
 
+CHAT_MAX_ATTEMPTS = 3
+
+
+def chat_retry_attempts(args) -> int:
+    """Single-send opt-in (#51): arguments carrying ``single_send`` truthy
+    run the chat operation exactly once (``max_attempts=1``).
+
+    A rate limit surfacing AFTER a dispatched mutation must propagate, not
+    re-invoke the mutating operation. REST resolves ``single_send`` from the
+    request body (or its ``metadata``) before calling this; MCP passes the
+    tool arguments dict directly. Default (no opt-in): 3 attempts —
+    unchanged behavior for existing callers.
+    """
+    try:
+        flag = args.get("single_send") if args is not None else None
+    except AttributeError:
+        flag = None
+    return 1 if flag else CHAT_MAX_ATTEMPTS
+
+
 async def retry_on_rate_limit(
     driver,
     factory: Callable[[], Awaitable[T]],

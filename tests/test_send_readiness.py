@@ -117,6 +117,8 @@ async def test_send_diagnostic_probes_composer_and_send_state(caplog):
         return _diag_json(send_candidates_count=3, enabled_send_candidates_count=1)
 
     driver._js = _make_scripted_js(poll_result="no", send_result="no send button")
+    # #51: the click is dispatched through _js_mutation (mutation — never replayed).
+    driver._js_mutation = AsyncMock(return_value="no send button")
     driver._js_strict = capturing_js_strict
 
     with pytest.raises(SendReadinessError):
@@ -143,6 +145,7 @@ async def test_send_succeeds_with_submit_type_fallback():
     dom, driver = _make_dom()
 
     driver._js = _make_scripted_js(poll_result="yes", send_result="sent")
+    driver._js_mutation = AsyncMock(return_value="sent")
     await dom.click_send()  # should NOT raise
 
 
@@ -158,6 +161,8 @@ async def test_error_distinguishes_empty_composer_from_missing_button(caplog):
     dom, driver = _make_dom()
 
     driver._js = _make_scripted_js(poll_result="no", send_result="no send button")
+    # #51: the click is dispatched through _js_mutation (mutation — never replayed).
+    driver._js_mutation = AsyncMock(return_value="no send button")
     driver._js_strict = AsyncMock(return_value=_diag_json(
         composer_text_length=0,  # EMPTY — injection failed!
     ))
@@ -187,6 +192,8 @@ async def test_diagnostic_captures_stop_button_when_generating(caplog):
     dom, driver = _make_dom()
 
     driver._js = _make_scripted_js(poll_result="no", send_result="no send button")
+    # #51: the click is dispatched through _js_mutation (mutation — never replayed).
+    driver._js_mutation = AsyncMock(return_value="no send button")
     driver._js_strict = AsyncMock(return_value=_diag_json(
         stop_button_present=True,
         generating_indicator_present=True,
