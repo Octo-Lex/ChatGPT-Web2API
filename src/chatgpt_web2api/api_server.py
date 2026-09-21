@@ -480,7 +480,16 @@ class APIServer:
             if exc.captured_user_id:
                 payload["captured_user_id"] = exc.captured_user_id
             payload["retry_safe"] = exc.retry_safe
-            return web.json_response({"error": payload}, status=409)
+            # x-should-retry is checked by the official OpenAI SDKs BEFORE
+            # their retryable-status rules (409 is otherwise auto-retried
+            # by default) — without this header the SDK layer re-enables
+            # the replay this whole patch removes. Deliberately no
+            # Retry-After: the instruction is "do not resend".
+            return web.json_response(
+                {"error": payload},
+                status=409,
+                headers={"x-should-retry": "false"},
+            )
         if isinstance(exc, AuthExpiredError):
             return web.json_response(
                 {

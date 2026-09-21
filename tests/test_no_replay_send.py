@@ -131,7 +131,10 @@ async def test_mutating_runtime_evaluate_ambiguous_send_is_not_replayed():
     healthy = HealthySocket(transport, value="sent")
     driver._ws = ambiguous
 
+    reconnect_calls = {"n": 0}
+
     async def reconnect():
+        reconnect_calls["n"] += 1
         driver._ws = healthy
 
     driver.reconnect = reconnect
@@ -149,8 +152,10 @@ async def test_mutating_runtime_evaluate_ambiguous_send_is_not_replayed():
     assert len(mutation_frames) == 1, (
         f"mutation replayed: {len(mutation_frames)} Runtime.evaluate frames "
         f"sent (ambiguous={len(ambiguous.sent)}, healthy={len(healthy.sent)})")
-    # reconnect must NOT have been triggered by the mutation path itself
-    assert driver._ws is ambiguous or driver._ws is healthy
+    # Zero reconnects on the mutation path — the whole point of #51. Counted
+    # explicitly (an earlier version asserted socket identity, which was
+    # tautological in this fixture).
+    assert reconnect_calls["n"] == 0
 
 
 async def test_readonly_runtime_evaluate_reconnect_retry_is_preserved():

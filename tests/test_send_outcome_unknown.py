@@ -49,7 +49,7 @@ def _make_send_driver(*, captured_uuid, click_raises=None, dom_ack=None):
     _orig = reg.record_success
     reg.record_success = lambda kind: (successes.append(kind), _orig(kind))[1]  # type: ignore[method-assign]
 
-    d._assert_owned_tab_required = AsyncMock()
+    d._assert_owned_tab_required = MagicMock()  # sync seam — must not be AsyncMock
     d._read_assistant_count_baseline = AsyncMock(return_value=0)
     d._capture_pre_send_fallback_anchor = AsyncMock(return_value=MagicMock())
 
@@ -189,7 +189,9 @@ def test_single_send_scoped_to_chat_send_tools():
 def test_rest_error_response_maps_unknown_to_409_with_evidence():
     """#51: an ambiguous outcome must not surface as a bare 500 (the status
     class SDKs blindly retry). It maps to 409 with code send_outcome_unknown,
-    retry_safe=false, and the preserved captured_user_id when present."""
+    retry_safe=false, and the preserved captured_user_id when present. The
+    x-should-retry:false header is load-bearing: the official OpenAI SDKs
+    check it BEFORE their status rules and auto-retry 409 otherwise."""
     import json as _json
 
     from chatgpt_web2api.api_server import APIServer
@@ -200,6 +202,8 @@ def test_rest_error_response_maps_unknown_to_409_with_evidence():
     exc.captured_user_id = "uuid-causal-9"
     resp = server._error_response(exc)
     assert resp.status == 409
+    assert resp.headers["x-should-retry"] == "false"
+    assert "Retry-After" not in resp.headers
     body = _json.loads(resp.text)
     assert body["error"]["code"] == "send_outcome_unknown"
     assert body["error"]["retry_safe"] is False
@@ -214,6 +218,8 @@ def test_rest_error_response_unknown_without_evidence_omits_field():
     server = object.__new__(APIServer)
     resp = server._error_response(SendOutcomeUnknownError("ambiguous dispatch"))
     assert resp.status == 409
+    assert resp.headers["x-should-retry"] == "false"
+    assert "Retry-After" not in resp.headers
     body = _json.loads(resp.text)
     assert body["error"]["code"] == "send_outcome_unknown"
     assert "captured_user_id" not in body["error"]
