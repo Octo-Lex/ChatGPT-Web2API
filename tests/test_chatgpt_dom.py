@@ -164,19 +164,32 @@ async def test_ensure_send_ready_routes_navigation_through_driver():
 
 
 @pytest.mark.asyncio
-async def test_click_send_records_success_through_driver_breaker():
-    """A confirmed send must record_success via driver._breakers (half-open
-    recovery) — the registry stays on the driver, not the dom."""
+async def test_click_send_does_not_record_breaker_success():
+    """#51 boundary change: click_send's JS return ("sent") only proves the
+    synthetic events ran — NOT React acceptance — so it must NOT record
+    COMPOSER_SEND_READINESS success. The success point moved to
+    send_and_stream, at submission evidence (captured UUID, or the DOM
+    acknowledgment fallback). A pre-existing failure count must therefore
+    survive a successful click untouched."""
     from chatgpt_web2api.breakers import BreakerKind, BreakerRegistry
 
     dom, driver = _make_dom()
     reg = BreakerRegistry()
     driver._breakers = reg
-    driver._js = AsyncMock(return_value="sent")
+    driver._js = AsyncMock(return_value="yes")
+    driver._js_mutation = AsyncMock(return_value="sent")
+
+    reg.record_failure(BreakerKind.COMPOSER_SEND_READINESS)
+    before = len(reg._states[BreakerKind.COMPOSER_SEND_READINESS].recent_failures)
 
     await dom.click_send()
-    # Not open after a success record (record_success clears failures).
-    assert not reg.is_open(BreakerKind.COMPOSER_SEND_READINESS)
+
+    after = len(reg._states[BreakerKind.COMPOSER_SEND_READINESS].recent_failures)
+    assert after == before, (
+        "click_send recorded success (cleared failure history) — the "
+        "breaker success boundary belongs at submission evidence in "
+        "send_and_stream, not at the click's JS return (#51)"
+    )
 
 
 # ── 5. dismiss_rate_limit tri-state via driver._js_strict ────────────
@@ -283,14 +296,20 @@ async def test_click_send_waits_then_sends(monkeypatch):
     monkeypatch.setattr(dom_mod, "SEND_BUTTON_POLL_MAX_WAIT_S", 2.0)
 
     dom, driver = _make_dom()
-    # First 3 readiness checks → "no" (button not ready), then "yes", then "sent".
-    driver._js = AsyncMock(side_effect=["no", "no", "no", "yes", "sent"])
+    # First 3 readiness checks → "no" (button not ready), then "yes"; the
+    # click itself now goes through _js_mutation (#51) → "sent".
+    driver._js = AsyncMock(side_effect=["no", "no", "no", "yes"])
+    driver._js_mutation = AsyncMock(return_value="sent")
 
     await dom.click_send()  # must not raise
 
-    # The readiness poll should have run 4 times (3×"no" + 1×"yes"), then the
-    # click once ("sent") = 5 total _js calls.
-    assert driver._js.await_count == 5, f"expected 5 _js calls, got {driver._js.await_count}"
+    # The readiness poll should have run 4 times (3×"no" + 1×"yes") on _js
+    # (a read — reconnect-retry is safe), then the click exactly once via
+    # _js_mutation (a mutation — never replayed).
+    assert driver._js.await_count == 4, f"expected 4 _js calls, got {driver._js.await_count}"
+    assert driver._js_mutation.await_count == 1
+    click_expr = driver._js_mutation.await_args.args[0]
+    assert "dispatchEvent" in click_expr and "MouseEvent" in click_expr
 
 
 @pytest.mark.asyncio
@@ -303,8 +322,10 @@ async def test_click_send_raises_on_budget_exhausted(monkeypatch):
     monkeypatch.setattr(dom_mod, "SEND_BUTTON_POLL_MAX_WAIT_S", 0.05)
 
     dom, driver = _make_dom()
-    # Every _js call returns "no" — button never appears.
+    # Every readiness poll returns "no" — button never appears; the final
+    # click (via _js_mutation) finds no button either.
     driver._js = AsyncMock(return_value="no")
+    driver._js_mutation = AsyncMock(return_value="no send button")
 
     from chatgpt_web2api.cdp_driver import SendReadinessError
 

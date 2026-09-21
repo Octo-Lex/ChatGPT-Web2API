@@ -197,6 +197,53 @@ class CDPTransport:
         )
         return resp.get("result", {}).get("result", {}).get("value", "")
 
+    async def _js_mutation(self, expr: str, timeout: float = 15) -> str:
+        """MUTATING ``Runtime.evaluate`` — sent exactly once, never replayed.
+
+        #51 no-replay seam. ``_js`` / ``_js_strict`` are observation
+        primitives: on a reconnect-class socket death they reconnect and
+        resend the same frame, which is the right resilience for reads. For
+        a mutation (the send click) that replay is a duplicate-send hazard:
+        the first frame may already have executed remotely. This primitive
+        disables the retry (``_retry=False``) and converts ambiguous
+        outcomes — reconnect-class send failure OR a response timeout after
+        the frame was handed to the socket — into
+        ``SendOutcomeUnknownError``: reconcile (read) only, never resend.
+        Non-reconnect errors raised before meaningful delivery propagate
+        unchanged.
+        """
+        try:
+            resp = await self._driver._cdp(
+                "Runtime.evaluate",
+                {
+                    "expression": expr,
+                    "awaitPromise": True,
+                    "returnByValue": True,
+                    "timeout": int(timeout * 1000),
+                },
+                timeout=timeout,
+                _retry=False,
+            )
+        except TimeoutError as exc:
+            from .cdp_driver import SendOutcomeUnknownError
+
+            raise SendOutcomeUnknownError(
+                "Send mutation outcome unknown: CDP response timed out after "
+                "the mutation frame was dispatched; it may have executed. "
+                "Reconcile (read) only — never resend."
+            ) from exc
+        except Exception as exc:
+            if self._should_reconnect(exc):
+                from .cdp_driver import SendOutcomeUnknownError
+
+                raise SendOutcomeUnknownError(
+                    "Send mutation outcome unknown: CDP connection died while "
+                    "dispatching the mutation; the frame may or may not have "
+                    "executed. Reconcile (read) only — never resend."
+                ) from exc
+            raise
+        return resp.get("result", {}).get("result", {}).get("value", "")
+
     async def _js_with_data(self, expr_template: str, data: dict, timeout: float = 15) -> str:
         """Evaluate JS with safely injected data variables.
 

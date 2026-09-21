@@ -28,7 +28,14 @@ from .cdp_driver import (
 from .config import Config
 from .cross_process_lock import LockAcquisitionError
 from .lock_resolver import MutationLock, OwnedTabRequiredError, resolve_mutation_lock
-from .resilience import retry_on_rate_limit
+from .resilience import chat_retry_attempts, retry_on_rate_limit
+
+
+def _resolve_single_send(body: dict) -> bool:
+    """#51 opt-in: REST accepts ``single_send`` at the top level or under
+    ``metadata`` (mirroring ``project_id`` resolution above)."""
+    return bool(body.get("single_send")
+                or (body.get("metadata") or {}).get("single_send"))
 
 logger = logging.getLogger(__name__)
 
@@ -390,7 +397,9 @@ class APIServer:
                 if stream:
                     return await self._stream_response(request, model_slug, full_text, timeout)
                 else:
-                    return await self._full_response(request, model_slug, full_text, timeout)
+                    return await self._full_response(
+                        request, model_slug, full_text, timeout,
+                        single_send=_resolve_single_send(body))
 
         except Exception as e:
             logger.error("Chat error: %s", e, exc_info=True)
@@ -521,7 +530,8 @@ class APIServer:
     # ── Response formatters ───────────────────────────────────
 
     async def _full_response(
-        self, request: web.Request, model: str, text: str, timeout: float
+        self, request: web.Request, model: str, text: str, timeout: float,
+        single_send: bool = False,
     ) -> web.Response:
         """Non-streaming: collect all chunks, return one JSON.
 
@@ -543,7 +553,12 @@ class APIServer:
                 collected += chunk.delta
             return collected
 
-        full_text = await retry_on_rate_limit(self._driver, _send_and_collect)
+        # #51: single_send runs the (mutating) chat operation exactly once —
+        # a post-mutation rate limit surfaces instead of re-sending.
+        full_text = await retry_on_rate_limit(
+            self._driver, _send_and_collect,
+            max_attempts=chat_retry_attempts({"single_send": single_send}),
+        )
 
         conv_id = self._driver._current_conv_id or ""
         self._last_conv_id = conv_id

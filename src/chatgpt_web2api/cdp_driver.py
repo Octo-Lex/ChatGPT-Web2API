@@ -46,6 +46,12 @@ class StreamChunk:
 # a real cooldown clear but short enough that a transient blip recovers fast.
 RATE_LIMIT_DEFAULT_RETRY_AFTER = 60
 
+# #51: bounded window (seconds) to wait for an in-flight IdentityListener
+# UUID capture after an ambiguous send mutation (SendOutcomeUnknownError),
+# before the capture scope closes and clears that state. Healthy capture
+# measured at +139 ms in the 2026-09-21 1B timeline; 1 s is the allowance.
+AMBIGUOUS_CAPTURE_WINDOW_S = 1.0
+
 # Re-exported from backend_client (Phase 5 PR1 extraction) for back-compat.
 # Canonical home is now backend_client.py.
 from .backend_client import TOKEN_TTL_SECONDS  # noqa: E402,F401
@@ -268,6 +274,41 @@ class SendReadinessError(RuntimeError):
     rather than guessing from a string. Raised by ``_ensure_send_ready``,
     ``type_message``, and ``click_send``.
     """
+
+
+class SendOutcomeUnknownError(RuntimeError):
+    """A chat mutation was dispatched but its external effect could not be
+    proven (issue #51 — ambiguous CDP send).
+
+    Raised when the transport dies (or its response is lost) while a
+    MUTATING ``Runtime.evaluate`` (the send click) is in flight. The frame
+    may or may not have executed remotely, so the outcome is UNKNOWN, not
+    failed:
+
+      - reads / reconciliation are permitted (``reconciliation_safe=True``):
+        if the IdentityListener captured a user UUID, a backend lookup by
+        exact UUID can upgrade UNKNOWN → CONFIRMED without another send.
+      - replaying the mutation is forbidden (``retry_safe=False``): a retry
+        could duplicate the user turn. Automatic retry must never happen.
+
+    Carries structured evidence (not just text) so callers and the REST/MCP
+    surfaces can decide without parsing messages.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        stage: str = "send_mutation",
+        captured_user_id: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = "send_outcome_unknown"
+        self.stage = stage
+        self.effect_state = "unknown"
+        self.captured_user_id = captured_user_id
+        self.retry_safe = False
+        self.reconciliation_safe = True
 
 
 class CDPReconnectError(RuntimeError):
@@ -1097,6 +1138,16 @@ class CDPDriver:
         Delegated to CDPTransport (Phase 5 PR2 extraction)."""
         return await self._transport._js(expr, timeout)
 
+    async def _js_mutation(self, expr: str, timeout: float = 15) -> str:
+        """MUTATING ``Runtime.evaluate`` (#51) — sent exactly once, never
+        replayed across a reconnect; ambiguous outcomes raise
+        SendOutcomeUnknownError (reconcile only, never resend).
+
+        Delegated to CDPTransport like _js; kept as an explicit driver-level
+        primitive so call sites read as observation (_js) vs effect
+        (_js_mutation)."""
+        return await self._transport._js_mutation(expr, timeout)
+
     async def _js_with_data(self, expr_template: str, data: dict, timeout: float = 15) -> str:
         """Evaluate JS with safely injected ``__D`` data variables (soft).
 
@@ -1768,7 +1819,32 @@ class CDPDriver:
         try:
             # Type and send.
             await self.type_message(text)
-            await self.click_send()
+            try:
+                await self.click_send()
+            except SendOutcomeUnknownError as exc:
+                # #51: the click frame may have executed remotely. The
+                # IdentityListener may already hold — or be about to resolve —
+                # the outgoing UUID; preserve it on the error BEFORE the
+                # finally below closes the capture scope and clears that
+                # state. Evidence preservation only: the outcome stays
+                # UNKNOWN until a later reconciliation reads the backend.
+                # This path never resends. Window rationale: 1B measured
+                # healthy capture at +139 ms; 1 s is the bounded allowance.
+                if capture_scope is not None and self._identity_listener is not None:
+                    try:
+                        captured = await self._identity_listener.wait_for_captured_uuid(
+                            timeout=AMBIGUOUS_CAPTURE_WINDOW_S
+                        )
+                    except Exception:
+                        captured = None
+                    if captured:
+                        exc.captured_user_id = captured
+                        logger.info(
+                            "send_outcome_unknown: captured_user_id=%s preserved "
+                            "before scope close (stage=%s)",
+                            captured, exc.stage,
+                        )
+                raise
 
             # A2 Step 6: wait for the IdentityListener to capture the UUID.
             captured_uuid = None
@@ -1789,6 +1865,7 @@ class CDPDriver:
             # environment, unusual DOM), DON'T block the send. The check is a
             # safety net for the overloaded-page case, not a hard gate that
             # could prevent sends in edge cases we haven't seen.
+            acknowledged: bool | None = None
             if not captured_uuid:
                 try:
                     acknowledged = await self._verify_send_acknowledged()
@@ -1806,6 +1883,18 @@ class CDPDriver:
                     # the send — let completion detection proceed. Log so the
                     # failure is traceable.
                     logger.debug("Send acknowledgment probe failed (non-blocking): %s", ack_err)
+            else:
+                acknowledged = True  # UUID captured — stronger than the DOM probe
+
+            # #51 breaker boundary: COMPOSER_SEND_READINESS success now means
+            # SUBMISSION evidence, not "the click's JS returned". Primary:
+            # IdentityListener captured the outgoing UUID (the submission
+            # request was emitted, causally identified — 1B: +139 ms).
+            # Fallback: the DOM acknowledgment probe returned True. This is
+            # a send-readiness breaker, so remote persistence (backend node,
+            # TurnAnchor) stays with the turn/effect contract, not here.
+            if self._breakers and (captured_uuid or acknowledged is True):
+                self._breakers.record_success(BreakerKind.COMPOSER_SEND_READINESS)
 
             # A2 Step 7: build the final anchor (fallback + captured UUID).
             turn_anchor = fallback_anchor.with_captured_id(captured_uuid)

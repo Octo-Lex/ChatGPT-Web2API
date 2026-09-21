@@ -208,6 +208,10 @@ async def test_click_send_fails_when_no_send_button(monkeypatch):
     async def _fake_js(expr, timeout=15):
         return "no send button"
     d._js = _fake_js
+    # #51: the click itself is a mutation — goes through _js_mutation.
+    async def _fake_js_mutation(expr, timeout=15):
+        return "no send button"
+    d._js_mutation = _fake_js_mutation
     d._capture_selector_diagnostic = AsyncMock()
 
     # The wait-for-button loop also returns 'no', so it polls all 10
@@ -229,9 +233,14 @@ async def test_click_send_emits_new_selector_first(monkeypatch):
 
     async def _fake_js(expr, timeout=15):
         seen.append(expr)
-        # Wait-loop returns 'yes' immediately, then the click returns 'sent'.
-        return "yes" if "yes" in expr or "'no'" in expr else "sent"
+        # Wait-loop returns 'yes' immediately; the click (a #51 mutation,
+        # separately stubbed) returns 'sent'.
+        return "yes"
     d._js = _fake_js
+    async def _fake_js_mutation(expr, timeout=15):
+        seen.append(expr)
+        return "sent"
+    d._js_mutation = _fake_js_mutation
     monkeypatch.setattr("chatgpt_web2api.cdp_driver.asyncio.sleep", AsyncMock())
 
     await d.click_send()
@@ -248,7 +257,8 @@ async def test_click_send_emits_new_selector_first(monkeypatch):
 async def test_click_send_sent_on_success(monkeypatch):
     """Happy path: button present + click dispatched → 'sent' logged, no raise."""
     d = _make_driver()
-    d._js = AsyncMock(return_value="sent")
+    d._js = AsyncMock(return_value="yes")
+    d._js_mutation = AsyncMock(return_value="sent")
     monkeypatch.setattr("chatgpt_web2api.cdp_driver.asyncio.sleep", AsyncMock())
 
     # Should not raise.

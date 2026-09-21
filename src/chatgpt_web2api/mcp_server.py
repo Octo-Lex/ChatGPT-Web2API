@@ -56,7 +56,7 @@ from .lock_resolver import (
     OwnedTabRequiredError,
     resolve_mutation_lock,
 )
-from .resilience import retry_on_rate_limit
+from .resilience import CHAT_MAX_ATTEMPTS, chat_retry_attempts, retry_on_rate_limit
 from .tab_registry import TabRegistry
 
 logger = logging.getLogger(__name__)
@@ -82,6 +82,14 @@ class ChatCompletionInput(BaseModel):
     """Input schema for chat_completion tool."""
 
     message: str = Field(description="The user message to send to ChatGPT")
+    single_send: bool = Field(
+        default=False,
+        description=(
+            "#51 no-replay opt-in: run the send exactly once. A rate limit "
+            "surfacing after the message was dispatched is returned as an "
+            "error instead of re-sending (which could duplicate the turn)."
+        ),
+    )
     system_prompt: str | None = Field(
         default=None,
         description=(
@@ -282,9 +290,17 @@ class ChatWithGptInput(BaseModel):
     gpt_id: str = Field(
         description=(
             "Custom GPT gizmo ID (e.g. g-hkJGhxxx). Use list_gpts to discover available GPTs."
-        ),
+        )
     )
     message: str = Field(description="The message to send to the GPT")
+    single_send: bool = Field(
+        default=False,
+        description=(
+            "#51 no-replay opt-in: run the send exactly once. A rate limit "
+            "surfacing after the message was dispatched is returned as an "
+            "error instead of re-sending (which could duplicate the turn)."
+        ),
+    )
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -315,6 +331,30 @@ class ToolName(str, Enum):
     DELETE_MEMORY = "delete_memory"
     # Custom GPTs
     CHAT_WITH_GPT = "chat_with_gpt"
+
+
+# #51: single_send controls USER-chat mutation replay ONLY. create_memory
+# also sits in _CHAT_TOOLS (rate-limit retry applies to it) but must not
+# inherit chat-send semantics by set membership — memory mutations would
+# need their own effect analysis before getting at-most-once behavior.
+_SINGLE_SEND_TOOLS = frozenset(
+    {
+        ToolName.CHAT_COMPLETION.value,
+        ToolName.CHAT_WITH_GPT.value,
+    }
+)
+
+
+def _chat_tool_attempts(name: str, arguments: dict) -> int:
+    """Retry budget for a chat-tool call (#51).
+
+    Only the USER-send chat tools honor ``single_send`` (one attempt, no
+    re-invocation of a mutating send on 429). Every other chat tool keeps
+    the default budget regardless of any ``single_send`` argument.
+    """
+    if name in _SINGLE_SEND_TOOLS:
+        return chat_retry_attempts(arguments)
+    return CHAT_MAX_ATTEMPTS
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1649,7 +1689,11 @@ def create_server() -> Server:
 
                     async def _run_pooled() -> dict:
                         if name in _CHAT_TOOLS:
-                            return await retry_on_rate_limit(driver, handler, on_progress=on_progress)
+                            # #51: only chat_completion / chat_with_gpt honor
+                            # single_send (_chat_tool_attempts scopes it).
+                            return await retry_on_rate_limit(
+                                driver, handler, on_progress=on_progress,
+                                max_attempts=_chat_tool_attempts(name, arguments))
                         return await handler()
 
                     if is_mutation and _lock_cdp_port is not None:
@@ -1813,7 +1857,11 @@ def create_server() -> Server:
                 # passes into the business function; here it's also used by
                 # retry_on_rate_limit to signal the backoff pause. Same object
                 # by design — two injection points, one notifier.
-                return await retry_on_rate_limit(_driver, handler, on_progress=on_progress)
+                # #51: only chat_completion / chat_with_gpt honor single_send
+                # (_chat_tool_attempts scopes it).
+                return await retry_on_rate_limit(
+                    _driver, handler, on_progress=on_progress,
+                    max_attempts=_chat_tool_attempts(name, arguments))
             return await handler()
 
         # Serialize mutating tools through the cross-process lock
