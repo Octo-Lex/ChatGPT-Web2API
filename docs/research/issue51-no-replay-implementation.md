@@ -86,7 +86,50 @@ dispatch sites) wrapped their full mutating operation in it.
    inherited baseline cleared so the lint job — and the build job it
    gates — can pass.
 
-## Claim boundary (for the PR description)
+## Automated-review round 2 (2026-09-21, commits 54d5593 + 9f52fe6)
+
+New Codex/GitWire findings after the live certification; PR returned to
+draft while they were addressed.
+
+- **Codex P1 (blocker) — cancellation during the mutating evaluate.**
+  CancelledError escaped unclassified although the frame may already have
+  reached Chrome. Deliberate design: CancelledError propagates UNCHANGED
+  (converting it would break the asyncio cancellation contract and turn
+  client-disconnect cancellations into 409 responses); the
+  UNKNOWN/do-not-resend classification lands on a driver side channel —
+  `note_send_outcome_unknown()` sets `last_send_outcome_unknown` (cleared
+  at each send start) and logs `code=send_outcome_unknown` at ERROR. No
+  evidence-window wait on this path (cancellation must not be delayed).
+  Two tests: cancellation-during-mutation (propagates + records + 1 frame
+  + 0 reconnects) and the scope check (cancellation during a read records
+  nothing).
+- **Codex P2 — breaker recovery on inconclusive evidence.** With no UUID
+  and `acknowledged=None`, a completed turn never cleared
+  `COMPOSER_SEND_READINESS` failures. Downstream-success fallback added
+  after stream completion only. Three tests (fires exactly once on
+  completion; no double-record with UUID; failed stream records nothing).
+- **GitWire streaming claim — not valid, but pinned.** `_stream_response`
+  retries only the read-only preflight and consumes `send_and_stream`
+  once. Two regression tests, including the disproving property (mid-stream
+  RateLimitError does not restart the generator). Evidence reply posted on
+  the PR (issuecomment-5767819420).
+- **Harness defects (commit 9f52fe6)**: `Network.getResponseBody` now
+  rides the observer's own CDP session (the wrong-session bug is why the
+  live run could not resolve `conv_id` in-band); `reconnect_calls` now
+  counts `driver.reconnect` directly (socket-creation total kept as
+  explicitly informational); live-cert cleanup closes ONLY the positively
+  owned `_target_id`; exp1b derives its owned tab from the bridge log
+  instead of the non-committed snapshot file. Not acted on, per review
+  disposition: the ≤3.10 TimeoutError note (project requires ≥3.11), the
+  latch/nonce concerns (no such mechanisms exist here), and committed-ID
+  hygiene in research docs (acknowledged low-severity debt).
+- CI on `9f52fe6`: build, lint, secret-scan, and all six test jobs PASS.
+  Local suite 720 passed / 1 pre-existing master failure; ruff clean.
+  The prior live certification remains valid for the certified path; the
+  new cancellation and breaker-fallback paths are deterministically tested
+  only.
+
+
 
 Claim: **the bridge now provides an opt-in at-most-one automatic USER-send
 mutation attempt across both transport reconnect ambiguity and outer
