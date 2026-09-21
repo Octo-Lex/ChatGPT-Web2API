@@ -118,7 +118,10 @@ COLLECTOR_JS = r"""
 })()
 """
 
-# Structure-only backend probes. NOTE: auth session records KEY NAMES ONLY.
+# Structure-only backend probes. The token is fetched transiently INSIDE the
+# page JS and never returned or persisted; the projection fetch reproduces
+# the report's authenticated method (Bearer header) — cookie-only requests
+# to this endpoint return masked 404s, which the report records explicitly.
 AUTH_SHAPE_JS = """
 (async function() {
   try {
@@ -133,7 +136,11 @@ AUTH_SHAPE_JS = """
 MODELS_JS = """
 (async function() {
   try {
-    var r = await fetch('/backend-api/models?iim=false&is_gizmo=false', {credentials: 'include'});
+    var s = await fetch('/api/auth/session', {credentials: 'include'});
+    var tok = (await s.json()).accessToken;
+    var r = await fetch('/backend-api/models?iim=false&is_gizmo=false',
+                        {credentials: 'include',
+                         headers: {'Authorization': 'Bearer ' + tok}});
     var j = await r.json().catch(function() { return {}; });
     var rows = (j && j.models) ? j.models : [];
     return { status: r.status, topKeys: Object.keys(j).sort(), count: rows.length,
@@ -142,11 +149,16 @@ MODELS_JS = """
 })()
 """
 
+# Parameterized (NOT self-called): eval_on appends the JSON argument when
+# injecting data — the IIFE-parameter pattern, never a top-level var __D.
 PROJECTION_JS = """
-(async function() {
+(async (__D) => {
   try {
+    var s = await fetch('/api/auth/session', {credentials: 'include'});
+    var tok = (await s.json()).accessToken;
     var r = await fetch('/backend-api/conversation/' + __D.conv_id + '?offset=0&limit=' + __D.limit,
-                        {credentials: 'include'});
+                        {credentials: 'include',
+                         headers: {'Authorization': 'Bearer ' + tok}});
     var j = await r.json().catch(function() { return {}; });
     var mapping = j.mapping || {};
     var counts = { user: 0, assistant: 0, system: 0, tool: 0, other: 0 };
@@ -163,7 +175,7 @@ PROJECTION_JS = """
              currentNode: j.current_node || null, sampleNode: node0,
              mappingNodeKeysHaveChildren: mapping[j.current_node] ? ('children' in mapping[j.current_node]) : null };
   } catch (e) { return { error: String(e) }; }
-})()
+})
 """
 
 
@@ -184,8 +196,14 @@ async def eval_on(ws, expr: str, data: dict | None = None, timeout: float = 8.0)
     msg_id = eval_on._next  # type: ignore[attr-defined]
     eval_on._next += 1  # type: ignore[attr-defined]
     if data is not None:
+        # Data injected as an IIFE CALL ARGUMENT, never a top-level
+        # `var __D` — ChatGPT's page defines its own global __D, and that
+        # collision is a bug class this project already diagnosed (the
+        # production code moved to this pattern). Data-bearing JS constants
+        # in this script are therefore parameterized, not self-called.
+        expression = f"{expr}({json.dumps(data)})"
         payload = {"id": msg_id, "method": "Runtime.evaluate",
-                   "params": {"expression": f"var __D = {json.dumps(data)};\n" + expr,
+                   "params": {"expression": expression,
                               "awaitPromise": True, "returnByValue": True, "silent": True}}
     else:
         payload = {"id": msg_id, "method": "Runtime.evaluate",

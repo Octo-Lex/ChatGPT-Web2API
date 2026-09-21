@@ -65,8 +65,12 @@ SAMPLER_JS = """
 })()
 """
 
+# Parameterized (NOT self-called): the caller appends the JSON argument —
+# IIFE-parameter injection, never a top-level var __D (ChatGPT's page owns a
+# global __D; collision is a known bug class). Token fetched transiently
+# in-page; never returned.
 PROJECTION_FIND_JS = """
-(async function() {
+(async (__D) => {
   var s = await fetch('/api/auth/session', {credentials: 'include'});
   var tok = (await s.json()).accessToken;
   var r = await fetch('/backend-api/conversation/' + __D.conv_id + '?offset=0&limit=200',
@@ -95,9 +99,9 @@ PROJECTION_FIND_JS = """
     }
   }
   assistants.sort(function(x, y) { return (x.create_time||0) - (y.create_time||0); });
-  return JSON.stringify({status: r.status, sentinel_user_node: found,
-    assistants_tail: assistants.slice(-4), current_node: j.current_node || null});
-})()
+  return {status: r.status, sentinel_user_node: found,
+    assistants_tail: assistants.slice(-4), current_node: j.current_node || null};
+})
 """
 
 
@@ -125,7 +129,7 @@ async def network_recorder(ws_url: str, events: list, stop_at: float) -> None:
         while time.monotonic() < stop_at:
             try:
                 raw = await asyncio.wait_for(ws.recv(), timeout=0.5)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 continue
             m = json.loads(raw)
             if m.get("method") == "Network.requestWillBeSent":
@@ -181,7 +185,8 @@ def fire_rest(sentinel: str) -> tuple[float, float, dict]:
     req = urllib.request.Request(
         f"{BRIDGE}/v1/chat/completions", data=body,
         headers={"Content-Type": "application/json"}, method="POST")
-    t0 = time.monotonic(); wall0 = time.time()
+    t0 = time.monotonic()
+    wall0 = time.time()
     try:
         with urllib.request.urlopen(req, timeout=REST_TIMEOUT_S) as r:
             payload = json.loads(r.read().decode(errors="replace"))
@@ -195,9 +200,9 @@ def fire_rest(sentinel: str) -> tuple[float, float, dict]:
 
 async def post_projection(ws_url: str, conv_id: str, sentinel: str) -> dict:
     async with websockets.connect(ws_url, max_size=10**7, open_timeout=5) as ws:
-        expr = ("var __D = " +
-                json.dumps({"conv_id": conv_id, "sentinel": sentinel}) + ";\n" +
-                PROJECTION_FIND_JS)
+        # IIFE-parameter injection (no top-level var __D — see note above)
+        expr = PROJECTION_FIND_JS + "(" + json.dumps(
+            {"conv_id": conv_id, "sentinel": sentinel}) + ")"
         await ws.send(json.dumps({"id": 1, "method": "Runtime.evaluate",
                                   "params": {"expression": expr, "silent": True,
                                              "awaitPromise": True,
@@ -205,8 +210,7 @@ async def post_projection(ws_url: str, conv_id: str, sentinel: str) -> dict:
         while True:
             m = json.loads(await asyncio.wait_for(ws.recv(), timeout=25))
             if m.get("id") == 1:
-                return json.loads(m.get("result", {}).get("result", {})
-                                  .get("value") or "{}")
+                return m.get("result", {}).get("result", {}).get("value") or {}
 
 
 async def main() -> None:
@@ -220,19 +224,24 @@ async def main() -> None:
     rest_result: dict = {}
 
     def _fire() -> None:
+        # Runs on a WORKER thread via asyncio.to_thread. Must not touch
+        # asyncio primitives here — asyncio.Event is not thread-safe. The
+        # caller (delayed_fire) sets rest_done back on the event-loop
+        # thread after this returns.
         t0, wall0, res = fire_rest(sentinel)
-        rest_result.update(res); rest_result["t0"] = t0; rest_result["wall0"] = wall0
-        rest_result["t_done"] = time.monotonic(); rest_result["wall_done"] = time.time()
-        rest_done.set()
+        rest_result.update(res)
+        rest_result["t0"] = t0
+        rest_result["wall0"] = wall0
+        rest_result["t_done"] = time.monotonic()
+        rest_result["wall_done"] = time.time()
 
-    # give observers a 2s head start, then fire
-    fire_task = asyncio.get_running_loop().run_in_executor(None, lambda: None)
     net_events: list = []
     samples: list = []
 
     async def delayed_fire() -> None:
         await asyncio.sleep(2.0)
         await asyncio.to_thread(_fire)
+        rest_done.set()  # on the event-loop thread — see note in _fire
 
     observers_done = asyncio.Event()
 
