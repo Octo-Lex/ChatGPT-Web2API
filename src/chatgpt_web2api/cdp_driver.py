@@ -1458,6 +1458,10 @@ class CDPDriver:
         """
         await self._dom.type_message(text)
 
+    async def type_message_with_apps(self, text: str, apps: list[str]) -> None:
+        """Select app mentions and append text without clearing their chips."""
+        await self._dom.type_message_with_apps(text, apps)
+
     async def _detect_select_all_modifier(self) -> int:
         """Return the CDP modifiers value for select-all on the live platform.
 
@@ -1724,6 +1728,7 @@ class CDPDriver:
         *,
         budgets=None,
         model: str | None = None,
+        apps: list[str] | None = None,
     ) -> AsyncIterator[StreamChunk]:
         """Send a message and yield streaming response chunks.
 
@@ -1767,7 +1772,10 @@ class CDPDriver:
 
         try:
             # Type and send.
-            await self.type_message(text)
+            if apps:
+                await self.type_message_with_apps(text, apps)
+            else:
+                await self.type_message(text)
             await self.click_send()
 
             # A2 Step 6: wait for the IdentityListener to capture the UUID.

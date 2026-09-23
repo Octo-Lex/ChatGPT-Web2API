@@ -253,6 +253,15 @@ class APIServer:
 
         model = body.get("model", self._config.chatgpt.default_model)
         stream = body.get("stream", False)
+        apps = body.get("apps")
+        if apps is not None and (
+            not isinstance(apps, list)
+            or any(not isinstance(name, str) or not name.strip() for name in apps)
+        ):
+            return web.json_response(
+                {"error": {"message": "apps must be a list of non-empty app names", "type": "invalid_request_error"}},
+                status=400,
+            )
         project_id = (
             body.get("project_id")
             or body.get("gizmo_id")
@@ -388,9 +397,13 @@ class APIServer:
                     self._last_project_id = project_id
 
                 if stream:
-                    return await self._stream_response(request, model_slug, full_text, timeout)
+                    return await self._stream_response(
+                        request, model_slug, full_text, timeout, **({"apps": apps} if apps else {}),
+                    )
                 else:
-                    return await self._full_response(request, model_slug, full_text, timeout)
+                    return await self._full_response(
+                        request, model_slug, full_text, timeout, **({"apps": apps} if apps else {}),
+                    )
 
         except Exception as e:
             logger.error("Chat error: %s", e, exc_info=True)
@@ -521,7 +534,8 @@ class APIServer:
     # ── Response formatters ───────────────────────────────────
 
     async def _full_response(
-        self, request: web.Request, model: str, text: str, timeout: float
+        self, request: web.Request, model: str, text: str, timeout: float,
+        apps: list[str] | None = None,
     ) -> web.Response:
         """Non-streaming: collect all chunks, return one JSON.
 
@@ -539,6 +553,7 @@ class APIServer:
             collected = ""
             async for chunk in self._driver.send_and_stream(
                 text, timeout=timeout, budgets=budgets, model=model,
+                **({"apps": apps} if apps else {}),
             ):
                 collected += chunk.delta
             return collected
@@ -568,7 +583,8 @@ class APIServer:
         )
 
     async def _stream_response(
-        self, request: web.Request, model: str, text: str, timeout: float
+        self, request: web.Request, model: str, text: str, timeout: float,
+        apps: list[str] | None = None,
     ) -> web.Response:
         """Streaming: SSE chunks as they arrive.
 
@@ -650,6 +666,7 @@ class APIServer:
         try:
             async for chunk in self._driver.send_and_stream(
                 text, timeout=timeout, budgets=budgets, model=model,
+                **({"apps": apps} if apps else {}),
             ):
                 if chunk.delta:
                     await self._send_sse(

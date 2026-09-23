@@ -40,7 +40,7 @@ from typing import Any
 from mcp import types as mcp_types
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from .breakers import BreakerKind, BreakerRegistry, CircuitOpenError
 from .cdp_driver import (
@@ -82,6 +82,21 @@ class ChatCompletionInput(BaseModel):
     """Input schema for chat_completion tool."""
 
     message: str = Field(description="The user message to send to ChatGPT")
+    apps: list[str] | None = Field(
+        default=None,
+        description="Installed ChatGPT app display names to select via @mention, in order.",
+    )
+
+    @field_validator("apps", mode="before")
+    @classmethod
+    def validate_apps(cls, value):
+        if value is not None and (
+            not isinstance(value, list)
+            or any(not isinstance(name, str) or not name.strip() for name in value)
+        ):
+            raise ValueError("apps must be a list of non-empty app names")
+        return value
+
     system_prompt: str | None = Field(
         default=None,
         description=(
@@ -789,6 +804,7 @@ async def do_chat_completion(
     )
     async for chunk in driver.send_and_stream(
         full_text, timeout=120, budgets=_budgets, model=validated.model,
+        **({"apps": validated.apps} if validated.apps else {}),
     ):
         if chunk.delta:
             full_response += chunk.delta

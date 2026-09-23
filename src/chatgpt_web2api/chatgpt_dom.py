@@ -51,6 +51,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 import unicodedata
 
@@ -104,6 +105,7 @@ SEND_BUTTON_BROAD_SELECTOR = (
 # indefinitely on a genuinely broken composer.
 SEND_BUTTON_POLL_INTERVAL_S = 0.3
 SEND_BUTTON_POLL_MAX_WAIT_S = 10.0
+APP_MENTION_MAX_WAIT_S = 8.0
 
 
 class ChatGPTDom:
@@ -302,6 +304,116 @@ class ChatGPTDom:
                     f"Composer text verification failed after retry; expected {text[:60]!r}"
                 )
         logger.info("Typed: %s", text[:80])
+
+    async def type_message_with_apps(self, text: str, apps: list[str]) -> None:
+        """Rebuild the composer with ordered app chips, then append the prompt.
+
+        Keep type_message's plain-text verification out of the populated
+        editor: mention nodes are structured UI metadata, not prompt text.
+        A click alone is insufficient; require a matching chip before sending.
+        """
+        from .cdp_driver import CDPJSError, SendReadinessError
+
+        d = self._driver
+        focus_end_js = (
+            "(function(){"
+            f"  const el = document.querySelector('{COMPOSER_SELECTOR}');"
+            "  if (!el || !el.isContentEditable) return false;"
+            "  el.focus();"
+            "  const range = document.createRange();"
+            "  range.selectNodeContents(el); range.collapse(false);"
+            "  const selection = window.getSelection();"
+            "  selection.removeAllRanges(); selection.addRange(range);"
+            "  return true;"
+            "})()"
+        )
+        app_name = apps[0]
+        try:
+            # Also clears stale chips/prompt after a rate-limit retry, using
+            # the existing clear + verification seam before adding any apps.
+            await d.type_message("")
+            for index, app_name in enumerate(apps):
+                if not await d._js_strict(focus_end_js):
+                    raise SendReadinessError("No editable app composer found")
+                word = re.search(r"[^\W_]+", app_name)
+                query = (word.group() if word else app_name)[:3]
+                await d._cdp("Input.insertText", {"text": "@" + query})
+                clicked = False
+                deadline = time.monotonic() + APP_MENTION_MAX_WAIT_S
+                while time.monotonic() < deadline:
+                    result = await d._js_strict(
+                        "(function(){"
+                        f"  const composer = document.querySelector('{COMPOSER_SELECTOR}');"
+                        "  if (!composer) return 'missing composer';"
+                        f"  const name = {json.dumps(app_name)};"
+                        "  function exact(el, name) {"
+                        "    const text = (el.innerText || el.textContent || '').trim();"
+                        "    return text === name || text === '@' + name;"
+                        "  }"
+                        "  function visible(el) {"
+                        "    const r = el.getBoundingClientRect(), s = getComputedStyle(el);"
+                        "    return r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < innerHeight"
+                        "      && s.visibility !== 'hidden' && s.display !== 'none' && s.opacity !== '0';"
+                        "  }"
+                        # Confirm selection in the editor, not merely in the
+                        # popup (which can retain the same display name).
+                        f"  if ({json.dumps(clicked)}) {{"
+                        "    const chips = Array.from(composer.querySelectorAll("
+                        "      '[contenteditable=\"false\"], [data-type=\"mention\"]'));"
+                        "    const outer = chips.filter(el => visible(el)"
+                        "      && !chips.some(parent => parent !== el && parent.contains(el))"
+                        "    );"
+                        f"    const names = {json.dumps(apps[:index + 1])};"
+                        "    return names.every(name => outer.filter(el => exact(el, name)"
+                        "      || Array.from(el.querySelectorAll('*')).some(child => exact(child, name))).length"
+                        "      >= names.filter(n => n === name).length) ? 'selected' : 'waiting';"
+                        "  }"
+                        "  const c = composer.getBoundingClientRect();"
+                        # Portalled popups need not be descendants of the
+                        # form. Scope by popup semantics AND composer geometry.
+                        "  const popups = document.querySelectorAll("
+                        "    '[role=\"listbox\"], [role=\"menu\"], [data-radix-popper-content-wrapper]');"
+                        "  const candidates = new Set();"
+                        "  for (const popup of popups) {"
+                        "    const r = popup.getBoundingClientRect();"
+                        "    if (!visible(popup) || r.right < c.left || r.left > c.right"
+                        "        || Math.max(0, c.top - r.bottom, r.top - c.bottom) > 120) continue;"
+                        "    for (const el of popup.querySelectorAll('*')) {"
+                        # Display names are exact; the internal prefix never
+                        # decides which app is selected.
+                        "      if (!visible(el) || (el.innerText || '').trim() !== name) continue;"
+                        "      const item = el.closest('button, [role=\"option\"], [role=\"menuitem\"], [role=\"button\"]');"
+                        "      if (!item || !popup.contains(item) || !visible(item) || item.disabled"
+                        "          || item.getAttribute('aria-disabled') === 'true' || composer.contains(item)"
+                        "          || item.closest('nav, aside, article, [data-message-author-role]')) continue;"
+                        "      candidates.add(item);"
+                        "    }"
+                        "  }"
+                        "  const items = Array.from(candidates).filter(item =>"
+                        "    !Array.from(candidates).some(child => child !== item && item.contains(child)));"
+                        "  if (items.length > 1) return 'ambiguous app suggestions';"
+                        "  if (!items.length) return 'waiting';"
+                        "  items[0].click();"
+                        "  return 'clicked';"
+                        "})()"
+                    )
+                    if result == "selected":
+                        break
+                    if result == "clicked":
+                        clicked = True
+                    elif result != "waiting":
+                        raise SendReadinessError(f"App autocomplete: {result}")
+                    await asyncio.sleep(0.1)
+                else:
+                    raise SendReadinessError("App suggestion or selected chip not found")
+            if not await d._js_strict(focus_end_js):
+                raise SendReadinessError("No editable app composer found")
+            await d._cdp("Input.insertText", {"text": text})
+        except (CDPJSError, SendReadinessError) as exc:
+            await d._capture_selector_diagnostic(f"app mention ({app_name})")
+            if d._breakers:
+                d._breakers.record_failure(BreakerKind.COMPOSER_SEND_READINESS)
+            raise SendReadinessError(f"Could not select app {app_name!r}: {exc}") from exc
 
     async def _detect_select_all_modifier(self) -> int:
         """Return the CDP modifiers value for select-all on the live platform.
