@@ -262,6 +262,8 @@ class APIServer:
                 {"error": {"message": "apps must be a list of non-empty app names", "type": "invalid_request_error"}},
                 status=400,
             )
+        if apps is not None:
+            apps = [name.strip() for name in apps]
         project_id = (
             body.get("project_id")
             or body.get("gizmo_id")

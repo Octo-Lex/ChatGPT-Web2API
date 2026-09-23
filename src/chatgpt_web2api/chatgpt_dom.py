@@ -372,7 +372,7 @@ class ChatGPTDom:
                         # Portalled popups need not be descendants of the
                         # form. Scope by popup semantics AND composer geometry.
                         "  const popups = document.querySelectorAll("
-                        "    '[role=\"listbox\"], [role=\"menu\"], [data-radix-popper-content-wrapper]');"
+                        "    '[role=\"listbox\"], [role=\"menu\"], [data-radix-popper-content-wrapper], .popover');"
                         "  const candidates = new Set();"
                         "  for (const popup of popups) {"
                         "    const r = popup.getBoundingClientRect();"
@@ -382,7 +382,9 @@ class ChatGPTDom:
                         # Display names are exact; the internal prefix never
                         # decides which app is selected.
                         "      if (!visible(el) || (el.innerText || '').trim() !== name) continue;"
-                        "      const item = el.closest('button, [role=\"option\"], [role=\"menuitem\"], [role=\"button\"]');"
+                        "      const interactive = el.closest('button, [role=\"option\"], [role=\"menuitem\"], [role=\"button\"], .__menu-item');"
+                        # Live app suggestions can be plain clickable DIVs.
+                        "      const item = interactive && popup.contains(interactive) ? interactive : el;"
                         "      if (!item || !popup.contains(item) || !visible(item) || item.disabled"
                         "          || item.getAttribute('aria-disabled') === 'true' || composer.contains(item)"
                         "          || item.closest('nav, aside, article, [data-message-author-role]')) continue;"

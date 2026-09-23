@@ -1764,8 +1764,12 @@ class CDPDriver:
         # or wall-clock) for dual-anchor correlation if UUID capture fails.
         fallback_anchor = await self._capture_pre_send_fallback_anchor(text)
         if self._identity_listener is not None and self._identity_listener.is_alive():
+            # Live POST evidence: app chips serialize as "@Display Name "
+            # prefixes in the string part, in addition to app metadata.
+            # Only capture matching uses this wire text; the logical prompt stays unchanged.
+            capture_text = "".join(f"@{app} " for app in apps) + text if apps else text
             capture_scope = self._identity_listener.arm_capture_scope(
-                expected_text_hash=hash_sent_text(text),
+                expected_text_hash=hash_sent_text(capture_text),
                 conversation_id=self._current_conv_id,
                 target_id=self._target_id,
             )

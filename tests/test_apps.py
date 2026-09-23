@@ -1,6 +1,8 @@
 """App contract and send regressions; no live ChatGPT account required."""
 
 import json
+import shutil
+import subprocess
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -152,7 +154,10 @@ def transport_driver():
     return driver
 
 
-APP_INPUTS = [{}, {"apps": None}, {"apps": []}, {"apps": ["GitHub", "Hermes Memory MCP NoAuth"]}]
+APP_INPUTS = [
+    {}, {"apps": None}, {"apps": []}, {"apps": ["GitHub", "Hermes Memory MCP NoAuth"]},
+    {"apps": ["  GitHub  ", "Hermes Memory MCP NoAuth\t", "GitHub"]},
+]
 INVALID_APPS = ["GitHub", {}, [""], [" \n"], [None], [1], [True], ["GitHub", {}]]
 
 
@@ -171,7 +176,7 @@ async def test_rest_apps_reach_driver(fields, stream):
     text, kwargs = driver.calls[0]
     assert text == "[User]\nprompt"
     if fields.get("apps"):
-        assert kwargs["apps"] == fields["apps"]
+        assert kwargs["apps"] == [name.strip() for name in fields["apps"]]
     else:
         assert "apps" not in kwargs  # Preserve existing driver/test seams.
 
@@ -202,7 +207,7 @@ async def test_mcp_apps_schema_and_forwarding(fields):
     text, kwargs = driver.calls[0]
     assert text == "prompt"
     if fields.get("apps"):
-        assert kwargs["apps"] == fields["apps"]
+        assert kwargs["apps"] == [name.strip() for name in fields["apps"]]
     else:
         assert "apps" not in kwargs
 
@@ -235,3 +240,98 @@ async def test_app_metadata_does_not_change_identity_text_hash():
         assert await listener.wait_for_captured_uuid(timeout=0.1) == message_id
     finally:
         scope.close()
+
+
+@pytest.mark.parametrize("apps,wire_text", [
+    (None, "prompt"),
+    (["Hermes Memory MCP NoAuth"], "@Hermes Memory MCP NoAuth prompt"),
+    (["GitHub", "Hermes Memory MCP NoAuth"], "@GitHub @Hermes Memory MCP NoAuth prompt"),
+])
+async def test_app_wire_text_captures_uuid_without_changing_logical_anchor(apps, wire_text):
+    """Live POST (2026-09-23): app names prefix the string part, not just metadata."""
+    driver = send_driver()
+    driver.type_message_with_apps = AsyncMock()
+    listener = driver._identity_listener = IdentityListener(driver)
+    listener._ready = True
+    message_id = "11111111-1111-4111-8111-111111111111"
+
+    async def click():
+        body = {"action": "next", "messages": [{
+            "id": message_id, "author": {"role": "user"},
+            "content": {"content_type": "text", "parts": [wire_text]},
+        }]}
+        await listener._process_send_post(listener._active_scope, {"params": {
+            "request": {"postData": json.dumps(body)},
+        }}, "https://chatgpt.com/backend-api/f/conversation")
+
+    async def complete(**kwargs):
+        anchor = kwargs["turn_anchor"]
+        assert anchor.sent_text == "prompt"
+        assert anchor.captured_user_message_id == message_id
+        yield StreamChunk(delta="OK")
+
+    driver.click_send = click
+    driver._completion.stream_until_complete = complete
+    _ = [chunk async for chunk in driver.send_and_stream("prompt", apps=apps)]
+    assert listener.capture_success_count == 1
+    assert listener._active_scope is None
+    driver._verify_send_acknowledged.assert_not_awaited()
+
+
+@pytest.mark.parametrize("popup_attributes,suggestion_html", [
+    ('role="listbox"', 'Hermes Memory MCP NoAuth'),
+    ('class="popover"', '<div class="__menu-item"><span>Hermes Memory MCP NoAuth</span>'
+     '<span>Hermes Memory MCP NoAuth</span></div>'),
+])
+async def test_plain_div_app_suggestion_in_real_dom(tmp_path, popup_attributes, suggestion_html):
+    """Run the generated selector in local Chrome; no ChatGPT session or network."""
+    chrome = shutil.which(Config().chrome.chrome_path)
+    if not chrome:
+        pytest.skip("Chrome is required for the local DOM regression")
+    driver = send_driver()
+    driver._cdp = AsyncMock()
+    scripts = []
+    responses = iter([True, "clicked", "selected", True])
+
+    async def capture_script(expr):
+        scripts.append(expr)
+        return next(responses)
+
+    driver._js_strict = capture_script
+    await driver.type_message_with_apps("prompt", ["Hermes Memory MCP NoAuth"])
+    fixture = tmp_path / "app-suggestion.html"
+    fixture.write_text("""<!doctype html><html><body>
+        <div id="prompt-textarea" role="textbox" contenteditable="true"
+             style="position:fixed;left:300px;top:400px;width:450px;height:90px"></div>
+        <div """ + popup_attributes + """ style="position:fixed;left:300px;top:280px;width:400px;height:110px">
+            <div id="suggestion">""" + suggestion_html + """</div>
+        </div>
+        <aside><div role="listbox"><div>Hermes Memory MCP NoAuth</div></div></aside>
+        <script>
+        const scripts = """ + json.dumps(scripts) + """;
+        const suggestion = document.getElementById('suggestion');
+        let clicks = 0;
+        suggestion.onclick = () => {
+            clicks++;
+            const chip = document.createElement('span');
+            chip.contentEditable = 'false';
+            chip.textContent = 'Hermes Memory MCP NoAuth';
+            document.getElementById('prompt-textarea').append(chip);
+        };
+        const result = [eval(scripts[0]), eval(scripts[1]), eval(scripts[2]), clicks];
+        suggestion.style.display = 'none';
+        result.push(eval(scripts[1]));
+        const output = document.createElement('pre');
+        output.id = 'result'; output.textContent = JSON.stringify(result);
+        document.body.append(output);
+        </script></body></html>""", encoding="utf-8")
+    result = subprocess.run(
+        [chrome, "--headless", "--disable-gpu", "--disable-background-networking",
+         "--no-first-run", "--no-default-browser-check", "--window-size=1280,900",
+         f"--user-data-dir={tmp_path / 'chrome-profile'}", "--dump-dom", fixture.as_uri()],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert '<pre id="result">[true,"clicked","selected",1,"waiting"]</pre>' in result.stdout, (
+        result.stdout + result.stderr
+    )

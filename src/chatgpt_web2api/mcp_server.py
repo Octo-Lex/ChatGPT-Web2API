@@ -95,7 +95,7 @@ class ChatCompletionInput(BaseModel):
             or any(not isinstance(name, str) or not name.strip() for name in value)
         ):
             raise ValueError("apps must be a list of non-empty app names")
-        return value
+        return [name.strip() for name in value] if value is not None else None
 
     system_prompt: str | None = Field(
         default=None,
