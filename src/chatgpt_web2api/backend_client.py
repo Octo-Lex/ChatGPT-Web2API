@@ -232,7 +232,9 @@ class BackendClient:
             return ""
         if not url or "/c/" not in url:
             return ""
-        return url.split("/c/")[1].split("/")[0].split("?")[0]
+        conversation_id = url.split("/c/")[1].split("/")[0].split("?")[0]
+        # New chats can briefly expose a frontend-only id before persistence.
+        return "" if conversation_id.startswith("WEB:") else conversation_id
 
     async def _get_live_conversation_id_best_effort(self) -> str:
         """Resolve the in-flight conversation id by cheapest available source.

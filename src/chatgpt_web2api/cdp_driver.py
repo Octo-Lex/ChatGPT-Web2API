@@ -1762,14 +1762,13 @@ class CDPDriver:
         # A2 Step 3+4: arm capture scope + build fallback anchor.
         # The fallback anchor captures pre-send state (backend node-ids/times
         # or wall-clock) for dual-anchor correlation if UUID capture fails.
-        fallback_anchor = await self._capture_pre_send_fallback_anchor(text)
+        # Live POST: app chips prefix the string part as "@Display Name ".
+        # Both correlation paths must match it; the composer still gets logical text.
+        wire_text = "".join(f"@{app} " for app in apps) + text if apps else text
+        fallback_anchor = await self._capture_pre_send_fallback_anchor(wire_text)
         if self._identity_listener is not None and self._identity_listener.is_alive():
-            # Live POST evidence: app chips serialize as "@Display Name "
-            # prefixes in the string part, in addition to app metadata.
-            # Only capture matching uses this wire text; the logical prompt stays unchanged.
-            capture_text = "".join(f"@{app} " for app in apps) + text if apps else text
             capture_scope = self._identity_listener.arm_capture_scope(
-                expected_text_hash=hash_sent_text(capture_text),
+                expected_text_hash=hash_sent_text(wire_text),
                 conversation_id=self._current_conv_id,
                 target_id=self._target_id,
             )
@@ -1838,13 +1837,8 @@ class CDPDriver:
             # Wait for URL to become /c/{id}
             conv_id = ""
             for _ in range(30):
-                try:
-                    url = await self._js_strict("window.location.href")
-                except CDPJSError:
-                    await asyncio.sleep(0.5)
-                    continue
-                if "/c/" in url:
-                    conv_id = url.split("/c/")[1].split("/")[0].split("?")[0]
+                conv_id = await self._conversation_id_from_url()
+                if conv_id:
                     break
                 await asyncio.sleep(0.5)
 
@@ -1864,10 +1858,14 @@ class CDPDriver:
                     last_status = result.status
                     last_diagnostic = result.diagnostic or {}
                     if result.status == "matched" and result.text:
-                        if len(result.text) > len(last_dom_text):
-                            yield StreamChunk(delta=result.text[len(last_dom_text):])
-                            last_dom_text = result.text
-                        break
+                        if result.text.startswith(last_dom_text):
+                            if result.text != last_dom_text:
+                                yield StreamChunk(delta=result.text[len(last_dom_text):])
+                                last_dom_text = result.text
+                            break
+                        # A rewritten/lagging backend text cannot extend the
+                        # emitted prefix. Wait for reconciliation, never splice.
+                        last_status = "text_mismatch"
                     if result.status == "non_text":
                         # P2.5 RCA fix: non_text is NOT terminal here. The backend
                         # propagates intermediary nodes (reasoning_recap, thoughts,

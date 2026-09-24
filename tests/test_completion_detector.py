@@ -22,16 +22,23 @@ file guards the wiring:
     rule); error classes / StreamChunk are imported lazily inside the method.
 """
 
+import html
 import inspect
+import json
+import re
+import shutil
+import subprocess
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from chatgpt_web2api.cdp_driver import CDPDriver
 from chatgpt_web2api.completion_detector import (
     PHASE_STALL_SECONDS,
     CompletionDetector,
 )
-from chatgpt_web2api.turn_anchor import TurnAnchor, TurnEndResult
+from chatgpt_web2api.config import Config
+from chatgpt_web2api.turn_anchor import TurnAnchor, TurnEndResult, TurnTextResult
 
 
 def _make_detector():
@@ -237,3 +244,122 @@ def importlib_import_module(name):
     import importlib
 
     return importlib.import_module(name)
+
+
+async def _stream_probes(monkeypatch, probes, backend_texts):
+    """Exercise the detector and final reconciliation with a virtual clock."""
+    driver = CDPDriver()
+    clock = [100.0]
+    monkeypatch.setattr("chatgpt_web2api.completion_detector.time.monotonic", lambda: clock[0])
+
+    async def sleep(seconds):
+        clock[0] += seconds
+
+    monkeypatch.setattr("chatgpt_web2api.completion_detector.asyncio.sleep", sleep)
+    driver._read_assistant_count_baseline = AsyncMock(return_value=1)
+    driver._verify_send_acknowledged = AsyncMock(return_value=True)
+    driver.type_message = AsyncMock()
+    driver.click_send = AsyncMock()
+    index = 0
+
+    async def js(expr):
+        nonlocal index
+        if "has_action" in expr:
+            probe = probes[min(index, len(probes) - 1)]
+            index += 1
+            return json.dumps(probe)
+        if "body.innerText" in expr:
+            return '{"text":""}'
+        if "location.href" in expr:
+            return "https://chatgpt.com/c/real-conversation"
+        return 2
+
+    async def end_turn(*args, **kwargs):
+        return TurnEndResult(status="matched" if index >= len(probes) else "not_ready")
+
+    driver._js_strict = js
+    driver._fetch_end_turn_for_turn = end_turn
+    driver._fetch_text_for_turn = AsyncMock(side_effect=[
+        TurnTextResult(status="matched", text=text) for text in backend_texts
+    ])
+    return [c.delta async for c in driver.send_and_stream("prompt") if c.delta]
+
+
+@pytest.mark.parametrize("texts,expected", [
+    (["ABC", "ABCDE", "ABCDEFG"], ["ABC", "DE", "FG"]),
+    (["ABC", "Unrelated longer rendering", "ABCDEFG"], ["ABC", "DEFG"]),
+    (["ABC", "", "A", "ABCDEFG"], ["ABC", "DEFG"]),
+])
+async def test_deltas_only_extend_emitted_prefix(monkeypatch, texts, expected):
+    probes = [{"text": text, "md_text": text, "html_len": 60} for text in texts]
+    assert await _stream_probes(monkeypatch, probes, ["ABCDEFG"]) == expected
+
+
+async def test_reconciliation_waits_for_matching_prefix(monkeypatch):
+    probes = [{"text": "ABC", "md_text": "ABC", "html_len": 60}]
+    assert await _stream_probes(monkeypatch, probes, ["Unrelated text", "ABCDEFG"]) == [
+        "ABC", "DEFG",
+    ]
+
+
+async def test_reasoning_dom_and_source_switch_emit_only_answer(monkeypatch, tmp_path):
+    """Execute the real probe JS against the observed German aria-busy DOM.
+
+    Also cover a disappearing tool placeholder and raw-text -> markdown switch.
+    Reuse the local headless Chrome approach from test_apps; no live account.
+    """
+    chrome = shutil.which(Config().chrome.chrome_path)
+    if not chrome:
+        pytest.skip("Chrome is required for the local DOM regression")
+    detector, driver = _make_detector()
+    scripts = []
+
+    async def capture(expr):
+        if "has_action" in expr:
+            scripts.append(expr)
+            return '{"text":"answer","md_text":"answer","has_action":true}'
+        if "body.innerText" in expr:
+            return '{"text":""}'
+        return 2
+
+    driver._js_strict = capture
+    _ = [c async for c in detector.stream_until_complete(
+        initial_count=1, timeout=5, turn_anchor=TurnAnchor(sent_text="test", mode="fresh_chat"),
+    )]
+    marker = "POC0_MEMORY_MARKER_7F2A"
+    fixture = tmp_path / "reasoning.html"
+    fixture.write_text("""<!doctype html><html><body>
+        <div data-message-author-role="assistant"><div class="markdown">STALE</div></div>
+        <div id="new" data-message-author-role="assistant"></div>
+        <script>
+        const probe = """ + json.dumps(scripts[0]) + """;
+        const current = document.getElementById('new');
+        const states = [
+          '<div aria-busy="true"><div class="loading-shimmer-tertiary">Denkt nach ...</div></div>',
+          null,
+          '<div>Zwischenstand A</div><div class="markdown"></div>',
+          '<div class="markdown">PO</div>',
+          '<div class="markdown">POC0_MEMORY_MARKER_7F2A</div>'
+        ];
+        const results = states.map(state => {
+          if (state === null) current.remove();
+          else { document.body.append(current); current.innerHTML = state; }
+          return JSON.parse(eval(probe));
+        });
+        const output = document.createElement('pre');
+        output.id = 'result'; output.textContent = JSON.stringify(results);
+        document.body.append(output);
+        </script></body></html>""", encoding="utf-8")
+    result = subprocess.run(
+        [chrome, "--headless", "--disable-gpu", "--disable-background-networking",
+         "--no-first-run", "--no-default-browser-check",
+         f"--user-data-dir={tmp_path / 'chrome-profile'}", "--dump-dom", fixture.as_uri()],
+        capture_output=True, text=True, encoding="utf-8", timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    output = re.search(r'<pre id="result">(.*?)</pre>', result.stdout, re.DOTALL)
+    assert output, result.stdout + result.stderr
+    probes = json.loads(html.unescape(output.group(1)))
+    assert probes[0]["is_thinking"] is True
+    assert [p["text"] for p in probes] == ["", "", "", "PO", marker]
+    assert "".join(await _stream_probes(monkeypatch, probes, [marker])) == marker

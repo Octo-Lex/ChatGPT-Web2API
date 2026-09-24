@@ -123,6 +123,50 @@ async def test_conversation_id_parsed_from_url():
 # ── 3. Loop resolves conv_id_for_check mid-loop ─────────────────────────
 
 
+@pytest.mark.parametrize("path,expected", [
+    ("/c/WEB:temporary-id", ""),
+    ("/g/project/c/WEB:temporary-id", ""),
+    ("/c/real-id?model=auto", "real-id"),
+    ("/g/project/c/real-id", "real-id"),
+])
+async def test_conversation_url_ignores_only_provisional_ids(path, expected):
+    driver = _make_driver()
+    driver._js_strict = AsyncMock(return_value="https://chatgpt.com" + path)
+    assert await driver._conversation_id_from_url() == expected
+
+
+@pytest.mark.parametrize("backend_completion", [False, True], ids=["final-resolver", "mid-loop"])
+async def test_new_chat_waits_past_web_id_before_backend(monkeypatch, backend_completion):
+    driver = _make_driver()
+    _install_virtual_clock(monkeypatch)
+    state = {"phase1": 0, "phase2": 0}
+    urls = iter(["https://chatgpt.com/c/WEB:temporary-id"] * 4)
+    probe = _phase1_then_phase2_js(state, phase2_factory=lambda n: {
+        "text": "Answer", "md_text": "Answer", "html_len": 60,
+        "has_action": not backend_completion,
+    })
+
+    async def js(expr, timeout=15):
+        if "location.href" in expr:
+            return next(urls, "https://chatgpt.com/c/persisted-id")
+        return await probe(expr, timeout)
+
+    driver._js_strict = js
+    driver.type_message = AsyncMock()
+    driver.click_send = AsyncMock()
+    driver._verify_send_acknowledged = AsyncMock(return_value=True)
+    driver._fetch_end_turn_for_turn = AsyncMock(return_value=TurnEndResult(status="matched"))
+    driver._fetch_text_for_turn = AsyncMock(return_value=TurnTextResult(status="matched", text="Answer"))
+    chunks = [c async for c in driver.send_and_stream("prompt")]
+    assert "".join(c.delta for c in chunks) == "Answer"
+    assert driver._current_conv_id == "persisted-id"
+    calls = driver._fetch_end_turn_for_turn.await_args_list + driver._fetch_text_for_turn.await_args_list
+    assert calls
+    assert all(call.args[0] == "persisted-id" for call in calls)
+    if backend_completion:
+        driver._fetch_end_turn_for_turn.assert_awaited()
+
+
 @pytest.mark.asyncio
 async def test_loop_resolves_conv_id_mid_loop(monkeypatch):
     """The completion poll loop must resolve conv_id_for_check from the URL

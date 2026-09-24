@@ -247,7 +247,7 @@ async def test_app_metadata_does_not_change_identity_text_hash():
     (["Hermes Memory MCP NoAuth"], "@Hermes Memory MCP NoAuth prompt"),
     (["GitHub", "Hermes Memory MCP NoAuth"], "@GitHub @Hermes Memory MCP NoAuth prompt"),
 ])
-async def test_app_wire_text_captures_uuid_without_changing_logical_anchor(apps, wire_text):
+async def test_app_wire_text_used_for_uuid_capture_and_fallback_anchor(apps, wire_text):
     """Live POST (2026-09-23): app names prefix the string part, not just metadata."""
     driver = send_driver()
     driver.type_message_with_apps = AsyncMock()
@@ -266,7 +266,7 @@ async def test_app_wire_text_captures_uuid_without_changing_logical_anchor(apps,
 
     async def complete(**kwargs):
         anchor = kwargs["turn_anchor"]
-        assert anchor.sent_text == "prompt"
+        assert anchor.sent_text == wire_text
         assert anchor.captured_user_message_id == message_id
         yield StreamChunk(delta="OK")
 
@@ -276,6 +276,60 @@ async def test_app_wire_text_captures_uuid_without_changing_logical_anchor(apps,
     assert listener.capture_success_count == 1
     assert listener._active_scope is None
     driver._verify_send_acknowledged.assert_not_awaited()
+
+
+async def test_app_without_captured_uuid_reconciles_wire_text():
+    from chatgpt_web2api.turn_anchor import select_text_for_turn
+
+    driver = send_driver()
+    driver._current_conv_id = "test"
+    driver.type_message_with_apps = AsyncMock()
+    listener = driver._identity_listener = IdentityListener(driver)
+    listener._ready = True
+    listener.wait_for_captured_uuid = AsyncMock(return_value=None)
+    prompt = "[User]\nRufe get_poc_memory auf."
+    wire_text = "@Hermes Memory MCP NoAuth " + prompt
+    marker = "POC0_MEMORY_MARKER_7F2A"
+
+    def turn(suffix, timestamp, answer):
+        user, assistant = "u-" + suffix, "a-" + suffix
+        return {
+            user: {"id": user, "children": [assistant], "role": "user",
+                   "create_time": timestamp, "content_type": "text", "text": wire_text},
+            assistant: {"id": assistant, "parent": user, "children": [], "role": "assistant",
+                        "end_turn": True, "create_time": timestamp + 1,
+                        "content_type": "text", "text": answer},
+        }
+
+    old_nodes = turn("old", 100, "STALE")
+    projection = {"nodes": {**old_nodes, **turn("new", 200, marker)}}
+    driver._backend_client._fetch_recent_conversation_projection = AsyncMock(
+        return_value={"nodes": old_nodes}
+    )
+
+    async def fetch(conv_id, anchor):
+        assert conv_id == "test"
+        assert anchor.captured_user_message_id is None
+        assert anchor.mode == "existing_conversation"
+        assert anchor.sent_text == wire_text
+        result = select_text_for_turn(projection, anchor)
+        assert result.status == "matched", result.diagnostic
+        assert result.text == marker
+        return result
+
+    async def complete(**kwargs):
+        driver._completion.last_dom_text = ""
+        if False:
+            yield
+
+    driver._fetch_text_for_turn = fetch
+    driver._completion.stream_until_complete = complete
+    chunks = [c async for c in driver.send_and_stream(prompt, apps=["Hermes Memory MCP NoAuth"])]
+    assert "".join(c.delta for c in chunks) == marker
+    driver.type_message_with_apps.assert_awaited_once_with(prompt, ["Hermes Memory MCP NoAuth"])
+    driver.click_send.assert_awaited_once()
+    listener.wait_for_captured_uuid.assert_awaited_once()
+    assert listener._active_scope is None
 
 
 @pytest.mark.parametrize("popup_attributes,suggestion_html", [
