@@ -379,7 +379,7 @@ class ChatGPTDom:
                         # Portalled popups need not be descendants of the
                         # form. Scope by popup semantics AND composer geometry.
                         "  const popups = document.querySelectorAll("
-                        "    '[role=\"listbox\"], [role=\"menu\"], [data-radix-popper-content-wrapper], .popover, .composer-home-top-menu');"
+                        "    '[role=\"listbox\"], [role=\"menu\"], [data-radix-popper-content-wrapper], .popover, .composer-home-top-menu, [data-composer-overlay-floating-ui=\"true\"]');"
                         "  const candidates = new Set();"
                         "  for (const popup of popups) {"
                         "    const r = popup.getBoundingClientRect();"

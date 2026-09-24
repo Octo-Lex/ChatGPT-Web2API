@@ -433,6 +433,10 @@ async def test_app_without_captured_uuid_reconciles_serialized_text():
     ('class="suggestionMenu-XYZ composer-home-top-menu"',
      '<button><span>GitHub</span><span>Triage PRs, issues, CI, and publish flows</span></button>',
      'GitHub', 'button'),
+    ('data-composer-overlay-floating-ui="true"',
+     '<div class="some-current-suggestion-menu"><button type="button" data-list-navigation-item="true">'
+     '<span>GitHub</span><span>Triage PRs, issues, CI, and publish flows</span></button></div>',
+     'GitHub', 'button'),
 ])
 async def test_plain_div_app_suggestion_in_real_dom(
     tmp_path, popup_attributes, suggestion_html, app_name, click_selector,
@@ -478,7 +482,12 @@ async def test_plain_div_app_suggestion_in_real_dom(
             chip.textContent = name;
             document.getElementById('prompt-textarea').append(chip);
         };
-        const result = [eval(scripts[0]), eval(scripts[1]), eval(scripts[2]), clicks];
+        const result = [eval(scripts[0])];
+        const popup = suggestion.parentElement;
+        popup.style.top = '20px';
+        result.push(eval(scripts[1]), clicks);
+        popup.style.top = '280px';
+        result.push(eval(scripts[1]), eval(scripts[2]), clicks);
         suggestion.style.display = 'none';
         result.push(eval(scripts[1]));
         const output = document.createElement('pre');
@@ -492,6 +501,6 @@ async def test_plain_div_app_suggestion_in_real_dom(
         capture_output=True, text=True, timeout=30,
     )
     assert result.returncode == 0, result.stderr
-    assert '<pre id="result">[true,"clicked","selected",1,"waiting"]</pre>' in result.stdout, (
+    assert '<pre id="result">[true,"waiting",0,"clicked","selected",1,"waiting"]</pre>' in result.stdout, (
         result.stdout + result.stderr
     )
