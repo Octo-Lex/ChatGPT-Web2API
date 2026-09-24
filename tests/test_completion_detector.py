@@ -367,7 +367,8 @@ async def test_reasoning_dom_and_source_switch_emit_only_answer(
           null,
           '<div>Zwischenstand A</div><div ' + markdownAttributes + '></div>',
           '<div ' + markdownAttributes + '>MEMORY=</div>',
-          '<div ' + markdownAttributes + '>' + marker + '</div>'
+          '<div>Tool status outside answer</div><div ' + markdownAttributes + '><span>'
+            + marker.replace('\\n', '</span><br><span>') + '</span></div>'
         ];
         const results = states.map(state => {
           if (state === null) current.remove();
@@ -377,8 +378,11 @@ async def test_reasoning_dom_and_source_switch_emit_only_answer(
           }
           return JSON.parse(eval(scripts.phase2));
         });
+        current.innerHTML = '<div>Denkt nach ...</div><div ' + markdownAttributes + '>'
+          + '<p>First paragraph</p><p>Second paragraph<br>Next line</p></div>';
+        const paragraphs = JSON.parse(eval(scripts.phase2));
         const output = document.createElement('pre');
-        output.id = 'result'; output.textContent = JSON.stringify({countsBefore, countsAfter, results});
+        output.id = 'result'; output.textContent = JSON.stringify({countsBefore, countsAfter, results, paragraphs});
         document.body.append(output);
         </script></body></html>""", encoding="utf-8")
     result = subprocess.run(
@@ -396,6 +400,7 @@ async def test_reasoning_dom_and_source_switch_emit_only_answer(
     probes = observed["results"]
     assert probes[0]["is_thinking"] is True
     assert [p["text"] for p in probes] == ["", "", "", "MEMORY=", marker]
+    assert observed["paragraphs"]["text"] == "First paragraph\n\nSecond paragraph\nNext line"
     assert "".join(await _stream_probes(
         monkeypatch, probes, [marker], initial_count=observed["countsBefore"][0],
         phase1_counts=[observed["countsBefore"][1], observed["countsAfter"][1]],

@@ -1,0 +1,14 @@
+{
+  "messages": [
+    {
+      "role": "user",
+      "content": "Verwende beide ausgewählten Apps.\n\n1. Rufe über Hermes Memory MCP NoAuth das Tool get_poc_memory auf.\n2. Lies über GitHub aus rosterbrink-awp/Keystone auf Branch master die Datei global.json und ermittle daraus die SDK-Version.\n\nAntworte ausschließlich in genau diesem Format:\nMEMORY=<Marker>\nSDK=<Version>"
+    }
+  ],
+  "model": "auto",
+  "apps": [
+    "GitHub",
+    "Hermes Memory MCP NoAuth"
+  ],
+  "stream": true
+}

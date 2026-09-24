@@ -305,6 +305,13 @@ class ChatGPTDom:
                 )
         logger.info("Typed: %s", text[:80])
 
+    async def _type_app_query(self, query: str) -> None:
+        """Trigger mention handling with layout-independent keyboard text."""
+        d = self._driver
+        for char in query:
+            await d._cdp("Input.dispatchKeyEvent", {"type": "keyDown", "key": char, "text": char})
+            await d._cdp("Input.dispatchKeyEvent", {"type": "keyUp", "key": char})
+
     async def type_message_with_apps(self, text: str, apps: list[str]) -> None:
         """Rebuild the composer with ordered app chips, then append the prompt.
 
@@ -337,7 +344,7 @@ class ChatGPTDom:
                     raise SendReadinessError("No editable app composer found")
                 word = re.search(r"[^\W_]+", app_name)
                 query = (word.group() if word else app_name)[:3]
-                await d._cdp("Input.insertText", {"text": "@" + query})
+                await self._type_app_query("@" + query)
                 clicked = False
                 deadline = time.monotonic() + APP_MENTION_MAX_WAIT_S
                 while time.monotonic() < deadline:

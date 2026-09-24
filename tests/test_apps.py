@@ -1,5 +1,6 @@
 """App contract and send regressions; no live ChatGPT account required."""
 
+import asyncio
 import json
 import shutil
 import subprocess
@@ -7,6 +8,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import websockets
+from aiohttp import ClientSession
 from aiohttp.test_utils import TestClient, TestServer
 from pydantic import ValidationError
 
@@ -63,15 +66,15 @@ async def test_apps_selected_in_order_before_prompt_and_send(apps):
         events.append(("clear", text))
 
     async def cdp(method, params):
-        events.append((method, params["text"]))
+        events.append((method, params))
 
     results = iter([value for _ in apps for value in [True, "waiting", "clicked", "selected"]]
                    + [True, "https://chatgpt.com/c/test"])
 
     async def js(expr):
         result = next(results)
-        if result == "selected":
-            events.append(("chip", "confirmed"))
+        if result in ("clicked", "selected"):
+            events.append(("chip", result))
         return result
 
     async def click():
@@ -84,8 +87,13 @@ async def test_apps_selected_in_order_before_prompt_and_send(apps):
     _ = [chunk async for chunk in driver.send_and_stream("prompt", apps=apps)]
     expected = [("clear", "")]
     for app in apps:
-        expected.extend([("Input.insertText", "@" + app[:3]), ("chip", "confirmed")])
-    assert events == expected + [("Input.insertText", "prompt"), ("send", "")]
+        for char in "@" + app[:3]:
+            expected.extend([
+                ("Input.dispatchKeyEvent", {"type": "keyDown", "key": char, "text": char}),
+                ("Input.dispatchKeyEvent", {"type": "keyUp", "key": char}),
+            ])
+        expected.extend([("chip", "clicked"), ("chip", "selected")])
+    assert events == expected + [("Input.insertText", {"text": "prompt"}), ("send", "")]
 
 
 @pytest.mark.parametrize("clicked", [False, True], ids=["missing-suggestion", "click-without-chip"])
@@ -106,7 +114,8 @@ async def test_app_failure_prevents_prompt_and_send_and_closes_capture(monkeypat
     with pytest.raises(SendReadinessError, match="Missing App"):
         _ = [chunk async for chunk in driver.send_and_stream("prompt", apps=["Missing App"])]
     driver.click_send.assert_not_awaited()
-    driver._cdp.assert_awaited_once_with("Input.insertText", {"text": "@Mis"})
+    assert all(call.args[0] == "Input.dispatchKeyEvent" for call in driver._cdp.await_args_list)
+    assert "".join(call.args[1].get("text", "") for call in driver._cdp.await_args_list) == "@Mis"
     driver._capture_selector_diagnostic.assert_awaited_once()
     assert driver._identity_listener._active_scope is None
 
@@ -122,7 +131,8 @@ async def test_rate_limit_retry_rebuilds_apps_and_prompt(monkeypatch):
         events.append("clear")
 
     async def cdp(method, params):
-        events.append(params["text"])
+        if "text" in params:
+            events.append(params["text"])
 
     driver.type_message = clear
     driver._cdp = cdp
@@ -135,8 +145,76 @@ async def test_rate_limit_retry_rebuilds_apps_and_prompt(monkeypatch):
         return [chunk async for chunk in driver.send_and_stream("prompt", apps=["GitHub"])]
 
     await retry_on_rate_limit(driver, send, max_attempts=2)
-    assert events == ["clear", "@Git", "prompt"] * 2
+    assert events == ["clear", "@", "G", "i", "t", "prompt"] * 2
     assert driver.click_send.await_count == 2
+
+
+async def test_app_query_keyboard_events_in_local_contenteditable(tmp_path):
+    """Exercise real CDP input on an isolated blank page, without a ChatGPT session."""
+    chrome = shutil.which(Config().chrome.chrome_path)
+    if not chrome:
+        pytest.skip("Chrome is required for the local DOM regression")
+    profile = tmp_path / "chrome-profile"
+    driver = CDPDriver()
+    driver.reconnect = AsyncMock(side_effect=AssertionError("Local test must not reconnect"))
+    with (tmp_path / "chrome.log").open("w", encoding="utf-8") as log:
+        process = subprocess.Popen(
+            [chrome, "--headless", "--disable-gpu", "--disable-background-networking",
+             "--no-first-run", "--no-default-browser-check", "--remote-debugging-port=0",
+             f"--user-data-dir={profile}", "about:blank"],
+            stdout=log, stderr=subprocess.STDOUT,
+        )
+        try:
+            async with asyncio.timeout(15):
+                port_file = profile / "DevToolsActivePort"
+                while not port_file.exists() or not port_file.read_text().strip():
+                    assert process.poll() is None, "Local Chrome exited before CDP was ready"
+                    await asyncio.sleep(0.05)
+                port = int(port_file.read_text().splitlines()[0])
+                async with ClientSession() as client:
+                    async with client.get(f"http://127.0.0.1:{port}/json/list") as response:
+                        targets = await response.json()
+                target = next(t for t in targets if t.get("type") == "page" and t["url"] == "about:blank")
+                driver._ws = await websockets.connect(target["webSocketDebuggerUrl"])
+                driver._reader_task = asyncio.create_task(driver._reader_loop())
+                await driver._js_strict("""
+                    document.body.innerHTML = '<div id="editor" contenteditable="true"></div>';
+                    for (const type of ['keydown', 'keypress', 'keyup', 'beforeinput', 'input']) {
+                        editor.addEventListener(type, event => window.events.push({
+                            type, key: event.key, data: event.data, trusted: event.isTrusted,
+                            keyboard: event instanceof KeyboardEvent,
+                            input: event instanceof InputEvent
+                        }));
+                    }
+                    true;
+                """)
+                for query in ("@Git", "@Her", "@Äpp"):
+                    await driver._js_strict("editor.textContent = ''; window.events = []; editor.focus(); true;")
+                    await driver._dom._type_app_query(query)
+                    observed = json.loads(await driver._js_strict(
+                        "JSON.stringify({text: editor.textContent, events: window.events})"
+                    ))
+                    assert observed["text"] == query
+                    events = observed["events"]
+                    assert all(event["trusted"] for event in events)
+                    assert [(event["type"], event["key"]) for event in events if event["keyboard"]] == [
+                        (kind, char) for char in query for kind in ("keydown", "keypress", "keyup")
+                    ]
+                    assert [(event["type"], event["data"]) for event in events if event["input"]] == [
+                        (kind, char) for char in query for kind in ("beforeinput", "input")
+                    ]
+        finally:
+            if driver._reader_task:
+                driver._reader_task.cancel()
+                await asyncio.gather(driver._reader_task, return_exceptions=True)
+            if driver._ws:
+                await driver._ws.close()
+            process.terminate()
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=10)
 
 
 def transport_driver():
@@ -374,7 +452,10 @@ async def test_plain_div_app_suggestion_in_real_dom(
 
     driver._js_strict = capture_script
     await driver.type_message_with_apps("prompt", [app_name])
-    assert driver._cdp.await_args_list[0].args == ("Input.insertText", {"text": "@" + app_name[:3]})
+    calls = driver._cdp.await_args_list
+    assert all(call.args[0] == "Input.dispatchKeyEvent" for call in calls[:-1])
+    assert "".join(call.args[1].get("text", "") for call in calls[:-1]) == "@" + app_name[:3]
+    assert calls[-1].args == ("Input.insertText", {"text": "prompt"})
     fixture = tmp_path / "app-suggestion.html"
     fixture.write_text("""<!doctype html><html><body>
         <div id="prompt-textarea" role="textbox" contenteditable="true"

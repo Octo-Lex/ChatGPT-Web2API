@@ -490,7 +490,7 @@ class CompletionDetector:
                     # Only answer markdown is safe to stream. Raw innerText
                     # includes localized reasoning/status UI (live: aria-busy).
                     "  var md = last.querySelector('.markdown, [data-markdown-text-style=\"assistant-message\"]');"
-                    "  var mdText = md ? (md.textContent || '') : '';"
+                    "  var mdText = md ? (md.innerText || md.textContent || '') : '';"
                     "  var rawText = (last.innerText || '').trim();"
                     "  var text = mdText;"
                     "  var html_len = last.innerHTML.length;"
