@@ -332,12 +332,17 @@ async def test_app_without_captured_uuid_reconciles_wire_text():
     assert listener._active_scope is None
 
 
-@pytest.mark.parametrize("popup_attributes,suggestion_html", [
-    ('role="listbox"', 'Hermes Memory MCP NoAuth'),
+@pytest.mark.parametrize("popup_attributes,suggestion_html,app_name,click_selector", [
+    ('role="listbox"', 'Hermes Memory MCP NoAuth', 'Hermes Memory MCP NoAuth', '#suggestion'),
     ('class="popover"', '<div class="__menu-item"><span>Hermes Memory MCP NoAuth</span>'
-     '<span>Hermes Memory MCP NoAuth</span></div>'),
+     '<span>Hermes Memory MCP NoAuth</span></div>', 'Hermes Memory MCP NoAuth', '.__menu-item'),
+    ('class="suggestionMenu-XYZ composer-home-top-menu"',
+     '<button><span>GitHub</span><span>Triage PRs, issues, CI, and publish flows</span></button>',
+     'GitHub', 'button'),
 ])
-async def test_plain_div_app_suggestion_in_real_dom(tmp_path, popup_attributes, suggestion_html):
+async def test_plain_div_app_suggestion_in_real_dom(
+    tmp_path, popup_attributes, suggestion_html, app_name, click_selector,
+):
     """Run the generated selector in local Chrome; no ChatGPT session or network."""
     chrome = shutil.which(Config().chrome.chrome_path)
     if not chrome:
@@ -352,7 +357,8 @@ async def test_plain_div_app_suggestion_in_real_dom(tmp_path, popup_attributes, 
         return next(responses)
 
     driver._js_strict = capture_script
-    await driver.type_message_with_apps("prompt", ["Hermes Memory MCP NoAuth"])
+    await driver.type_message_with_apps("prompt", [app_name])
+    assert driver._cdp.await_args_list[0].args == ("Input.insertText", {"text": "@" + app_name[:3]})
     fixture = tmp_path / "app-suggestion.html"
     fixture.write_text("""<!doctype html><html><body>
         <div id="prompt-textarea" role="textbox" contenteditable="true"
@@ -360,16 +366,19 @@ async def test_plain_div_app_suggestion_in_real_dom(tmp_path, popup_attributes, 
         <div """ + popup_attributes + """ style="position:fixed;left:300px;top:280px;width:400px;height:110px">
             <div id="suggestion">""" + suggestion_html + """</div>
         </div>
-        <aside><div role="listbox"><div>Hermes Memory MCP NoAuth</div></div></aside>
+        <aside><div role="listbox"><div>""" + app_name + """</div></div></aside>
         <script>
         const scripts = """ + json.dumps(scripts) + """;
+        const name = """ + json.dumps(app_name) + """;
+        const clickTarget = document.querySelector(""" + json.dumps(click_selector) + """);
         const suggestion = document.getElementById('suggestion');
         let clicks = 0;
-        suggestion.onclick = () => {
+        suggestion.onclick = event => {
+            if (event.target !== clickTarget) return;
             clicks++;
             const chip = document.createElement('span');
             chip.contentEditable = 'false';
-            chip.textContent = 'Hermes Memory MCP NoAuth';
+            chip.textContent = name;
             document.getElementById('prompt-textarea').append(chip);
         };
         const result = [eval(scripts[0]), eval(scripts[1]), eval(scripts[2]), clicks];
