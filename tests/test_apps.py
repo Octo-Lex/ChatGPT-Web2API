@@ -242,13 +242,27 @@ async def test_app_metadata_does_not_change_identity_text_hash():
         scope.close()
 
 
-@pytest.mark.parametrize("apps,wire_text", [
-    (None, "prompt"),
-    (["Hermes Memory MCP NoAuth"], "@Hermes Memory MCP NoAuth prompt"),
-    (["GitHub", "Hermes Memory MCP NoAuth"], "@GitHub @Hermes Memory MCP NoAuth prompt"),
+APP_PROMPT = "[User]\nVerwende beide ausgewählten Apps.\n\n1. Test\nMEMORY=<Marker>"
+APP_SERIALIZED_PROMPT = "[User]\nVerwende beide ausgewählten Apps.\n\n1\\. Test\nMEMORY=\\<Marker>"
+APP_LINKS = (
+    "[$github](app://connector_76869538009648d5b282a4bb21c3d157)"
+    "[$hermes-memory-mcp-noauth](app://asdk_app_6ab28256fde8819197fa5c529d311f41)"
+)
+
+
+@pytest.mark.parametrize("apps,prefix", [
+    (None, ""),
+    ([], ""),
+    (["Hermes Memory MCP NoAuth"],
+     "[$hermes-memory-mcp-noauth](app://asdk_app_6ab28256fde8819197fa5c529d311f41)"),
+    (["GitHub", "Hermes Memory MCP NoAuth"], APP_LINKS),
 ])
-async def test_app_wire_text_used_for_uuid_capture_and_fallback_anchor(apps, wire_text):
-    """Live POST (2026-09-23): app names prefix the string part, not just metadata."""
+@pytest.mark.parametrize("logical,serialized", [
+    (APP_PROMPT, APP_SERIALIZED_PROMPT),
+    ("Cafe\u0301\r\n1. Test  ", "Café\n1\\. Test"),
+])
+async def test_app_serialization_captures_uuid_with_logical_anchor(apps, prefix, logical, serialized):
+    """Observed app links/Markdown escapes must match the logical send text."""
     driver = send_driver()
     driver.type_message_with_apps = AsyncMock()
     listener = driver._identity_listener = IdentityListener(driver)
@@ -258,7 +272,7 @@ async def test_app_wire_text_used_for_uuid_capture_and_fallback_anchor(apps, wir
     async def click():
         body = {"action": "next", "messages": [{
             "id": message_id, "author": {"role": "user"},
-            "content": {"content_type": "text", "parts": [wire_text]},
+            "content": {"content_type": "text", "parts": [prefix + serialized]},
         }]}
         await listener._process_send_post(listener._active_scope, {"params": {
             "request": {"postData": json.dumps(body)},
@@ -266,19 +280,19 @@ async def test_app_wire_text_used_for_uuid_capture_and_fallback_anchor(apps, wir
 
     async def complete(**kwargs):
         anchor = kwargs["turn_anchor"]
-        assert anchor.sent_text == wire_text
+        assert anchor.sent_text == logical
         assert anchor.captured_user_message_id == message_id
         yield StreamChunk(delta="OK")
 
     driver.click_send = click
     driver._completion.stream_until_complete = complete
-    _ = [chunk async for chunk in driver.send_and_stream("prompt", apps=apps)]
+    _ = [chunk async for chunk in driver.send_and_stream(logical, apps=apps)]
     assert listener.capture_success_count == 1
     assert listener._active_scope is None
     driver._verify_send_acknowledged.assert_not_awaited()
 
 
-async def test_app_without_captured_uuid_reconciles_wire_text():
+async def test_app_without_captured_uuid_reconciles_serialized_text():
     from chatgpt_web2api.turn_anchor import select_text_for_turn
 
     driver = send_driver()
@@ -287,8 +301,9 @@ async def test_app_without_captured_uuid_reconciles_wire_text():
     listener = driver._identity_listener = IdentityListener(driver)
     listener._ready = True
     listener.wait_for_captured_uuid = AsyncMock(return_value=None)
-    prompt = "[User]\nRufe get_poc_memory auf."
-    wire_text = "@Hermes Memory MCP NoAuth " + prompt
+    apps = ["GitHub", "Hermes Memory MCP NoAuth"]
+    prompt = APP_PROMPT
+    wire_text = APP_LINKS + APP_SERIALIZED_PROMPT
     marker = "POC0_MEMORY_MARKER_7F2A"
 
     def turn(suffix, timestamp, answer):
@@ -311,10 +326,11 @@ async def test_app_without_captured_uuid_reconciles_wire_text():
         assert conv_id == "test"
         assert anchor.captured_user_message_id is None
         assert anchor.mode == "existing_conversation"
-        assert anchor.sent_text == wire_text
+        assert anchor.sent_text == prompt
         result = select_text_for_turn(projection, anchor)
         assert result.status == "matched", result.diagnostic
         assert result.text == marker
+        assert result.diagnostic["assistant_node"] == "a-new"
         return result
 
     async def complete(**kwargs):
@@ -324,9 +340,9 @@ async def test_app_without_captured_uuid_reconciles_wire_text():
 
     driver._fetch_text_for_turn = fetch
     driver._completion.stream_until_complete = complete
-    chunks = [c async for c in driver.send_and_stream(prompt, apps=["Hermes Memory MCP NoAuth"])]
+    chunks = [c async for c in driver.send_and_stream(prompt, apps=apps)]
     assert "".join(c.delta for c in chunks) == marker
-    driver.type_message_with_apps.assert_awaited_once_with(prompt, ["Hermes Memory MCP NoAuth"])
+    driver.type_message_with_apps.assert_awaited_once_with(prompt, apps)
     driver.click_send.assert_awaited_once()
     listener.wait_for_captured_uuid.assert_awaited_once()
     assert listener._active_scope is None

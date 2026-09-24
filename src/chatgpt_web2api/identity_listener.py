@@ -36,6 +36,8 @@ import logging
 import re
 from dataclasses import dataclass
 
+from .turn_anchor import canonicalize_user_text
+
 logger = logging.getLogger(__name__)
 
 
@@ -347,7 +349,7 @@ class IdentityListener:
             parts = (m0.get("content") or {}).get("parts") or []
             body_text = "\n".join(str(p) for p in parts if isinstance(p, str))
             if body_text:
-                body_hash = hashlib.sha256(body_text.encode("utf-8")).hexdigest()
+                body_hash = hash_sent_text(canonicalize_user_text(body_text))
                 if body_hash != scope.expected_text_hash:
                     # Text doesn't match — could be a different send (retry,
                     # regenerate). Don't resolve; leave scope open.
@@ -392,8 +394,7 @@ class IdentityListener:
 def hash_sent_text(text: str) -> str:
     """Stable SHA-256 hash of the sent prompt, for capture validation.
 
-    The hash is computed over the *raw* sent text (before any normalization)
-    because the POST body carries the raw text. Used by the capture scope to
-    validate a POST belongs to this send (failure-mode D).
+    Hashes the supplied text unchanged. Callers normalize logical text or
+    canonicalize observed POST text before hashing (failure-mode D).
     """
     return hashlib.sha256(text.encode("utf-8")).hexdigest()

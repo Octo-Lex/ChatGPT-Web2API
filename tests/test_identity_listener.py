@@ -16,6 +16,7 @@ from chatgpt_web2api.identity_listener import (
     IdentityListener,
     hash_sent_text,
 )
+from chatgpt_web2api.turn_anchor import normalize_text
 
 
 def _make_driver():
@@ -120,6 +121,54 @@ async def test_wrong_text_hash_does_not_resolve():
         # Should NOT resolve; scope stays open.
         uuid = await listener.wait_for_captured_uuid(timeout=0.2)
         assert uuid is None  # timeout
+    finally:
+        scope.close()
+
+
+@pytest.mark.parametrize("logical,serialized", [
+    ("[User]\nVerwende beide ausgewählten Apps.\n\n1. Test\nMEMORY=<Marker>",
+     "[$github](app://connector_76869538009648d5b282a4bb21c3d157)"
+     "[$hermes-memory-mcp-noauth](app://asdk_app_6ab28256fde8819197fa5c529d311f41)"
+     "[User]\nVerwende beide ausgewählten Apps.\n\n1\\. Test\nMEMORY=\\<Marker>"),
+    ("Café\n1. Test", "[$app](app://any-id)Cafe\u0301\r\n1\\. Test"),
+    (r"Literal \* and C:\temp", r"Literal \\\* and C:\\temp"),
+])
+async def test_serialized_user_text_captures_logical_prompt(logical, serialized):
+    listener = IdentityListener(_make_driver())
+    scope = listener.arm_capture_scope(
+        expected_text_hash=hash_sent_text(normalize_text(logical)),
+        conversation_id="conv-1", target_id="tgt-1",
+    )
+    try:
+        await listener._process_send_post(
+            scope, _make_send_event(text=serialized),
+            "https://chatgpt.com/backend-api/f/conversation",
+        )
+        assert await listener.wait_for_captured_uuid(timeout=0.1) == "11111111-1111-4111-8111-111111111111"
+    finally:
+        scope.close()
+
+
+@pytest.mark.parametrize("serialized", [
+    "[$app](app://any-id)different prompt",
+    "[docs](https://example.org)our prompt",
+    "[$app](https://example.org)our prompt",
+    "prefix [$app](app://any-id)our prompt",
+    "[$app](app://any-id)",
+])
+async def test_canonicalization_does_not_capture_foreign_prompt(serialized):
+    listener = IdentityListener(_make_driver())
+    scope = listener.arm_capture_scope(
+        expected_text_hash=hash_sent_text("our prompt"),
+        conversation_id="conv-1", target_id="tgt-1",
+    )
+    try:
+        await listener._process_send_post(
+            scope, _make_send_event(text=serialized),
+            "https://chatgpt.com/backend-api/f/conversation",
+        )
+        assert not scope.future.done()
+        assert listener.capture_success_count == 0
     finally:
         scope.close()
 

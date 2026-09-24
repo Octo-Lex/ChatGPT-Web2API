@@ -19,12 +19,17 @@ Fix 2: include last_result.diagnostic in TurnReconciliationError.
 """
 
 import asyncio
+import html
 import json
+import re
+import shutil
+import subprocess
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from chatgpt_web2api.cdp_driver import CDPDriver, SendReadinessError
+from chatgpt_web2api.config import Config
 from chatgpt_web2api.turn_anchor import TurnReconciliationError, TurnTextResult
 
 
@@ -202,3 +207,59 @@ async def test_missing_composer_returns_none_not_false():
     assert result is None, (
         f"Missing composer should return None (inconclusive), got {result!r}"
     )
+
+
+@pytest.mark.parametrize("attributes", [
+    'data-message-author-role="user"',
+    'data-markdown-text-tone="user-message"',
+    'class="rich-text-user-turn"',
+    'data-markdown-text-tone="user-message" class="other rich-text-user-turn"',
+    'data-message-author-role="user" data-markdown-text-tone="user-message" class="rich-text-user-turn"',
+])
+async def test_user_count_baseline_and_acknowledgment_in_real_dom(tmp_path, attributes):
+    """Execute both production probes in isolated local Chrome, without ChatGPT."""
+    chrome = shutil.which(Config().chrome.chrome_path)
+    if not chrome:
+        pytest.skip("Chrome is required for the local DOM regression")
+    driver = _make_driver()
+    driver._js_strict = AsyncMock(side_effect=[0, 1])
+    assert await driver._read_assistant_count_baseline() == 0
+    assert driver._pre_send_user_count == 1
+    baseline_js = driver._js_strict.await_args_list[1].args[0]
+    driver._js_strict = AsyncMock(return_value=json.dumps({
+        "userCount": 2, "composerPresent": True, "composerEmpty": True,
+    }))
+    assert await driver._verify_send_acknowledged() is True
+    ack_js = driver._js_strict.await_args.args[0]
+
+    fixture = tmp_path / "user-turn.html"
+    fixture.write_text("""<!doctype html><html><body>
+        <div id="prompt-textarea" role="textbox" contenteditable="true"></div>
+        <div id="user-turn" """ + attributes + """>Existing user message</div>
+        <script>
+        const baseline = """ + json.dumps(baseline_js) + """;
+        const acknowledgment = """ + json.dumps(ack_js) + """;
+        const before = [eval(baseline), JSON.parse(eval(acknowledgment))];
+        const nextTurn = document.getElementById('user-turn').cloneNode(true);
+        nextTurn.removeAttribute('id');
+        document.body.append(nextTurn);
+        const after = [eval(baseline), JSON.parse(eval(acknowledgment))];
+        const output = document.createElement('pre');
+        output.id = 'result'; output.textContent = JSON.stringify([before, after]);
+        document.body.append(output);
+        </script></body></html>""", encoding="utf-8")
+    result = subprocess.run(
+        [chrome, "--headless", "--disable-gpu", "--disable-background-networking",
+         "--no-first-run", "--no-default-browser-check",
+         f"--user-data-dir={tmp_path / 'chrome-profile'}", "--dump-dom", fixture.as_uri()],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    output = re.search(r'<pre id="result">(.*?)</pre>', result.stdout, re.DOTALL)
+    assert output, result.stdout + result.stderr
+    before, after = json.loads(html.unescape(output.group(1)))
+    assert before[0] == before[1]["userCount"] == 1
+    assert after[0] == after[1]["userCount"] == 2  # overlapping selectors count each node once
+    driver._pre_send_user_count = before[0]
+    driver._js_strict = AsyncMock(return_value=json.dumps(after[1]))
+    assert await driver._verify_send_acknowledged() is True

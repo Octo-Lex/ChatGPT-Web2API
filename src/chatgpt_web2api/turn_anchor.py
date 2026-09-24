@@ -42,6 +42,8 @@ from __future__ import annotations
 # can still pass). For rapid same-text repeats, the selector returns ``ambiguous``
 # or ``not_ready`` rather than silently picking. Env-overridable for canary tuning.
 import os as _os
+import re
+import string
 import unicodedata
 from dataclasses import dataclass, field, replace
 from typing import Literal
@@ -207,6 +209,18 @@ def normalize_text(s: str) -> str:
     return s.strip()
 
 
+def canonicalize_user_text(text: str) -> str:
+    """Recover logical text from ChatGPT's user-message Markdown for matching.
+
+    Strip only leading app prompt-links, then undo one layer of Markdown
+    escapes of ASCII punctuation. Keep ordinary/embedded links and literal
+    backslashes before non-punctuation. Sent logical text must not be decoded.
+    """
+    text = re.sub(r"\A(?:\[\$[^\]\r\n]+\]\(app://[^)\s]+\)[ \t\r\n]*)+", "", text)
+    text = re.sub(r"\\([" + re.escape(string.punctuation) + r"])", r"\1", text)
+    return normalize_text(text)
+
+
 def user_text_matches_sent(parent_text: str, sent_text: str) -> bool:
     """Does a backend user-node's text match the sent prompt?
 
@@ -217,7 +231,7 @@ def user_text_matches_sent(parent_text: str, sent_text: str) -> bool:
     - No tiny prefixes — agent prompts share long boilerplate prefixes, so a
       short shared prefix is not distinctive enough to match on.
     """
-    p = normalize_text(parent_text)
+    p = canonicalize_user_text(parent_text)
     s = normalize_text(sent_text)
     if not p or not s:
         return False

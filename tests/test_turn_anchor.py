@@ -5,11 +5,14 @@ no real browser — operates on synthetic projected mappings.
 """
 from __future__ import annotations
 
+import string
+
 import pytest
 
 from chatgpt_web2api.turn_anchor import (
     TurnAnchor,
     TurnEndResult,
+    canonicalize_user_text,
     collapse_to_end_turn_status,
     normalize_text,
     select_end_turn_for_turn,
@@ -386,3 +389,43 @@ class TestNormalize:
 
     def test_crlf_to_lf(self):
         assert normalize_text("a\r\nb\rc") == "a\nb\nc"
+
+
+class TestCanonicalizeUserText:
+    @pytest.mark.parametrize("separator", ["", "\r\n", " \n"])
+    def test_app_links_and_markdown_escapes(self, separator):
+        serialized = separator.join([
+            "[$github](app://connector_76869538009648d5b282a4bb21c3d157)",
+            "[$hermes-memory-mcp-noauth](app://asdk_app_6ab28256fde8819197fa5c529d311f41)",
+            "[User]\nVerwende beide ausgewählten Apps.\n\n1\\. Test\nMEMORY=\\<Marker>",
+        ])
+        logical = "[User]\nVerwende beide ausgewählten Apps.\n\n1. Test\nMEMORY=<Marker>"
+        assert canonicalize_user_text(serialized) == logical
+        assert user_text_matches_sent(serialized, logical)
+        assert not user_text_matches_sent(serialized, "fremder Prompt")
+
+    @pytest.mark.parametrize("text", [
+        "[docs](https://example.org)prompt",
+        "[$label](https://example.org)prompt",
+        "[label](app://connector_test)prompt",
+        "before [$label](app://connector_test)prompt",
+        "[$label](app://connector_test)",
+    ])
+    def test_only_leading_app_prompt_links_are_removed(self, text):
+        assert not user_text_matches_sent(text, "prompt")
+        if not text.startswith("[$label](app://"):
+            assert canonicalize_user_text(text) == text
+
+    def test_escaped_literal_app_link_is_not_removed(self):
+        logical = "[$label](app://connector_test)prompt"
+        serialized = r"\[$label\]\(app://connector_test\)prompt"
+        assert canonicalize_user_text(serialized) == logical
+
+    def test_one_layer_of_ascii_punctuation_escapes(self):
+        assert canonicalize_user_text("".join("\\" + c for c in string.punctuation)) == string.punctuation
+        assert canonicalize_user_text(r"C:\temp\file\n \é") == r"C:\temp\file\n \é"
+        assert user_text_matches_sent(r"\\\*", r"\*")
+        assert not user_text_matches_sent(r"\*", r"\*")  # logical text must not be decoded
+
+    def test_existing_normalization_is_preserved(self):
+        assert canonicalize_user_text("[$app](app://id)Cafe\u0301\r\n1\\. Test\u200b  ") == "Café\n1. Test"

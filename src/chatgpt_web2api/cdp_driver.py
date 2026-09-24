@@ -72,6 +72,13 @@ from .completion_detector import (  # noqa: E402,F401
 # matches ``navigate_new_chat``.
 _CONNECT_READY_TIMEOUT = 10
 
+# Shared by the pre-send baseline and acknowledgment probe. querySelectorAll
+# deduplicates a node even when it matches multiple selectors in this list.
+_USER_MESSAGE_SELECTOR = (
+    '[data-message-author-role="user"], '
+    '[data-markdown-text-tone="user-message"], .rich-text-user-turn'
+)
+
 # ChatGPT composer / send-button selectors.
 #
 # Canonical home moved to chatgpt_dom.py in Phase 5 PR3; re-exported here for
@@ -1508,7 +1515,7 @@ class CDPDriver:
         )
         user_selector = (
             "document.querySelectorAll("
-            "'[data-message-author-role=\"user\"]'"
+            f"'{_USER_MESSAGE_SELECTOR}'"
             ").length"
         )
         max_attempts = 3
@@ -1614,7 +1621,7 @@ class CDPDriver:
                 result = await self._js_strict(
                     "(function() {"
                     "  var userMsgs = document.querySelectorAll("
-                    "    '[data-message-author-role=\"user\"]').length;"
+                    f"    '{_USER_MESSAGE_SELECTOR}').length;"
                     f"  var composer = document.querySelector('{COMPOSER_SELECTOR}')"
                     f"       || document.querySelector('{COMPOSER_FALLBACK_SELECTOR}');"
                     "  var composerPresent = !!composer;"
@@ -1747,7 +1754,7 @@ class CDPDriver:
            terminal path — success, timeout, exception, cancellation).
         """
         from .identity_listener import hash_sent_text
-        from .turn_anchor import TurnReconciliationError
+        from .turn_anchor import TurnReconciliationError, normalize_text
 
         # PR4 belt-and-suspenders: refuse to mutate the DOM in parallel mode.
         self._assert_owned_tab_required()
@@ -1762,13 +1769,11 @@ class CDPDriver:
         # A2 Step 3+4: arm capture scope + build fallback anchor.
         # The fallback anchor captures pre-send state (backend node-ids/times
         # or wall-clock) for dual-anchor correlation if UUID capture fails.
-        # Live POST: app chips prefix the string part as "@Display Name ".
-        # Both correlation paths must match it; the composer still gets logical text.
-        wire_text = "".join(f"@{app} " for app in apps) + text if apps else text
-        fallback_anchor = await self._capture_pre_send_fallback_anchor(wire_text)
+        # Correlate logical text; the listener/matcher decode observed serialization.
+        fallback_anchor = await self._capture_pre_send_fallback_anchor(text)
         if self._identity_listener is not None and self._identity_listener.is_alive():
             capture_scope = self._identity_listener.arm_capture_scope(
-                expected_text_hash=hash_sent_text(wire_text),
+                expected_text_hash=hash_sent_text(normalize_text(text)),
                 conversation_id=self._current_conv_id,
                 target_id=self._target_id,
             )
