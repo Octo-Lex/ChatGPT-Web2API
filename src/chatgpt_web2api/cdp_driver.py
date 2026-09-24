@@ -55,6 +55,7 @@ from .backend_client import TOKEN_TTL_SECONDS  # noqa: E402,F401
 # (is_rate_limited_text is imported from cdp_driver by api_server, chatgpt_dom,
 # and tests). _RATE_LIMIT_PHRASES stays private to completion_detector.
 from .completion_detector import (  # noqa: E402,F401
+    ASSISTANT_ROOT_SELECTOR,
     PHASE_STALL_SECONDS,
     is_rate_limited_text,
 )
@@ -1510,7 +1511,7 @@ class CDPDriver:
 
         selector = (
             "document.querySelectorAll("
-            "'[data-message-author-role=\"assistant\"]'"
+            f"'{ASSISTANT_ROOT_SELECTOR}'"
             ").length"
         )
         user_selector = (

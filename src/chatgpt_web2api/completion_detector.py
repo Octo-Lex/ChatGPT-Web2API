@@ -75,6 +75,13 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Shared with the pre-send baseline; overlapping selectors count each root once.
+ASSISTANT_ROOT_SELECTOR = (
+    '[data-message-author-role="assistant"], '
+    '[data-chatgpt-search-unit-key$=":assistant"], '
+    '[data-content-search-unit-key$=":assistant"]'
+)
+
 
 # A generation is considered "stuck" (vs. merely slow) if no DOM progress
 # signal occurs within this window. Slow-but-progressing generations
@@ -377,7 +384,7 @@ class CompletionDetector:
 
             try:
                 raw = await d._js_strict(
-                    "document.querySelectorAll('[data-message-author-role=\"assistant\"]').length"
+                    f"document.querySelectorAll('{ASSISTANT_ROOT_SELECTOR}').length"
                 )
                 current_count = int(raw or 0)
             except CDPJSError:
@@ -475,14 +482,14 @@ class CompletionDetector:
             try:
                 result = await d._js_strict(
                     "(function() {"
-                    "  var msgs = document.querySelectorAll('[data-message-author-role=\"assistant\"]');"
+                    f"  var msgs = document.querySelectorAll('{ASSISTANT_ROOT_SELECTOR}');"
                     # Tool transitions can temporarily remove the new message.
                     # Never fall back to the previous turn's assistant node.
                     f"  if (msgs.length <= {initial_count}) return JSON.stringify({{text:'', md_text:'', html_len:0, child_count:0, has_action:false, is_thinking:false}});"
                     "  var last = msgs[msgs.length - 1];"
                     # Only answer markdown is safe to stream. Raw innerText
                     # includes localized reasoning/status UI (live: aria-busy).
-                    "  var md = last.querySelector('.markdown');"
+                    "  var md = last.querySelector('.markdown, [data-markdown-text-style=\"assistant-message\"]');"
                     "  var mdText = md ? (md.textContent || '') : '';"
                     "  var rawText = (last.innerText || '').trim();"
                     "  var text = mdText;"

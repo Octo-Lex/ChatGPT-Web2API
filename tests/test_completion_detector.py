@@ -246,7 +246,7 @@ def importlib_import_module(name):
     return importlib.import_module(name)
 
 
-async def _stream_probes(monkeypatch, probes, backend_texts):
+async def _stream_probes(monkeypatch, probes, backend_texts, *, initial_count=1, phase1_counts=(2,)):
     """Exercise the detector and final reconciliation with a virtual clock."""
     driver = CDPDriver()
     clock = [100.0]
@@ -256,11 +256,12 @@ async def _stream_probes(monkeypatch, probes, backend_texts):
         clock[0] += seconds
 
     monkeypatch.setattr("chatgpt_web2api.completion_detector.asyncio.sleep", sleep)
-    driver._read_assistant_count_baseline = AsyncMock(return_value=1)
+    driver._read_assistant_count_baseline = AsyncMock(return_value=initial_count)
     driver._verify_send_acknowledged = AsyncMock(return_value=True)
     driver.type_message = AsyncMock()
     driver.click_send = AsyncMock()
     index = 0
+    counts = iter(phase1_counts)
 
     async def js(expr):
         nonlocal index
@@ -272,7 +273,7 @@ async def _stream_probes(monkeypatch, probes, backend_texts):
             return '{"text":""}'
         if "location.href" in expr:
             return "https://chatgpt.com/c/real-conversation"
-        return 2
+        return next(counts)
 
     async def end_turn(*args, **kwargs):
         return TurnEndResult(status="matched" if index >= len(probes) else "not_ready")
@@ -302,7 +303,20 @@ async def test_reconciliation_waits_for_matching_prefix(monkeypatch):
     ]
 
 
-async def test_reasoning_dom_and_source_switch_emit_only_answer(monkeypatch, tmp_path):
+@pytest.mark.parametrize("root_attributes,markdown_attributes", [
+    ('data-message-author-role="assistant"', 'class="markdown"'),
+    ('data-chatgpt-search-unit-key="fallback-turn-0:2:assistant"',
+     'data-markdown-text-style="assistant-message"'),
+    ('data-content-search-unit-key="fallback-turn-0:2:assistant"',
+     'data-markdown-text-style="assistant-message"'),
+    ('data-chatgpt-search-unit-key="fallback-turn-0:2:assistant" '
+     'data-content-search-unit-key="fallback-turn-0:2:assistant"',
+     'data-markdown-text-style="assistant-message"'),
+])
+@pytest.mark.parametrize("initial_count", [0, 1], ids=["fresh-chat", "existing-chat"])
+async def test_reasoning_dom_and_source_switch_emit_only_answer(
+    monkeypatch, tmp_path, root_attributes, markdown_attributes, initial_count,
+):
     """Execute the real probe JS against the observed German aria-busy DOM.
 
     Also cover a disappearing tool placeholder and raw-text -> markdown switch.
@@ -312,42 +326,59 @@ async def test_reasoning_dom_and_source_switch_emit_only_answer(monkeypatch, tmp
     if not chrome:
         pytest.skip("Chrome is required for the local DOM regression")
     detector, driver = _make_detector()
-    scripts = []
+    scripts = {}
+    baseline_driver = CDPDriver()
+    baseline_driver._js_strict = AsyncMock(side_effect=[initial_count, 0])
+    assert await baseline_driver._read_assistant_count_baseline() == initial_count
+    scripts["baseline"] = baseline_driver._js_strict.await_args_list[0].args[0]
 
     async def capture(expr):
         if "has_action" in expr:
-            scripts.append(expr)
+            scripts["phase2"] = expr
             return '{"text":"answer","md_text":"answer","has_action":true}'
         if "body.innerText" in expr:
             return '{"text":""}'
-        return 2
+        scripts["phase1"] = expr
+        return initial_count + 1
 
     driver._js_strict = capture
     _ = [c async for c in detector.stream_until_complete(
-        initial_count=1, timeout=5, turn_anchor=TurnAnchor(sent_text="test", mode="fresh_chat"),
+        initial_count=initial_count, timeout=5, turn_anchor=TurnAnchor(sent_text="test", mode="fresh_chat"),
     )]
-    marker = "POC0_MEMORY_MARKER_7F2A"
+    marker = "MEMORY=POC0_MEMORY_MARKER_7F2A\nSDK=10.0.100"
     fixture = tmp_path / "reasoning.html"
     fixture.write_text("""<!doctype html><html><body>
-        <div data-message-author-role="assistant"><div class="markdown">STALE</div></div>
-        <div id="new" data-message-author-role="assistant"></div>
+        <h4 data-conversation-role="assistant">Heading alone is not a message root</h4>
+        <div id="previous" """ + root_attributes + """><div """ + markdown_attributes + """>STALE</div></div>
+        <div id="new" """ + root_attributes + """></div>
         <script>
-        const probe = """ + json.dumps(scripts[0]) + """;
+        const scripts = """ + json.dumps(scripts) + """;
+        const initialCount = """ + json.dumps(initial_count) + """;
+        const markdownAttributes = """ + json.dumps(markdown_attributes) + """;
+        const marker = """ + json.dumps(marker) + """;
+        if (!initialCount) document.getElementById('previous').remove();
         const current = document.getElementById('new');
+        current.remove();
+        const countsBefore = [eval(scripts.baseline), eval(scripts.phase1)];
+        document.body.append(current);
+        const countsAfter = [eval(scripts.baseline), eval(scripts.phase1)];
         const states = [
           '<div aria-busy="true"><div class="loading-shimmer-tertiary">Denkt nach ...</div></div>',
           null,
-          '<div>Zwischenstand A</div><div class="markdown"></div>',
-          '<div class="markdown">PO</div>',
-          '<div class="markdown">POC0_MEMORY_MARKER_7F2A</div>'
+          '<div>Zwischenstand A</div><div ' + markdownAttributes + '></div>',
+          '<div ' + markdownAttributes + '>MEMORY=</div>',
+          '<div ' + markdownAttributes + '>' + marker + '</div>'
         ];
         const results = states.map(state => {
           if (state === null) current.remove();
-          else { document.body.append(current); current.innerHTML = state; }
-          return JSON.parse(eval(probe));
+          else {
+            document.body.append(current);
+            current.innerHTML = '<h4 data-conversation-role="assistant">Assistant heading</h4>' + state;
+          }
+          return JSON.parse(eval(scripts.phase2));
         });
         const output = document.createElement('pre');
-        output.id = 'result'; output.textContent = JSON.stringify(results);
+        output.id = 'result'; output.textContent = JSON.stringify({countsBefore, countsAfter, results});
         document.body.append(output);
         </script></body></html>""", encoding="utf-8")
     result = subprocess.run(
@@ -359,7 +390,13 @@ async def test_reasoning_dom_and_source_switch_emit_only_answer(monkeypatch, tmp
     assert result.returncode == 0, result.stderr
     output = re.search(r'<pre id="result">(.*?)</pre>', result.stdout, re.DOTALL)
     assert output, result.stdout + result.stderr
-    probes = json.loads(html.unescape(output.group(1)))
+    observed = json.loads(html.unescape(output.group(1)))
+    assert observed["countsBefore"] == [initial_count, initial_count]
+    assert observed["countsAfter"] == [initial_count + 1, initial_count + 1]
+    probes = observed["results"]
     assert probes[0]["is_thinking"] is True
-    assert [p["text"] for p in probes] == ["", "", "", "PO", marker]
-    assert "".join(await _stream_probes(monkeypatch, probes, [marker])) == marker
+    assert [p["text"] for p in probes] == ["", "", "", "MEMORY=", marker]
+    assert "".join(await _stream_probes(
+        monkeypatch, probes, [marker], initial_count=observed["countsBefore"][0],
+        phase1_counts=[observed["countsBefore"][1], observed["countsAfter"][1]],
+    )) == marker
