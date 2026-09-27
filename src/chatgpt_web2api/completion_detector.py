@@ -377,7 +377,7 @@ class CompletionDetector:
 
             try:
                 raw = await d._js_strict(
-                    "document.querySelectorAll('[data-message-author-role=\"assistant\"]').length"
+                    "document.querySelectorAll('[data-message-author-role=\"assistant\"], [data-content-search-unit-key$=\":assistant\"], [data-chatgpt-search-unit-key$=\":assistant\"]').length"
                 )
                 current_count = int(raw or 0)
             except CDPJSError:
@@ -474,7 +474,7 @@ class CompletionDetector:
             try:
                 result = await d._js_strict(
                     "(function() {"
-                    "  var msgs = document.querySelectorAll('[data-message-author-role=\"assistant\"]');"
+                    "  var msgs = document.querySelectorAll('[data-message-author-role=\"assistant\"], [data-content-search-unit-key$=\":assistant\"], [data-chatgpt-search-unit-key$=\":assistant\"]');"
                     "  if (!msgs.length) return JSON.stringify({text:'', md_text:'', html_len:0, child_count:0, has_action:false, is_thinking:false});"
                     "  var last = msgs[msgs.length - 1];"
                     # Text: the clean answer lives in ``.markdown`` textContent.

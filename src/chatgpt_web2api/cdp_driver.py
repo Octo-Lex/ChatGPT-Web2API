@@ -1499,12 +1499,12 @@ class CDPDriver:
 
         selector = (
             "document.querySelectorAll("
-            "'[data-message-author-role=\"assistant\"]'"
+            "'[data-message-author-role=\"assistant\"], [data-content-search-unit-key$=\":assistant\"], [data-chatgpt-search-unit-key$=\":assistant\"]'"
             ").length"
         )
         user_selector = (
             "document.querySelectorAll("
-            "'[data-message-author-role=\"user\"]'"
+            "'[data-message-author-role=\"user\"], [data-content-search-unit-key$=\":user\"], [data-chatgpt-search-unit-key$=\":user\"]'"
             ").length"
         )
         max_attempts = 3
@@ -1610,7 +1610,7 @@ class CDPDriver:
                 result = await self._js_strict(
                     "(function() {"
                     "  var userMsgs = document.querySelectorAll("
-                    "    '[data-message-author-role=\"user\"]').length;"
+                    "    '[data-message-author-role=\"user\"], [data-content-search-unit-key$=\":user\"], [data-chatgpt-search-unit-key$=\":user\"]').length;"
                     f"  var composer = document.querySelector('{COMPOSER_SELECTOR}')"
                     f"       || document.querySelector('{COMPOSER_FALLBACK_SELECTOR}');"
                     "  var composerPresent = !!composer;"

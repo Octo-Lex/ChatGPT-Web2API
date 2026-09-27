@@ -34,13 +34,13 @@ class TestProjectionConstant:
 
     def test_js_fetches_correct_endpoint(self):
         assert "/backend-api/conversation/" in CONVERSATION_PROJECTION_JS
-        assert "offset=0" in CONVERSATION_PROJECTION_JS
-        assert "limit=" in CONVERSATION_PROJECTION_JS
+        assert "?offset=" not in CONVERSATION_PROJECTION_JS
+        assert "&limit=" not in CONVERSATION_PROJECTION_JS
 
     def test_js_threads_data_slots(self):
         assert "__D.conv_id" in CONVERSATION_PROJECTION_JS
         assert "__D.token" in CONVERSATION_PROJECTION_JS
-        assert "__D.limit" in CONVERSATION_PROJECTION_JS
+        assert "__D.limit" not in CONVERSATION_PROJECTION_JS
 
     def test_js_status_decode(self):
         assert "__status" in CONVERSATION_PROJECTION_JS

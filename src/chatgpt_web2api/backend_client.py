@@ -276,7 +276,7 @@ class BackendClient:
         on 401 (with breaker trip), ``_Transient404`` on 404, ``RuntimeError``
         on other non-OK status, and ``CDPJSError`` on transport failure.
         """
-        from .backend_projection import CONVERSATION_PROJECTION_JS, TURN_PROJECTION_LIMIT
+        from .backend_projection import CONVERSATION_PROJECTION_JS
         from .cdp_driver import AuthExpiredError, CDPJSError
 
         d = self._driver
@@ -286,7 +286,6 @@ class BackendClient:
             {
                 "conv_id": conversation_id,
                 "token": d._access_token,
-                "limit": TURN_PROJECTION_LIMIT,
             },
             timeout=15,
         )
