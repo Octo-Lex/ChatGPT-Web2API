@@ -450,7 +450,11 @@ class ChatGPTDom:
                 break
             await asyncio.sleep(SEND_BUTTON_POLL_INTERVAL_S)
 
-        result = await d._js(
+        # #51: the click is a MUTATION — it goes through _js_mutation (sent
+        # exactly once, never replayed across a reconnect; an ambiguous
+        # outcome raises SendOutcomeUnknownError). The readiness POLL above
+        # stays on _js (a read — reconnect-retry is safe there).
+        result = await d._js_mutation(
             "(function() {"
             f"  var btn = document.querySelector('{SEND_BUTTON_SELECTOR}')"
             f"       || document.querySelector('{SEND_BUTTON_FALLBACK_SELECTOR}')"
@@ -472,11 +476,13 @@ class ChatGPTDom:
 
             raise SendReadinessError(f"Send failed: {result}")
         logger.info("Message sent")
-        # Success: clear composer failure history and recover a half-open
-        # breaker. Only after the message is confirmed sent — not after
-        # type_message alone, since a successful type can still fail to send.
-        if d._breakers:
-            d._breakers.record_success(BreakerKind.COMPOSER_SEND_READINESS)
+        # #51: click_send does NOT record COMPOSER_SEND_READINESS success
+        # here. 'sent' only proves the synthetic mouse events ran — 1B
+        # measured the click's JS return at +141 ms while React acceptance
+        # (composer cleared, user node mounted) landed at +437 ms. The
+        # breaker's success point moved to send_and_stream, at submission
+        # evidence: captured UUID (primary) or the DOM acknowledgment
+        # fallback.
 
     # ── Rate-limit popup ──────────────────────────────────────
 

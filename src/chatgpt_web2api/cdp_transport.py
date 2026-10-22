@@ -154,6 +154,13 @@ class CDPTransport:
         d._pending[mid] = fut
         try:
             await d._ws.send(json.dumps({"id": mid, "method": method, "params": params or {}}))
+        except asyncio.CancelledError:
+            # Cancellation must not leak the pending entry (round-2 review):
+            # CancelledError bypasses `except Exception` below, and with a
+            # dead/hanging socket nothing would ever pop it. Re-raise
+            # unchanged — the cancellation contract is preserved.
+            d._pending.pop(mid, None)
+            raise
         except Exception as e:
             d._pending.pop(mid, None)
             if _retry and self._should_reconnect(e):
@@ -163,6 +170,11 @@ class CDPTransport:
             raise
         try:
             return await asyncio.wait_for(fut, timeout)
+        except asyncio.CancelledError:
+            # Same leak on the response wait: wait_for cancels the inner
+            # future, but the id-keyed entry stays. Pop it, re-raise.
+            d._pending.pop(mid, None)
+            raise
         except TimeoutError:
             d._pending.pop(mid, None)
             raise TimeoutError(f"CDP timeout: {method}")
@@ -195,6 +207,72 @@ class CDPTransport:
             },
             timeout=timeout,
         )
+        return resp.get("result", {}).get("result", {}).get("value", "")
+
+    async def _js_mutation(self, expr: str, timeout: float = 15) -> str:
+        """MUTATING ``Runtime.evaluate`` — sent exactly once, never replayed.
+
+        #51 no-replay seam. ``_js`` / ``_js_strict`` are observation
+        primitives: on a reconnect-class socket death they reconnect and
+        resend the same frame, which is the right resilience for reads. For
+        a mutation (the send click) that replay is a duplicate-send hazard:
+        the first frame may already have executed remotely. This primitive
+        disables the retry (``_retry=False``) and converts ambiguous
+        outcomes — reconnect-class send failure OR a response timeout after
+        the frame was handed to the socket — into
+        ``SendOutcomeUnknownError``: reconcile (read) only, never resend.
+        Non-reconnect errors raised before meaningful delivery propagate
+        unchanged.
+        """
+        try:
+            resp = await self._driver._cdp(
+                "Runtime.evaluate",
+                {
+                    "expression": expr,
+                    "awaitPromise": True,
+                    "returnByValue": True,
+                    "timeout": int(timeout * 1000),
+                },
+                timeout=timeout,
+                _retry=False,
+            )
+        except TimeoutError as exc:
+            from .cdp_driver import SendOutcomeUnknownError
+
+            raise SendOutcomeUnknownError(
+                "Send mutation outcome unknown: CDP response timed out after "
+                "the mutation frame was dispatched; it may have executed. "
+                "Reconcile (read) only — never resend."
+            ) from exc
+        except asyncio.CancelledError:
+            # Deliberate cancellation semantics (Codex P1 review): the frame
+            # may ALREADY have reached Chrome — cancellation can land after
+            # the transport write — so this is an outcome-unknown mutation.
+            # But swallowing or converting CancelledError would break the
+            # asyncio cancellation contract (a cancelled task must surface
+            # CancelledError; converting it would turn a client-disconnect
+            # cancellation into a 409 response). So: cancellation propagates
+            # UNCHANGED, and the UNKNOWN/do-not-resend classification is
+            # recorded as an observable side channel on the driver instead.
+            # No evidence-window wait here — cancellation must not be
+            # delayed; the scope still closes in send_and_stream's finally.
+            self._driver.note_send_outcome_unknown(
+                stage="send_mutation",
+                reason="cancelled during dispatch — the mutation frame may "
+                       "have reached Chrome; do not resend without "
+                       "reconciliation",
+            )
+            raise
+        except Exception as exc:
+            if self._should_reconnect(exc):
+                from .cdp_driver import SendOutcomeUnknownError
+
+                raise SendOutcomeUnknownError(
+                    "Send mutation outcome unknown: CDP connection died while "
+                    "dispatching the mutation; the frame may or may not have "
+                    "executed. Reconcile (read) only — never resend."
+                ) from exc
+            raise
         return resp.get("result", {}).get("result", {}).get("value", "")
 
     async def _js_with_data(self, expr_template: str, data: dict, timeout: float = 15) -> str:

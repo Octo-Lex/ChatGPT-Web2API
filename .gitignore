@@ -17,3 +17,6 @@ sentinel_flow.json
 
 # ChatGPT collaboration binding (local only)
 .chatgpt-collaboration.json
+
+# Phase 0 recon raw captures (conversation ids/titles — local only)
+captures/
