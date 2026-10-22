@@ -129,6 +129,34 @@ draft while they were addressed.
   new cancellation and breaker-fallback paths are deterministically tested
   only.
 
+## Round-2 follow-ups (current-head pass; commits 546c345 + 78b8ed2)
+
+- **CDP pending-entry cancellation leak** (independently confirmed, red
+  proven before the fix): `_cdp` inserted `d._pending[mid] = fut`, but
+  `CancelledError` bypassed both exception handlers, so cancelling during
+  the mutating evaluate or any response wait left the entry behind
+  indefinitely on a dead/hanging socket. Not a replay hazard — a state
+  leak on the newly supported cancellation path. Both await points now
+  pop the entry and re-raise unchanged; both cancellation tests assert
+  `driver._pending == {}` afterward (verified failing against the previous
+  code first).
+- **Experiment 1B early-stop** (GitWire current-head finding, valid):
+  `stop_at_holder["until"]` was evaluated and passed as a plain float, so
+  the controller's later update could not affect the running recorder
+  loops — they ran to the full deadline instead of stopping after the
+  post-REST grace (which also explains the original run's ~5-minute
+  duration). Now a shared `asyncio.Event` stops both recorders, with the
+  absolute deadline kept as a backstop.
+- **Evidence provenance**: both harnesses derive working-tree provenance
+  from git at run time (`_git_describe()` → branch@head + dirty state).
+  Previously `phase0_live_cert_51.py` hard-coded `code_head: 162c80c …`
+  and exp1b a hard-coded tree description, so reruns at newer heads would
+  have produced evidence falsely labeled as an older tree.
+- PR description refreshed (720-pass round, review-rounds section with
+  per-commit provenance). CI on `78b8ed2`: all gates PASS. Still pending:
+  fresh automated review of this head; single_send default decision,
+  ready-for-review, and #51 closure remain downstream.
+
 ## Claim boundary (for the PR description)
 
 Claim: **the bridge now provides an opt-in at-most-one automatic USER-send
