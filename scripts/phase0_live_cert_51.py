@@ -247,6 +247,28 @@ async def projection_lookup(ws_url: str, conv_id: str) -> dict:
                 return m.get("result", {}).get("result", {}).get("value") or {}
 
 
+def _git_describe() -> str:
+    """Run-time working-tree provenance — never hard-coded (round-2 review:
+    a hard-coded code_head mislabels evidence produced by reruns at newer
+    heads). Evidence must carry the revision it actually ran against."""
+    import subprocess
+
+    try:
+        head = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=5).stdout.strip()
+        branch = subprocess.run(
+            ["git", "branch", "--show-current"],
+            capture_output=True, text=True, timeout=5).stdout.strip()
+        dirty = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=no"],
+            capture_output=True, text=True, timeout=5).stdout.strip()
+        return (f"{branch or 'detached'}@{head}"
+                + (" (dirty)" if dirty else " (clean)"))
+    except Exception:
+        return "git-unavailable"
+
+
 def fire_rest() -> dict:
     body = json.dumps({
         "model": "auto", "stream": False, "single_send": True,
@@ -405,7 +427,7 @@ async def main() -> None:
     result = {
         "captured_at": _dt.datetime.now().isoformat(timespec="seconds"),
         "sentinel": SENTINEL, "conv_id": conv_id,
-        "code_head": "162c80c (PR #52 tree = 346411c + comment-only fix)",
+        "code_head": f"{_git_describe()} (derived at run time)",
         "env": {"chrome": "shared 9222, owned-tab isolation",
                 "live_bridge": "8080 untouched", "injection": "ws.send wrapper: "
                 "forward to real Chrome, then raise ConnectionClosedError — once"},

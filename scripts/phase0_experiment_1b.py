@@ -142,10 +142,11 @@ def find_experiment_tab() -> str:
     raise SystemExit(f"log-derived owned tab {owned} not present in /json/list")
 
 
-async def network_recorder(ws_url: str, events: list, stop_at: float) -> None:
+async def network_recorder(ws_url: str, events: list, stop_at: float,
+                           stop_evt: asyncio.Event | None = None) -> None:
     async with websockets.connect(ws_url, max_size=10**7, open_timeout=5) as ws:
         await ws.send(json.dumps({"id": 1, "method": "Network.enable"}))
-        while time.monotonic() < stop_at:
+        while time.monotonic() < stop_at and not (stop_evt and stop_evt.is_set()):
             try:
                 raw = await asyncio.wait_for(ws.recv(), timeout=0.5)
             except TimeoutError:
@@ -168,10 +169,11 @@ async def network_recorder(ws_url: str, events: list, stop_at: float) -> None:
                                    "url": url[:120], "rid": p.get("requestId")})
 
 
-async def dom_sampler(ws_url: str, samples: list, stop_at: float) -> None:
+async def dom_sampler(ws_url: str, samples: list, stop_at: float,
+                       stop_evt: asyncio.Event | None = None) -> None:
     async with websockets.connect(ws_url, max_size=10**7, open_timeout=5) as ws:
         mid = 500
-        while time.monotonic() < stop_at:
+        while time.monotonic() < stop_at and not (stop_evt and stop_evt.is_set()):
             t0 = time.monotonic()
             mid += 1
             try:
@@ -232,6 +234,28 @@ async def post_projection(ws_url: str, conv_id: str, sentinel: str) -> dict:
                 return m.get("result", {}).get("result", {}).get("value") or {}
 
 
+def _git_describe() -> str:
+    """Working-tree provenance for the evidence record — derived at RUN
+    time, never hard-coded (round-2 review: a hard-coded tree description
+    mislabels reruns at newer heads)."""
+    import subprocess
+
+    try:
+        head = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=5).stdout.strip()
+        branch = subprocess.run(
+            ["git", "branch", "--show-current"],
+            capture_output=True, text=True, timeout=5).stdout.strip()
+        dirty = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=no"],
+            capture_output=True, text=True, timeout=5).stdout.strip()
+        return (f"{branch or 'detached'}@{head}"
+                + (" (dirty)" if dirty else " (clean)"))
+    except Exception:
+        return "git-unavailable"
+
+
 async def main() -> None:
     sentinel = f"PHASE0-1B-{secrets.token_hex(4)}"
     tab = find_experiment_tab()
@@ -269,16 +293,23 @@ async def main() -> None:
         await asyncio.sleep(GRACE_AFTER_REST_S)
         observers_done.set()
 
-    stop_at_holder = {"until": t_start + REST_TIMEOUT_S + 60}
+    # Early-stop mechanism (round-2 review / GitWire finding): a shared
+    # asyncio.Event. The old code passed stop_at_holder["until"] as a plain
+    # FLOAT to the recorders, so later mutating the dict could not affect
+    # the running loops — they ran to the full REST_TIMEOUT+60 deadline
+    # instead of stopping after GRACE_AFTER_REST_S. The absolute deadline
+    # remains as a backstop.
+    stop_evt = asyncio.Event()
+    stop_backstop = t_start + REST_TIMEOUT_S + 60
 
     async def net_task() -> None:
-        await network_recorder(ws_url, net_events, stop_at_holder["until"])
+        await network_recorder(ws_url, net_events, stop_backstop, stop_evt)
     async def dom_task() -> None:
-        await dom_sampler(ws_url, samples, stop_at_holder["until"])
+        await dom_sampler(ws_url, samples, stop_backstop, stop_evt)
 
     async def controller() -> None:
         await observers_done.wait()
-        stop_at_holder["until"] = time.monotonic()  # stop loops
+        stop_evt.set()  # actually stops the recorder loops
 
     await asyncio.gather(
         asyncio.create_task(net_task()),
@@ -306,8 +337,7 @@ async def main() -> None:
         "captured_at": _dt.datetime.now().isoformat(timespec="seconds"),
         "sentinel": sentinel, "project_id": PROJECT_ID, "conv_id": conv_id,
         "env": {"chrome": "shared 9222 with live bridge (recorded limitation)",
-                "bridge": "8081 isolated instance, working tree "
-                          "feat/sse-pool-status-endpoint (master + /health)"},
+                "bridge": f"8081 isolated instance, working tree {_git_describe()}"},
         "rest": {k: v for k, v in rest_result.items() if k != "t0"},
         "network": net_events, "dom_samples": samples, "projection": proj,
     }
