@@ -250,19 +250,30 @@ async def projection_lookup(ws_url: str, conv_id: str) -> dict:
 def _git_describe() -> str:
     """Run-time working-tree provenance — never hard-coded (round-2 review:
     a hard-coded code_head mislabels evidence produced by reruns at newer
-    heads). Evidence must carry the revision it actually ran against."""
+    heads). Git is anchored at THIS repository (derived from the script's
+    own location, never the process CWD — invoking the harness from some
+    other repository must not record that repo's branch/SHA), every
+    command must succeed (check=True; genuine failure returns
+    "git-unavailable" rather than a misleading label), and an empty head
+    is rejected. The dirty flag reflects TRACKED working-tree state only
+    (--untracked-files=no)."""
     import subprocess
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parents[1]
+
+    def _run(*args: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(repo_root), *args],
+            capture_output=True, text=True, timeout=5, check=True,
+        ).stdout.strip()
 
     try:
-        head = subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"],
-            capture_output=True, text=True, timeout=5).stdout.strip()
-        branch = subprocess.run(
-            ["git", "branch", "--show-current"],
-            capture_output=True, text=True, timeout=5).stdout.strip()
-        dirty = subprocess.run(
-            ["git", "status", "--porcelain", "--untracked-files=no"],
-            capture_output=True, text=True, timeout=5).stdout.strip()
+        head = _run("rev-parse", "--short", "HEAD")
+        if not head:
+            return "git-unavailable"
+        branch = _run("branch", "--show-current")
+        dirty = _run("status", "--porcelain", "--untracked-files=no")
         return (f"{branch or 'detached'}@{head}"
                 + (" (dirty)" if dirty else " (clean)"))
     except Exception:
