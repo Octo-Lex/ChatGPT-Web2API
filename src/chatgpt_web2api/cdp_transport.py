@@ -154,6 +154,13 @@ class CDPTransport:
         d._pending[mid] = fut
         try:
             await d._ws.send(json.dumps({"id": mid, "method": method, "params": params or {}}))
+        except asyncio.CancelledError:
+            # Cancellation must not leak the pending entry (round-2 review):
+            # CancelledError bypasses `except Exception` below, and with a
+            # dead/hanging socket nothing would ever pop it. Re-raise
+            # unchanged — the cancellation contract is preserved.
+            d._pending.pop(mid, None)
+            raise
         except Exception as e:
             d._pending.pop(mid, None)
             if _retry and self._should_reconnect(e):
@@ -163,6 +170,11 @@ class CDPTransport:
             raise
         try:
             return await asyncio.wait_for(fut, timeout)
+        except asyncio.CancelledError:
+            # Same leak on the response wait: wait_for cancels the inner
+            # future, but the id-keyed entry stays. Pop it, re-raise.
+            d._pending.pop(mid, None)
+            raise
         except TimeoutError:
             d._pending.pop(mid, None)
             raise TimeoutError(f"CDP timeout: {method}")

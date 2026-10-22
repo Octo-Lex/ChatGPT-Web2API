@@ -249,6 +249,10 @@ async def test_cancelled_mutation_propagates_cancellation_and_records_unknown():
     frames = [f for f in sock.sent if f.get("method") == "Runtime.evaluate"]
     assert len(frames) == 1  # still exactly one mutation frame
     driver.reconnect.assert_not_awaited()
+    # Cancellation cleanup (round-2 review): CancelledError must not leak
+    # the pending-future entry — with a hanging socket it would stay forever.
+    assert driver._pending == {}, (
+        f"pending table leaked on cancellation: {list(driver._pending)}")
 
 
 async def test_cancelled_read_does_not_record_unknown():
@@ -266,6 +270,9 @@ async def test_cancelled_read_does_not_record_unknown():
         await task
 
     driver.note_send_outcome_unknown.assert_not_called()
+    # Cancellation cleanup applies to the read path identically.
+    assert driver._pending == {}, (
+        f"pending table leaked on cancellation: {list(driver._pending)}")
 
 
 async def test_default_retry_mode_remains_backward_compatible():
