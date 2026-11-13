@@ -84,16 +84,9 @@ COMPOSER_FALLBACK_SELECTOR = "textarea#prompt-textarea"
 # the legacy testid for older deployments.
 SEND_BUTTON_SELECTOR = 'button[aria-label*="Send" i]:not([data-testid="stop-button"])'
 SEND_BUTTON_FALLBACK_SELECTOR = 'button[data-testid="send-button"]'
-# P2.5: broader fallback — a submit-type button inside the COMPOSER FORM
-# (scoped to the form containing #prompt-textarea, not page-global, to avoid
-# hitting login/search/feedback forms if the page is displaced). If ChatGPT
-# changes the aria-label (selector drift), a submit-type button inside the
-# composer form is still the send affordance. This is the LAST resort.
-SEND_BUTTON_BROAD_SELECTOR = (
-    'form:has(#prompt-textarea) button[type="submit"],'
-    'form:has(.ProseMirror) button[type="submit"]'
-)
-
+# No type=submit fallback: during generation the only submit-like control
+# may be Stop. A widened fallback could cancel a foreign in-progress turn.
+# An unknown send control must fail closed until its semantics are verified.
 # Send-button readiness poll. After a prior send completes (or under parallel
 # mode, where the MutationLock releases the instant a send finishes), ChatGPT's
 # composer can take several seconds to re-enable the send button — the composer
@@ -421,29 +414,42 @@ class ChatGPTDom:
         return canon_actual == canon_expected or canon_actual == canon_expected + "\n"
 
     async def click_send(self) -> None:
-        """Click the send button via JS MouseEvent sequence.
+        """Dispatch only an explicit Send control in the owned composer form.
 
-        The new composer has no ``data-testid="send-button"``; its send
-        affordance is the submit ``<button aria-label="Send ...">`` inside
-        the composer form. We prefer that, falling back to the legacy
-        testid selector for older deployments. The stop button (which
-        appears during generation) is explicitly excluded — it also
-        carries an aria-label, but never "Send".
+        The prior type=submit fallback was ambiguous: Stop can be the only
+        submit-like button during generation. Keep explicit Send selectors,
+        require the associated visible composer form, and re-check for a
+        visible Stop in the SAME JS evaluation that dispatches the click.
+        This action guard does not replace #51's separate CDP no-replay fix.
         """
         d = self._driver
-        # Wait for the send button to appear and be enabled. Try the new
-        # aria-label selector first, then the legacy testid fallback. Time-
-        # budgeted (not a fixed iteration count) so the wait scales to the
-        # composer-reset window after a prior send — see
-        # SEND_BUTTON_POLL_MAX_WAIT_S for rationale.
+        # Both the poll and the click use the same conservative lookup.
+        # Every check in lookup_js is evaluated again at mutation time, not
+        # trusted from the previous poll's state.
+        lookup_js = (
+            "  function visible(el) {"
+            "    return !!el && el.getClientRects().length > 0 &&"
+            "      !el.disabled && el.getAttribute('aria-disabled') !== 'true';"
+            "  }"
+            f"  var composer = document.querySelector('{COMPOSER_SELECTOR}')"
+            f"    || document.querySelector('{COMPOSER_FALLBACK_SELECTOR}');"
+            "  var form = visible(composer) && composer.closest('form');"
+            '  var stop = document.querySelector(\'[data-testid="stop-button"], '
+            'button[aria-label*="Stop" i]\');'
+            f"  var btn = form && (form.querySelector('{SEND_BUTTON_SELECTOR}')"
+            f"    || form.querySelector('{SEND_BUTTON_FALLBACK_SELECTOR}'));"
+            "  var stopLike = btn && (btn.getAttribute('data-testid') === 'stop-button'"
+            "    || /stop/i.test(btn.getAttribute('aria-label') || '')"
+            "    || /stop/i.test(btn.getAttribute('title') || '')"
+            "    || (btn.textContent || '').trim().toLowerCase() === 'stop');"
+        )
+
         deadline = time.monotonic() + SEND_BUTTON_POLL_MAX_WAIT_S
         while time.monotonic() < deadline:
             has_btn = await d._js(
                 "(function() {"
-                f"  var btn = document.querySelector('{SEND_BUTTON_SELECTOR}')"
-                f"       || document.querySelector('{SEND_BUTTON_FALLBACK_SELECTOR}')"
-                f"       || document.querySelector('{SEND_BUTTON_BROAD_SELECTOR}');"
-                "  return btn && !btn.disabled ? 'yes' : 'no';"
+                + lookup_js
+                + "  return (!visible(stop) && !stopLike && visible(btn)) ? 'yes' : 'no';"
                 "})()"
             )
             if has_btn == "yes":
@@ -452,11 +458,10 @@ class ChatGPTDom:
 
         result = await d._js(
             "(function() {"
-            f"  var btn = document.querySelector('{SEND_BUTTON_SELECTOR}')"
-            f"       || document.querySelector('{SEND_BUTTON_FALLBACK_SELECTOR}')"
-            f"       || document.querySelector('{SEND_BUTTON_BROAD_SELECTOR}');"
+            + lookup_js
+            + "  if (visible(stop) || stopLike) return 'stop button present';"
             "  if (!btn) return 'no send button';"
-            "  if (btn.disabled) return 'button disabled';"
+            "  if (!visible(btn)) return 'button disabled or hidden';"
             "  var evts = ['pointerdown','mousedown','pointerup','mouseup','click'];"
             "  for (var i = 0; i < evts.length; i++) {"
             "    btn.dispatchEvent(new MouseEvent(evts[i], {bubbles:true, cancelable:true, view:window}));"
@@ -472,9 +477,8 @@ class ChatGPTDom:
 
             raise SendReadinessError(f"Send failed: {result}")
         logger.info("Message sent")
-        # Success: clear composer failure history and recover a half-open
-        # breaker. Only after the message is confirmed sent — not after
-        # type_message alone, since a successful type can still fail to send.
+        # Legacy breaker behavior preserved pending #52's acknowledged-send
+        # boundary; a JS 'sent' is not authoritative remote acceptance.
         if d._breakers:
             d._breakers.record_success(BreakerKind.COMPOSER_SEND_READINESS)
 
