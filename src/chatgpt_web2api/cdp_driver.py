@@ -1209,53 +1209,114 @@ class CDPDriver:
 
     # ── Navigation ────────────────────────────────────────────
 
+    @staticmethod
+    def _is_url_at_new_chat(url: str, gizmo_id: str | None = None) -> bool:
+        """Require the exact HTTPS ChatGPT origin and the requested fresh route.
+
+        A composer's presence on /c/{id}, a different project, or a host
+        merely containing 'chatgpt.com' must never qualify a new chat.
+        Query parameters and a trailing slash may be normalized by the SPA.
+        """
+        if not url:
+            return False
+        try:
+            parsed = urllib.parse.urlparse(url)
+        except ValueError:
+            return False
+        if parsed.scheme != "https" or parsed.netloc.lower() != "chatgpt.com":
+            return False
+        expected = (
+            f"/g/{urllib.parse.quote(gizmo_id, safe='')}/project"
+            if gizmo_id else "/"
+        )
+        return parsed.path.rstrip("/") == expected.rstrip("/")
+
     async def navigate_new_chat(self, gizmo_id: str = None) -> None:
-        """Navigate to a fresh chat. Optionally scope to a project gizmo."""
+        """Navigate to a verified, idle fresh-chat composer or fail closed.
+
+        An old conversation ID must not survive a failed new-chat navigation.
+        A usable editor and the exact requested route are verified together;
+        an in-progress generation (Stop visible) is not send-ready. A second
+        probe after a short settle detects immediate SPA displacement.
+        """
+        # Clear stale continuation state BEFORE any navigation or probe can fail.
+        self._current_conv_id = None
         if gizmo_id:
-            url = f"https://chatgpt.com/g/{gizmo_id}/project"
+            url = f"https://chatgpt.com/g/{urllib.parse.quote(gizmo_id, safe='')}/project"
         else:
-            # The bare ``chatgpt.com/`` home shell renders only the hidden
-            # fallback textarea (``name=prompt-textarea``, no id, not visible),
-            # so neither COMPOSER_SELECTOR nor COMPOSER_FALLBACK_SELECTOR matches
-            # and type_message fails with "No composer found". The
-            # ``?model=auto`` query triggers the SPA to render the real
-            # ProseMirror composer reliably. Verified live: bare home → no
-            # composer after 20s; ``?model=auto`` → composer present.
+            # The bare home shell may render only a hidden fallback textarea;
+            # ?model=auto has been observed to hydrate the real composer.
             url = "https://chatgpt.com/?model=auto"
         logger.info("Navigate: %s", url)
-        await self._cdp("Page.navigate", {"url": url})
+        navigation = await self._cdp("Page.navigate", {"url": url})
+        if isinstance(navigation, dict) and navigation.get("errorText"):
+            raise SendReadinessError(
+                f"Fresh chat navigation rejected: {navigation['errorText']}"
+            )
         await asyncio.sleep(2)
 
-        # Wait for the composer. The new composer is a contenteditable
-        # ProseMirror div (#prompt-textarea is now a hidden fallback);
-        # COMPOSER_SELECTOR matches the real textbox, with the legacy
-        # textarea as a last resort for older deployments.
-        for _ in range(30):
-            result = await self._js(
-                "(function() {"
-                "  return JSON.stringify({"
-                f"    ready: !!document.querySelector('{COMPOSER_SELECTOR}') || !!document.querySelector('{COMPOSER_FALLBACK_SELECTOR}'),"
-                "    url: location.href"
-                "  });"
-                "})()"
-            )
+        # This probe is read-only. In particular, never try a submit-button
+        # fallback to infer readiness: the same button can become Stop while
+        # a foreign tab is generating.
+        probe_js = (
+            "(function(){"
+            "  function visible(el) {"
+            "    return !!el && el.getClientRects().length > 0 &&"
+            "      !el.disabled && el.getAttribute('aria-disabled') !== 'true';"
+            "  }"
+            f"  var composer = document.querySelector('{COMPOSER_SELECTOR}')"
+            f"    || document.querySelector('{COMPOSER_FALLBACK_SELECTOR}');"
+            '  var stop = document.querySelector(\'[data-testid="stop-button"], '
+            'button[aria-label*="Stop" i]\');'
+            "  return JSON.stringify({"
+            "    url: location.href, ready_state: document.readyState,"
+            "    composer: visible(composer), stop_present: visible(stop)"
+            "  });"
+            "})()"
+        )
+        last_state: dict | None = None
+
+        def is_ready(raw: str) -> bool:
+            nonlocal last_state
             try:
-                state = json.loads(result)
-                if state.get("ready"):
-                    actual_url = state.get("url", "")
-                    # #14: verify we actually landed on chatgpt.com, not an
-                    # error/recovery page that happens to have a textarea.
-                    if "chatgpt.com" not in actual_url:
-                        raise RuntimeError(f"Navigation landed on unexpected URL: {actual_url}")
-                    logger.info("Page ready: %s", actual_url)
-                    break
-            except (json.JSONDecodeError, TypeError):
-                pass
+                state = json.loads(raw)
+            except (ValueError, TypeError):
+                return False
+            if not isinstance(state, dict):
+                return False
+            last_state = state
+            return (
+                self._is_url_at_new_chat(state.get("url", ""), gizmo_id)
+                and state.get("ready_state") == "complete"
+                and state.get("composer") is True
+                and state.get("stop_present") is False
+            )
+
+        for _ in range(30):
+            if is_ready(await self._js(probe_js)):
+                await asyncio.sleep(0.25)
+                if is_ready(await self._js(probe_js)):
+                    logger.info("Fresh chat ready: %s", last_state.get("url"))
+                    return
             await asyncio.sleep(0.5)
 
-        # Settle time for sentinel init
-        await asyncio.sleep(2)
-        self._current_conv_id = None
+        if last_state is None:
+            stage = "no readable readiness probes"
+        elif not self._is_url_at_new_chat(last_state.get("url", ""), gizmo_id):
+            stage = "wrong fresh-chat route"
+        elif last_state.get("stop_present") is True:
+            stage = "generation active (Stop visible)"
+        elif last_state.get("ready_state") != "complete":
+            stage = "document not ready"
+        elif last_state.get("composer") is not True:
+            stage = "usable composer absent"
+        else:
+            stage = "readiness not stable"
+        if self._breakers:
+            self._breakers.record_failure(BreakerKind.COMPOSER_SEND_READINESS)
+        raise SendReadinessError(
+            f"Fresh chat navigation failed closed after readiness polling: {stage}"
+        )
 
     async def _has_composer(self) -> bool:
         """Is a send-capable composer present on the live tab?
