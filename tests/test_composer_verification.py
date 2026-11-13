@@ -12,13 +12,12 @@ reimplementation of the JS DOM walker to verify the extraction logic against
 realistic ProseMirror DOM shapes — not just mocked output strings.
 """
 
-import unicodedata
 from unittest.mock import AsyncMock
 
 import pytest
 
-from chatgpt_web2api.chatgpt_dom import ChatGPTDom
 from chatgpt_web2api.cdp_driver import CDPDriver
+from chatgpt_web2api.chatgpt_dom import ChatGPTDom
 
 
 def _make_dom(js_return_value=""):
