@@ -38,12 +38,21 @@ function element(kind, cfg={}) {
       return null;
     },
     closest: () => kind === 'composer' ? (scenario.noForm ? null : form) : null,
-    dispatchEvent: (event) => { events.push(event.type); return true; },
+    dispatchEvent: (event) => {
+      events.push(event.type);
+      if (kind === 'button' && event.type === 'pointerdown') {
+        if (scenario.mutationGeometry === 'same-node') cfg.label = 'Stop generating';
+        if (scenario.mutationGeometry === 'replacement') scenario.replacementState = true;
+      }
+      return true;
+    },
     focus: () => {},
   };
 }
+const replacement = element('stop', {label: 'Stop generating', testid: 'stop-button'});
 const form = {
   querySelector: (selector) => scenario.noButton ? null :
+    scenario.replacementState ? replacement :
     selector.includes('aria-label') ? button : null,
 };
 const composer = element('composer', {hidden: !!scenario.hiddenComposer});
@@ -61,7 +70,9 @@ const document = {
     return null;
   },
   querySelectorAll: (selector) => {
-    if (selector.includes('stop-button')) return stops;
+    if (selector.includes('stop-button')) {
+      return scenario.replacementState ? [replacement, ...stops] : stops;
+    }
     return [];
   },
 };
@@ -219,3 +230,25 @@ async def test_js_runtime_typing_refuses_displaced_route(monkeypatch):
         focus_js, {"url": "https://chatgpt.com/c/expected"}
     )["result"] == "composer"
     assert "if (!routeOk)" in focus_js
+
+
+
+@pytest.mark.asyncio
+@pytest.mark.xfail(
+    strict=True,
+    reason="NAV-08: five-event dispatch does not re-check changed button; "
+           "defer mutation-effect UNKNOWN semantics to PR #52 integration",
+)
+@pytest.mark.parametrize("geometry", ["same-node", "replacement"])
+async def test_adversarial_pointerdown_mutation_must_never_reach_click(
+    geometry,
+):
+    """Desired future contract, intentionally RED on the present implementation.
+
+    The fake DOM mutates synchronously on pointerdown in either geometry.
+    That is not evidence that React uses either geometry in production.
+    """
+    expr = await _capture_click_expression(("fresh", "/"))
+    state = _run_js(expr, {"mutationGeometry": geometry})
+    assert "pointerdown" in state["events"]
+    assert "click" not in state["events"]
