@@ -85,8 +85,10 @@ from .chatgpt_dom import (  # noqa: E402,F401
     SEND_BUTTON_SELECTOR,
 )
 from .dom_turn_signals import (  # noqa: E402
-    ASSISTANT_TURN_COUNT_JS,
-    USER_TURN_COUNT_JS,
+    EDIT_MESSAGE_BUTTON_SELECTOR,
+    LEGACY_USER_SELECTOR,
+    TURN_SIGNAL_COUNTS_JS,
+    parse_turn_signal_counts,
 )
 
 # ── P2: Navigation readiness probe ────────────────────────────────────────
@@ -1502,58 +1504,38 @@ class CDPDriver:
         """
         import time as _time
 
-        selector = ASSISTANT_TURN_COUNT_JS
-        user_selector = USER_TURN_COUNT_JS
+        # One atomic pre-send DOM snapshot. The four counts are kept
+        # separately because Math.max masks growth in mixed old/new layouts.
+        # Bad/partial snapshots retry and ultimately fail closed before Send.
+        self._pre_send_signal_counts = None
+        self._pre_send_user_count = None
         max_attempts = 3
         for attempt in range(1, max_attempts + 1):
             t0 = _time.monotonic()
-            err: Exception | None = None
             try:
-                raw = await self._js_strict(selector)
-            except CDPJSError as e:
-                err = e
+                raw = await self._js_strict(TURN_SIGNAL_COUNTS_JS)
+                signals = parse_turn_signal_counts(raw)
+            except (CDPJSError, ValueError, TypeError) as err:
+                pass
             else:
-                try:
-                    # Explicit parse — do NOT use truthiness (numeric 0 from
-                    # CDP is falsy but valid for a fresh chat). ChatGPT's
-                    # review caught that `raw and int(raw)` rejects numeric 0.
-                    count = int(raw)
-                except (ValueError, TypeError) as e:
-                    err = e
-                else:
-                    if count < 0:
-                        err = ValueError(f"negative assistant count: {count}")
-
-            # If we got a valid count, log + return.
-            if err is None:
+                count = max(signals["copy"], signals["legacy_assistant"])
+                user_count = max(signals["edit"], signals["legacy_user"])
+                self._pre_send_signal_counts = signals
+                self._pre_send_user_count = user_count
                 elapsed_ms = int((_time.monotonic() - t0) * 1000)
-                # Best-effort user-count for diagnostics (non-fatal).
-                try:
-                    user_raw = await self._js_strict(user_selector)
-                    user_count = int(user_raw)
-                except (CDPJSError, ValueError, TypeError):
-                    user_count = None
                 logger.info(
                     "send_baseline: attempt=%d assistant_count=%d "
                     "user_count=%s elapsed_ms=%d conv_id=%s",
-                    attempt,
-                    count,
-                    user_count,
-                    elapsed_ms,
+                    attempt, count, user_count, elapsed_ms,
                     self._current_conv_id or "(none)",
                 )
-                # Store for send-acknowledgment baseline (ChatGPT review A).
-                self._pre_send_user_count = user_count
                 return count
 
-            # Retry or fail-closed.
             if attempt < max_attempts:
                 logger.warning(
                     "send_baseline_failed: attempt=%d error=%s "
                     "conv_id=%s — retrying",
-                    attempt,
-                    err,
-                    self._current_conv_id or "(none)",
+                    attempt, err, self._current_conv_id or "(none)",
                 )
                 await asyncio.sleep(0.3 * attempt)
             else:
@@ -1561,9 +1543,7 @@ class CDPDriver:
                     "send_baseline_unavailable: attempts=%d last_error=%s "
                     "conv_id=%s — refusing to send with untrusted baseline "
                     "(stale-return risk)",
-                    attempt,
-                    err,
-                    self._current_conv_id or "(none)",
+                    attempt, err, self._current_conv_id or "(none)",
                 )
                 raise SendReadinessError(
                     f"Cannot establish pre-send assistant-count baseline "
@@ -1597,6 +1577,7 @@ class CDPDriver:
         from .chatgpt_dom import COMPOSER_FALLBACK_SELECTOR, COMPOSER_SELECTOR
 
         pre_send_count = getattr(self, "_pre_send_user_count", None)
+        pre_signals = getattr(self, "_pre_send_signal_counts", None)
         if pre_send_count is None:
             # No baseline — can't verify a delta. Non-blocking.
             return None
@@ -1607,12 +1588,14 @@ class CDPDriver:
             try:
                 result = await self._js_strict(
                     "(function() {"
-                    f"  var userMsgs = {USER_TURN_COUNT_JS};"
+                    f"  var editCount = document.querySelectorAll('{EDIT_MESSAGE_BUTTON_SELECTOR}').length;"
+                    f"  var legacyCount = document.querySelectorAll('{LEGACY_USER_SELECTOR}').length;"
+                    "  var userMsgs = Math.max(editCount, legacyCount);"
                     f"  var composer = document.querySelector('{COMPOSER_SELECTOR}')"
                     f"       || document.querySelector('{COMPOSER_FALLBACK_SELECTOR}');"
                     "  var composerPresent = !!composer;"
                     "  var composerEmpty = composer ? !(composer.innerText || composer.value || '').trim() : false;"
-                    "  return JSON.stringify({userCount: userMsgs, composerPresent: composerPresent, composerEmpty: composerEmpty});"
+                    "  return JSON.stringify({userCount: userMsgs, editCount: editCount, legacyCount: legacyCount, composerPresent: composerPresent, composerEmpty: composerEmpty});"
                     "})()"
                 )
                 if not result or not result.strip().startswith("{"):
@@ -1627,9 +1610,23 @@ class CDPDriver:
                     continue  # wait for next poll — might be transient
                 # Only count as a valid probe when the composer is present
                 # and we can actually evaluate the acknowledgment condition.
+                if pre_signals is not None:
+                    edit_count = state.get("editCount")
+                    legacy_count = state.get("legacyCount")
+                    if (
+                        type(edit_count) is not int or type(legacy_count) is not int
+                        or edit_count < 0 or legacy_count < 0
+                    ):
+                        return None  # no trustworthy per-signal observation
+                    user_delta = (
+                        edit_count > pre_signals["edit"]
+                        or legacy_count > pre_signals["legacy_user"]
+                    )
+                else:
+                    # Compatibility with callers that mock the baseline read.
+                    user_delta = state.get("userCount", 0) > pre_send_count
                 valid_probe_seen = True
-                current_count = state.get("userCount", 0)
-                if current_count > pre_send_count and state.get("composerEmpty"):
+                if user_delta and state.get("composerEmpty"):
                     return True
             except Exception:
                 pass
@@ -1744,6 +1741,9 @@ class CDPDriver:
         # PR4 belt-and-suspenders: refuse to mutate the DOM in parallel mode.
         self._assert_owned_tab_required()
         # A1: count existing assistants BEFORE sending (fail-closed baseline).
+        # Clear stale per-signal state even if a test or subclass overrides
+        # _read_assistant_count_baseline.
+        self._pre_send_signal_counts = None
         initial_count = await self._read_assistant_count_baseline()
 
         # A2 Step 2: identity-listener health check.
