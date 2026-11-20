@@ -114,7 +114,7 @@ async def _actual_phase2_expression(initial_count=0):
         if "copyButtons" in expr and "has_action" in expr:
             seen.append(expr)
             raise _CapturedProbe
-        return "1"  # Phase-1 assistant-count delta
+        return str(initial_count + 1)  # Phase-1 assistant-count delta
 
     d._js_strict = _js
     det = CompletionDetector(d)
