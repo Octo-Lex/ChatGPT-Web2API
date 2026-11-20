@@ -39,6 +39,7 @@ function element(kind, cfg={}) {
     },
     closest: () => kind === 'composer' ? (scenario.noForm ? null : form) : null,
     dispatchEvent: (event) => { events.push(event.type); return true; },
+    focus: () => {},
   };
 }
 const form = {
@@ -66,6 +67,7 @@ const document = {
 };
 const context = {
   document,
+  URL,
   window: {},
   location: {href: scenario.url || 'https://chatgpt.com/?model=auto'},
   MouseEvent: class MouseEvent {constructor(type) {this.type = type;}},
@@ -93,8 +95,9 @@ def _run_js(expression, scenario=None):
     return json.loads(completed.stdout)
 
 
-async def _capture_click_expression():
+async def _capture_click_expression(expected_context=None):
     driver = CDPDriver(cdp_port=9222)
+    driver._expected_send_context = expected_context
     driver._breakers = None
     driver._js = AsyncMock(side_effect=["yes", "sent"])
     await driver.click_send()
@@ -166,3 +169,53 @@ async def test_js_runtime_rejects_invisible_editor_before_navigation_ready(
         _run_js(script, {"hiddenComposer": True})["result"]
     )
     assert state["composer"] is False
+
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("context,url,expected", [
+    (("fresh", "/"), "https://chatgpt.com/?model=auto", "sent"),
+    (("fresh", "/"), "https://chatgpt.com/c/foreign", "wrong send route"),
+    (("fresh", "/"), "https://chatgpt.com.evil.test/", "wrong send route"),
+    (("fresh", "/g/g-123/project"),
+     "https://chatgpt.com/g/g-123/project", "sent"),
+    (("fresh", "/g/g-123/project"),
+     "https://chatgpt.com/g/other/project", "wrong send route"),
+    (("conversation", "conv-123"),
+     "https://chatgpt.com/c/conv-123?model=auto", "sent"),
+    (("conversation", "conv-123"),
+     "https://chatgpt.com/g/g-123/c/conv-123", "sent"),
+    (("conversation", "conv-123"),
+     "https://chatgpt.com/c/other", "wrong send route"),
+    (("conversation", "conv-123"),
+     "http://chatgpt.com/c/conv-123", "wrong send route"),
+])
+async def test_js_runtime_send_action_binds_expected_route(
+    context, url, expected
+):
+    script = await _capture_click_expression(context)
+    result = _run_js(script, {"url": url})
+    assert result["result"] == expected
+    assert len(result["events"]) == (5 if expected == "sent" else 0)
+
+
+@pytest.mark.asyncio
+async def test_js_runtime_typing_refuses_displaced_route(monkeypatch):
+    """The focus mutation fails closed before Input.insertText."""
+    d = CDPDriver(cdp_port=9222)
+    d._expected_send_context = ("conversation", "expected")
+    d._js = AsyncMock(return_value="composer")
+    d._detect_select_all_modifier = AsyncMock(return_value=2)
+    d._verify_composer_text = AsyncMock(return_value=True)
+    d._cdp = AsyncMock()
+    monkeypatch.setattr("chatgpt_web2api.chatgpt_dom.asyncio.sleep", AsyncMock())
+    await d.type_message("example")
+
+    focus_js = d._js.await_args_list[0].args[0]
+    assert _run_js(
+        focus_js, {"url": "https://chatgpt.com/c/foreign"}
+    )["result"] == "wrong send route"
+    assert _run_js(
+        focus_js, {"url": "https://chatgpt.com/c/expected"}
+    )["result"] == "composer"
+    assert "if (!routeOk)" in focus_js
