@@ -362,6 +362,7 @@ class CompletionDetector:
         deadline = time.monotonic() + timeout
         last_node_count = initial_count
         last_progress = time.monotonic()
+        user_turn_seen = False
         while time.monotonic() < deadline:
             # First check for ChatGPT's rate-limit pop-up — if present, fail
             # fast with a clear error instead of waiting out the whole timeout.
@@ -404,6 +405,7 @@ class CompletionDetector:
                 try:
                     user_raw = await d._js_strict(USER_TURN_COUNT_JS)
                     if int(user_raw) > pre_user_count:
+                        user_turn_seen = True
                         logger.debug("User turn appeared via Edit-message delta")
                         break
                 except (CDPJSError, ValueError, TypeError):
@@ -725,7 +727,10 @@ class CompletionDetector:
             backend_fetch_failed = False
             if (
                 conv_id_for_check
-                and (last_dom_text or saw_thinking or is_thinking or had_non_text_content or copy_delta)
+                and (
+                    last_dom_text or saw_thinking or is_thinking
+                    or had_non_text_content or copy_delta or user_turn_seen
+                )
                 and time.monotonic() - last_backend_check > 3.0
             ):
                 last_backend_check = time.monotonic()
