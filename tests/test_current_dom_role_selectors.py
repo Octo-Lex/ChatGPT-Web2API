@@ -38,7 +38,7 @@ function el(kind) {
 }
 const root = {
   innerText: mode === 'current'
-    ? 'ChatGPT said:\\n\\n' + (state.answer ?? 'Current UI answer.')
+    ? 'ChatGPT said:\n\n' + (state.answer ?? 'Current UI answer.')
     : (state.answer ?? 'Legacy answer.'),
   innerHTML: '<p>Current UI answer</p>'.repeat(3),
   children: [1],
