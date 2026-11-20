@@ -200,7 +200,7 @@ async def test_phase1_user_edit_delta_unblocks_before_copy_action():
             return json.dumps({
                 "text": "Answer", "md_text": "Answer", "html_len": 60,
                 "child_count": 1, "has_action": True,
-                "copy_delta": True, "stop_present": False,
+                "copy_delta": copy_delta, "stop_present": False,
                 "is_thinking": False,
             })
         raise AssertionError(expr)
@@ -219,7 +219,10 @@ async def test_phase1_user_edit_delta_unblocks_before_copy_action():
 
 
 @pytest.mark.asyncio
-async def test_anchored_backend_text_recovers_when_current_dom_has_no_container():
+@pytest.mark.parametrize("copy_delta", [False, True])
+async def test_anchored_backend_text_recovers_when_current_dom_has_no_container(
+    copy_delta,
+):
     d = MagicMock()
     d._current_conv_id = "conv-current"
     d._pre_send_user_count = 0
