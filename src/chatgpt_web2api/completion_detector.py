@@ -510,10 +510,11 @@ class CompletionDetector:
                     f"  var last = msgs.length > {initial_count} ? msgs[msgs.length - 1] : null;"
                     # New layout: the completed Copy affordance anchors a
                     # semantic turn container; never fall back to body text.
+                    "  var fromCopyRoot = false;"
                     "  if (!last && copyDelta) {"
                     "    var copyBtn = copyButtons[copyButtons.length - 1];"
                     '    var root = copyBtn.closest(\'[data-testid^="conversation-turn-"], article\');'
-                    "    if (root) last = root;"
+                    "    if (root) { last = root; fromCopyRoot = true; }"
                     "  }"
                     "  var stops = document.querySelectorAll('[data-testid=\\\"stop-button\\\"], button[aria-label*=\\\"Stop\\\" i]');"
                     "  var stopPresent = Array.prototype.some.call(stops, function(b){return b.getClientRects().length > 0;});"
@@ -531,8 +532,13 @@ class CompletionDetector:
                     # Strip a leading "Thinking..." / "Thought for …" reasoning
                     # label so the innerText fallback can't leak it as a delta.
                     "  var text = mdText || rawText.replace(/^Think(ing|\\s+for)[^\\n]*\\n?/i, '');"
-                    "  var html_len = last.innerHTML.length;"
-                    "  var child_count = last.children.length;"
+                    # A current article includes an action toolbar whose
+                    # HTML can exceed 50 chars even with ZERO answer content.
+                    # Do not mistake that wrapper for non-text assistant
+                    # content (which would bypass strict backend text gating).
+                    "  var hasRichContent = !!last.querySelector('img, canvas, video, audio');"
+                    "  var html_len = fromCopyRoot && !hasRichContent ? 0 : last.innerHTML.length;"
+                    "  var child_count = fromCopyRoot && !hasRichContent ? 0 : last.children.length;"
                     # has_action: the per-turn copy/feedback action row appears
                     # only on a COMPLETED message. ChatGPT's DOM layout puts these
                     # buttons in a SIBLING/UNCLE container, NOT as descendants of
