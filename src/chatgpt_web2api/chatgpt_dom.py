@@ -434,8 +434,14 @@ class ChatGPTDom:
             f"  var composer = document.querySelector('{COMPOSER_SELECTOR}')"
             f"    || document.querySelector('{COMPOSER_FALLBACK_SELECTOR}');"
             "  var form = visible(composer) && composer.closest('form');"
-            '  var stop = document.querySelector(\'[data-testid="stop-button"], '
+            '  var stops = document.querySelectorAll(\'[data-testid="stop-button"], '
             'button[aria-label*="Stop" i]\');'
+            "  var stopPresent = false;"
+            "  for (var si = 0; si < stops.length; si++) {"
+            "    if (stops[si].getClientRects().length > 0) {"
+            "      stopPresent = true; break;"
+            "    }"
+            "  }"
             f"  var btn = form && (form.querySelector('{SEND_BUTTON_SELECTOR}')"
             f"    || form.querySelector('{SEND_BUTTON_FALLBACK_SELECTOR}'));"
             "  var stopLike = btn && (btn.getAttribute('data-testid') === 'stop-button'"
@@ -449,7 +455,7 @@ class ChatGPTDom:
             has_btn = await d._js(
                 "(function() {"
                 + lookup_js
-                + "  return (!visible(stop) && !stopLike && visible(btn)) ? 'yes' : 'no';"
+                + "  return (!stopPresent && !stopLike && visible(btn)) ? 'yes' : 'no';"
                 "})()"
             )
             if has_btn == "yes":
@@ -459,7 +465,7 @@ class ChatGPTDom:
         result = await d._js(
             "(function() {"
             + lookup_js
-            + "  if (visible(stop) || stopLike) return 'stop button present';"
+            + "  if (stopPresent || stopLike) return 'stop button present';"
             "  if (!btn) return 'no send button';"
             "  if (!visible(btn)) return 'button disabled or hidden';"
             "  var evts = ['pointerdown','mousedown','pointerup','mouseup','click'];"
