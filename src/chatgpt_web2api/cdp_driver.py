@@ -479,6 +479,9 @@ class CDPDriver:
         If already connected (e.g. Service reconnects after login), reuses the
         existing owned tab instead of creating a new one.
         """
+        # CDP attachment can change on reconnect; do not carry an old
+        # route proof across a new WebSocket/target association.
+        self._expected_send_context = None
         # If we already own a tab from a prior connect attempt, reuse it
         if self._ws is not None:
             await self._ws.close()
@@ -2212,6 +2215,7 @@ class CDPDriver:
     # ── Lifecycle ─────────────────────────────────────────────
 
     async def close(self) -> None:
+        self._expected_send_context = None
         # Stop the background reader first
         if self._reader_task and not self._reader_task.done():
             self._reader_task.cancel()
