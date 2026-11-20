@@ -73,6 +73,13 @@ if TYPE_CHECKING:
     from .cdp_driver import StreamChunk
     from .config import ChatGPTConfig
 
+from .dom_turn_signals import (
+    ASSISTANT_TURN_COUNT_JS,
+    COPY_BUTTON_SELECTOR,
+    LEGACY_ASSISTANT_SELECTOR,
+    USER_TURN_COUNT_JS,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -376,9 +383,7 @@ class CompletionDetector:
                 raise RateLimitError.from_text(scanned_text)
 
             try:
-                raw = await d._js_strict(
-                    "document.querySelectorAll('[data-message-author-role=\"assistant\"], [data-content-search-unit-key$=\":assistant\"], [data-chatgpt-search-unit-key$=\":assistant\"]').length"
-                )
+                raw = await d._js_strict(ASSISTANT_TURN_COUNT_JS)
                 current_count = int(raw or 0)
             except CDPJSError:
                 current_count = last_node_count  # no progress signal
@@ -389,6 +394,21 @@ class CompletionDetector:
                 last_progress = time.monotonic()
             if current_count > initial_count:
                 break
+
+            # The current UI only adds the per-turn Copy affordance when
+            # the assistant FINISHES, so an assistant-count delta alone cannot
+            # start phase 2. The new user message's Edit message control is
+            # available earlier. It permits observation, NOT completion.
+            pre_user_count = getattr(d, "_pre_send_user_count", None)
+            if pre_user_count is not None:
+                try:
+                    user_raw = await d._js_strict(USER_TURN_COUNT_JS)
+                    if int(user_raw) > pre_user_count:
+                        logger.debug("User turn appeared via Edit-message delta")
+                        break
+                except (CDPJSError, ValueError, TypeError):
+                    pass
+
             if time.monotonic() - last_progress > PHASE_STALL_SECONDS:
                 raise GenerationStuckError("phase_1_appear", time.monotonic() - last_progress)
             await asyncio.sleep(0.5)
@@ -453,6 +473,12 @@ class CompletionDetector:
         # think silently); stream-idle uses budgets.stream_idle_timeout_seconds.
         phase_2_start = time.monotonic()
         first_content_seen = False
+        # A current-DOM Copy affordance appears only after a completed turn.
+        # Require its count to grow beyond the pre-send baseline AND one
+        # subsequent identical-text observation before enabling DOM fallback.
+        # An old Copy button may never mark the new turn complete.
+        last_copy_text = ""
+        copy_stable_polls = 0
         generation_active_signal = False  # advisory liveness (DOM thinking/generating)
         # Backend end_turn fallback throttle (R4): if the DOM action-button
         # selector drifts again, the conversation API's end_turn flag is a
@@ -474,9 +500,22 @@ class CompletionDetector:
             try:
                 result = await d._js_strict(
                     "(function() {"
-                    "  var msgs = document.querySelectorAll('[data-message-author-role=\"assistant\"], [data-content-search-unit-key$=\":assistant\"], [data-chatgpt-search-unit-key$=\":assistant\"]');"
-                    "  if (!msgs.length) return JSON.stringify({text:'', md_text:'', html_len:0, child_count:0, has_action:false, is_thinking:false});"
-                    "  var last = msgs[msgs.length - 1];"
+                    f"  var msgs = document.querySelectorAll('{LEGACY_ASSISTANT_SELECTOR}');"
+                    f"  var copyButtons = document.querySelectorAll('{COPY_BUTTON_SELECTOR}');"
+                    f"  var copyDelta = copyButtons.length > {int(0)} + {initial_count};"
+                    # The old assistant node must not be read while a new
+                    # USER node has appeared but no new assistant node yet.
+                    f"  var last = msgs.length > {initial_count} ? msgs[msgs.length - 1] : null;"
+                    # New layout: the completed Copy affordance anchors a
+                    # semantic turn container; never fall back to body text.
+                    "  if (!last && copyDelta) {"
+                    "    var copyBtn = copyButtons[copyButtons.length - 1];"
+                    '    var root = copyBtn.closest(\'[data-testid^="conversation-turn-"], article\');'
+                    "    if (root) last = root;"
+                    "  }"
+                    "  var stops = document.querySelectorAll('[data-testid=\\\"stop-button\\\"], button[aria-label*=\\\"Stop\\\" i]');"
+                    "  var stopPresent = Array.prototype.some.call(stops, function(b){return b.getClientRects().length > 0;});"
+                    "  if (!last) return JSON.stringify({text:'', md_text:'', html_len:0, child_count:0, has_action:false, copy_delta:copyDelta, stop_present:stopPresent, is_thinking:false});"
                     # Text: the clean answer lives in ``.markdown`` textContent.
                     # It's empty during streaming and populates as the turn
                     # settles — so we ALSO capture ``innerText`` (populated
@@ -484,7 +523,7 @@ class CompletionDetector:
                     # reasoning UI label ("Thinking.../Thought for N seconds"),
                     # so md_text is captured SEPARATELY and Python prefers it;
                     # the innerText fallback is trimmed of the leading label.
-                    "  var md = last.querySelector('.markdown');"
+                    "  var md = last.querySelector('.markdown, .prose, [data-message-content]');"
                     "  var mdText = md ? (md.textContent || '') : '';"
                     "  var rawText = (last.innerText || '').trim();"
                     # Strip a leading "Thinking..." / "Thought for …" reasoning
@@ -519,7 +558,7 @@ class CompletionDetector:
                     '            [data-testid*="turn-action-button"],'
                     '            [data-testid*="copy"],'
                     '            [data-testid*="response-turn"]\';'
-                    "  var has_action = (function() {"
+                    "  var legacy_action = (function() {"
                     "    var lastRect = last.getBoundingClientRect();"
                     "    var scope = last;"
                     "    for (var d = 0; scope && d <= 8; d++, scope = scope.parentElement) {"
@@ -555,7 +594,8 @@ class CompletionDetector:
                     "  var hasThinkingEl = !!last.querySelector('.result-thinking');"
                     "  var visibleThinking = /^(thinking|reasoning)\\b/i.test(rawText.trim());"
                     "  var is_thinking = !has_action && (hasThinkingEl || (visibleThinking && !mdText));"
-                    "  return JSON.stringify({text: text, md_text: mdText, html_len: html_len, child_count: child_count, has_action: has_action, is_thinking: is_thinking});"
+                    "  var has_action = legacy_action || copyDelta;"
+                    "  return JSON.stringify({text: text, md_text: mdText, html_len: html_len, child_count: child_count, has_action: has_action, copy_delta:copyDelta, stop_present:stopPresent, is_thinking: is_thinking});"
                     "})()",
                 )
                 data = json.loads(result)
@@ -568,6 +608,8 @@ class CompletionDetector:
             html_len = data.get("html_len", 0)
             child_count = data.get("child_count", 0)
             has_action = data.get("has_action", False)
+            copy_delta = data.get("copy_delta", False)
+            stop_present = data.get("stop_present", False)
             is_thinking = data.get("is_thinking", False)
 
             # Streaming source: prefer the clean .markdown answer container
@@ -576,6 +618,20 @@ class CompletionDetector:
             # the innerText fallback (with its leading label already stripped
             # in JS) is what carries the streamed answer.
             current = md_text or current
+
+            if copy_delta:
+                if current and current == last_copy_text and not stop_present:
+                    copy_stable_polls += 1
+                else:
+                    copy_stable_polls = 0
+                last_copy_text = current
+                # A Copy delta is a terminal DOM signal only after one extra
+                # same-text poll, with Stop absent as a prerequisite. Do not
+                # use Stop *absence* as proof of completion.
+                has_action = bool(current) and copy_stable_polls >= 1 and not stop_present
+            else:
+                copy_stable_polls = 0
+                last_copy_text = ""
 
             # is_thinking means the model is actively reasoning — the DOM is
             # legitimately static for tens of seconds, which is NOT a stall.
@@ -669,7 +725,7 @@ class CompletionDetector:
             backend_fetch_failed = False
             if (
                 conv_id_for_check
-                and (last_dom_text or saw_thinking or is_thinking or had_non_text_content)
+                and (last_dom_text or saw_thinking or is_thinking or had_non_text_content or copy_delta)
                 and time.monotonic() - last_backend_check > 3.0
             ):
                 last_backend_check = time.monotonic()
@@ -687,6 +743,18 @@ class CompletionDetector:
                     )
                     status = collapse_to_end_turn_status(end_result)
                     if status == "complete":
+                        # If the current markup has no usable text-bearing
+                        # assistant container, read the ANCHORED backend text.
+                        # This is observation-only; no message is resent.
+                        # Do not report success based on the Copy icon alone.
+                        if not last_dom_text and not had_non_text_content:
+                            text_result = await d._fetch_text_for_turn(
+                                conv_id_for_check, turn_anchor,
+                            )
+                            if text_result.status == "matched" and text_result.text:
+                                yield StreamChunk(delta=text_result.text)
+                                last_dom_text = text_result.text
+                                self.last_dom_text = last_dom_text
                         # STRICT: end_turn AND usable content. The saw_thinking
                         # unlock lets us CONSULT the backend during thinking, but
                         # we must not finish on a bare end_turn with no answer.
@@ -732,6 +800,7 @@ class CompletionDetector:
                 has_action
                 and (not conv_id_for_check or backend_fetch_failed)
                 and (last_dom_text or had_non_text_content)
+                and not stop_present
             ):
                 logger.info("DOM has_action (fallback completion) — no backend signal")
                 break
