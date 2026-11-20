@@ -34,7 +34,7 @@ function el(kind) {
     getClientRects: () => [{}],
     getBoundingClientRect: () => ({top:100, bottom:180}),
     getAttribute: k => k === 'aria-label' ? kind : null,
-    closest: selector => selector.includes('article') ? root : null,
+    closest: selector => state.rootFound === false ? null : (selector.includes('article') ? root : null),
   };
 }
 const root = {
@@ -462,7 +462,8 @@ async def test_live_shape_driver_fetches_anchored_text_once_after_end_turn():
         if "copyButtons" in expr and "has_action" in expr:
             assert expr == phase2_js
             return _eval_js(
-                phase2_js, "current", copies=1, answer=sentinel
+                phase2_js, "current", copies=1,
+                answer=sentinel, rootFound=False,
             )
         raise AssertionError(expr)
 
@@ -475,3 +476,17 @@ async def test_live_shape_driver_fetches_anchored_text_once_after_end_turn():
     d._fetch_text_for_turn.assert_awaited_once()
     d.click_send.assert_awaited_once()
     assert d._completion.last_dom_text == ""  # zero untrusted DOM bytes
+
+
+
+@pytest.mark.asyncio
+async def test_copy_button_without_any_turn_root_keeps_dom_text_empty():
+    """October live DOM: no article or conversation-turn ancestor for Copy."""
+    js = await _actual_phase2_expression(0)
+    result = json.loads(
+        _eval_js(js, "current", copies=1, rootFound=False)
+    )
+    assert result["copy_delta"] is True
+    assert result["text"] == ""
+    assert result["md_text"] == ""
+    assert result["html_len"] == 0
