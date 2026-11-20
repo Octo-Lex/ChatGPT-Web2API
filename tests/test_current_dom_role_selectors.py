@@ -423,7 +423,8 @@ async def test_live_shape_driver_fetches_anchored_text_once_after_end_turn():
     conv_id = "6b0016ad-different-from-the-prior-live-conversation"
     phase2_js = await _actual_phase2_expression(0)
     d = CDPDriver(cdp_port=9222)
-    d._current_conv_id = conv_id
+    d._current_conv_id = None  # true fresh-chat path
+    d._get_live_conversation_id_best_effort = AsyncMock(return_value=conv_id)
     d._identity_listener = None
     d._assert_owned_tab_required = MagicMock()
     d._read_assistant_count_baseline = AsyncMock(return_value=0)
