@@ -1266,11 +1266,17 @@ class CDPDriver:
             "  }"
             f"  var composer = document.querySelector('{COMPOSER_SELECTOR}')"
             f"    || document.querySelector('{COMPOSER_FALLBACK_SELECTOR}');"
-            '  var stop = document.querySelector(\'[data-testid="stop-button"], '
+            '  var stops = document.querySelectorAll(\'[data-testid="stop-button"], '
             'button[aria-label*="Stop" i]\');'
+            "  var stopPresent = false;"
+            "  for (var si = 0; si < stops.length; si++) {"
+            "    if (stops[si].getClientRects().length > 0) {"
+            "      stopPresent = true; break;"
+            "    }"
+            "  }"
             "  return JSON.stringify({"
             "    url: location.href, ready_state: document.readyState,"
-            "    composer: visible(composer), stop_present: visible(stop)"
+            "    composer: visible(composer), stop_present: stopPresent"
             "  });"
             "})()"
         )
