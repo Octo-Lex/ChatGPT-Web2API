@@ -92,7 +92,10 @@ def test_detector_has_only_driver_and_transient_results():
     (last_dom_text / had_non_text_content). No long-lived config migrates in."""
     detector, _ = _make_detector()
     own = vars(detector)
-    assert set(own) == {"_driver", "last_dom_text", "had_non_text_content"}, (
+    assert set(own) == {
+        "_driver", "last_dom_text", "had_non_text_content",
+        "last_anchored_conv_id",
+    }, (
         f"unexpected instance state on CompletionDetector: {set(own)}"
     )
 
@@ -104,6 +107,7 @@ def test_per_call_results_reset_on_each_call():
     # Pollute them; the first thing the method does is reset both to defaults.
     detector.last_dom_text = "stale"
     detector.had_non_text_content = True
+    detector.last_anchored_conv_id = "stale-conversation"
 
     # The detector calls _js_strict with several distinct JS expressions:
     #   - the rate-limit body scan  -> JSON {"text": ...}
@@ -143,6 +147,7 @@ def test_per_call_results_reset_on_each_call():
     # the poll carrying text="hi", last_dom_text reflects THIS call ("hi").
     assert detector.last_dom_text == "hi"
     assert detector.last_dom_text != "stale"
+    assert detector.last_anchored_conv_id == "conv-1"
 
 
 # ── 4. Back-compat re-exports from cdp_driver ─────────────────────────
