@@ -77,15 +77,15 @@ _CONNECT_READY_TIMEOUT = 10
 # Canonical home moved to chatgpt_dom.py in Phase 5 PR3; re-exported here for
 # back-compat (tests import these from cdp_driver, and the navigation methods
 # that stay here still reference them).
-from .dom_turn_signals import (  # noqa: E402
-    ASSISTANT_TURN_COUNT_JS,
-    USER_TURN_COUNT_JS,
-)
 from .chatgpt_dom import (  # noqa: E402,F401
     COMPOSER_FALLBACK_SELECTOR,
     COMPOSER_SELECTOR,
     SEND_BUTTON_FALLBACK_SELECTOR,
     SEND_BUTTON_SELECTOR,
+)
+from .dom_turn_signals import (  # noqa: E402
+    ASSISTANT_TURN_COUNT_JS,
+    USER_TURN_COUNT_JS,
 )
 
 # ── P2: Navigation readiness probe ────────────────────────────────────────
