@@ -61,11 +61,18 @@ const edits = Array.from({length:state.edits ?? (mode === 'current' ? 1 : 0)}, (
 const legacyAssistants = mode === 'legacy' ? [root] : [];
 const legacyUsers = mode === 'legacy' ? [el('user')] : [];
 const hiddenMenus = state.hiddenMenus || [];  // irrelevant role=menuitem nodes
+const assistantExtras = ['Read aloud', 'Share', 'More actions'];
+const userExtras = ['Share prompt'];
 const document = {
   body: {innerText: state.bodyText || '<script>Copy x12 Retry x12</script>'},
   querySelectorAll: selector => {
     if (selector.startsWith('button[aria-label="Copy"]')) return copies;
     if (selector.startsWith('button[aria-label="Edit message"]')) return edits;
+    if (mode === 'current') {
+      for (const label of [...assistantExtras, ...userExtras]) {
+        if (selector === 'button[aria-label="' + label + '"]') return [el(label)];
+      }
+    }
     if (selector.startsWith('[data-message-author-role="assistant"]')) return legacyAssistants;
     if (selector.startsWith('[data-message-author-role="user"]')) return legacyUsers;
     if (selector.includes('stop-button')) return state.stop ? [el('Stop')] : [];
@@ -329,3 +336,17 @@ async def test_action_toolbar_alone_is_not_a_non_text_response():
     assert state["text"] == ""
     assert state["html_len"] == 0
     assert state["child_count"] == 0
+
+
+
+@pytest.mark.parametrize("label", [
+    "Copy", "Read aloud", "Share", "More actions",
+    "Edit message", "Share prompt",
+])
+def test_current_layout_exposes_exact_action_row_labels_without_role_attrs(
+    label,
+):
+    selector = json.dumps(f'button[aria-label="{label}"]')
+    expression = f"document.querySelectorAll({selector}).length"
+    assert _eval_js(expression, "current", copies=1, edits=1) == 1
+    assert _eval_js(expression, "legacy", copies=0, edits=0) == 0
