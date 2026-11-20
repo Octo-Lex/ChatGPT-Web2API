@@ -540,8 +540,17 @@ class CompletionDetector:
                     # such as "ChatGPT said:" and action-toolbar labels. With
                     # no semantic content descendant, its innerText is NOT
                     # assistant text and must not be streamed optimistically.
-                    "  var text = mdText || (fromCopyRoot ? '' :"
-                    "    rawText.replace(/^Think(ing|\\s+for)[^\\n]*\\n?/i, ''));"
+                    # The fallback can briefly bind a legacy role wrapper
+                    # during UI hydration. Its screen-reader h4 label may be
+                    # the ONLY text: "ChatGPT said:". Strip that standalone
+                    # role header BEFORE any StreamChunk can be committed.
+                    # Never remove same-line actual answer content or modify
+                    # text from a semantic .markdown/.prose container.
+                    "  var fallbackText = rawText"
+                    "    .replace(/^Think(ing|\\s+for)[^\\n]*\\n?/i, '')"
+                    "    .replace(/^ChatGPT said:(?:[ \\t]*\\r?\\n|$)/i, '')"
+                    "    .trim();"
+                    "  var text = mdText || (fromCopyRoot ? '' : fallbackText);"
                     # A current article includes an action toolbar whose
                     # HTML can exceed 50 chars even with ZERO answer content.
                     # Do not mistake that wrapper for non-text assistant
