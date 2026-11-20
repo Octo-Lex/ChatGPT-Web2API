@@ -86,8 +86,7 @@ def _run_js(expression, scenario=None):
         ["node", "-e", _JS_FAKE_DOM],
         input=json.dumps({"expression": expression, "scenario": scenario or {}}),
         text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        capture_output=True,
         check=True,
         timeout=8,
     )
