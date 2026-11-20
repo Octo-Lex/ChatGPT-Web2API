@@ -1921,6 +1921,7 @@ class CDPDriver:
             if conv_id:
                 logger.info("Conversation: %s", conv_id)
                 self._current_conv_id = conv_id
+                self._expected_send_context = ("conversation", conv_id)
                 last_dom_text = self._completion.last_dom_text
                 had_non_text_content = self._completion.had_non_text_content
                 # A2: anchored final-text reconciliation. The selector resolves
