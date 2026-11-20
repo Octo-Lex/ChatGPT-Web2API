@@ -502,7 +502,7 @@ class CompletionDetector:
                     "(function() {"
                     f"  var msgs = document.querySelectorAll('{LEGACY_ASSISTANT_SELECTOR}');"
                     f"  var copyButtons = document.querySelectorAll('{COPY_BUTTON_SELECTOR}');"
-                    f"  var copyDelta = copyButtons.length > {int(0)} + {initial_count};"
+                    f"  var copyDelta = copyButtons.length > {initial_count};"
                     # The old assistant node must not be read while a new
                     # USER node has appeared but no new assistant node yet.
                     f"  var last = msgs.length > {initial_count} ? msgs[msgs.length - 1] : null;"
@@ -593,8 +593,8 @@ class CompletionDetector:
                     # so the stall clock treats it as active generation, not a stall.
                     "  var hasThinkingEl = !!last.querySelector('.result-thinking');"
                     "  var visibleThinking = /^(thinking|reasoning)\\b/i.test(rawText.trim());"
-                    "  var is_thinking = !has_action && (hasThinkingEl || (visibleThinking && !mdText));"
                     "  var has_action = legacy_action || copyDelta;"
+                    "  var is_thinking = !has_action && (hasThinkingEl || (visibleThinking && !mdText));"
                     "  return JSON.stringify({text: text, md_text: mdText, html_len: html_len, child_count: child_count, has_action: has_action, copy_delta:copyDelta, stop_present:stopPresent, is_thinking: is_thinking});"
                     "})()",
                 )
@@ -747,7 +747,7 @@ class CompletionDetector:
                         # assistant container, read the ANCHORED backend text.
                         # This is observation-only; no message is resent.
                         # Do not report success based on the Copy icon alone.
-                        if not last_dom_text and not had_non_text_content:
+                        if not last_dom_text:
                             text_result = await d._fetch_text_for_turn(
                                 conv_id_for_check, turn_anchor,
                             )
