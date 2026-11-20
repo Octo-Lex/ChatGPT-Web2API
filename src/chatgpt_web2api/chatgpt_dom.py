@@ -111,6 +111,51 @@ class ChatGPTDom:
     def __init__(self, driver) -> None:
         self._driver = driver
 
+    def _send_route_guard_js(self) -> str:
+        """Produce the read-only in-page route guard used at type and click.
+
+        A verified navigation supplies exact fresh-route or conversation-ID
+        authority. For legacy entrypoints without such authority (NAV-07 GPT),
+        this only validates the HTTPS ChatGPT origin; it cannot establish
+        conversation ownership. That limitation is explicitly tracked.
+        """
+        context = getattr(self._driver, "_expected_send_context", None)
+        if not (isinstance(context, tuple) and len(context) == 2):
+            context = None
+
+        if context and context[0] == "fresh":
+            route_check = (
+                "  routeOk = routeOk && path === "
+                + json.dumps(context[1].rstrip("/") or "/")
+                + ";"
+            )
+        elif context and context[0] == "conversation":
+            route_check = (
+                "  var parts = path.split('/').filter(Boolean);"
+                "  routeOk = routeOk && ("
+                "    (parts.length === 2 && parts[0] === 'c' &&"
+                "      parts[1] === " + json.dumps(context[1]) + ") ||"
+                "    (parts.length === 4 && parts[0] === 'g' &&"
+                "      parts[2] === 'c' &&"
+                "      parts[3] === " + json.dumps(context[1]) + ")"
+                "  );"
+            )
+        else:
+            route_check = ""  # origin-only for unbound/legacy entrypoints
+
+        return (
+            "  var routeOk = false;"
+            "  try {"
+            "    var currentUrl = new URL(location.href);"
+            "    var path = currentUrl.pathname.replace(/\/+$/, '') || '/';"
+            "    routeOk = currentUrl.protocol === 'https:' &&"
+            "      currentUrl.hostname === 'chatgpt.com' &&"
+            "      currentUrl.port === '' &&"
+            "      currentUrl.username === '' && currentUrl.password === '';"
+            + route_check
+            + "  } catch(e) { routeOk = false; }"
+        )
+
     # ── Send readiness ────────────────────────────────────────
 
     async def _has_composer(self) -> bool:
@@ -207,6 +252,8 @@ class ChatGPTDom:
         # 'no composer') so the verify step reads the right element.
         focus_result = await d._js(
             "(function() {"
+            + self._send_route_guard_js()
+            + "  if (!routeOk) return 'wrong send route';"
             f"  var el = document.querySelector('{COMPOSER_SELECTOR}');"
             "  if (el) { el.focus(); return 'composer'; }"
             f"  var fb = document.querySelector('{COMPOSER_FALLBACK_SELECTOR}');"
@@ -214,6 +261,10 @@ class ChatGPTDom:
             "  return 'no composer';"
             "})()"
         )
+        if focus_result == "wrong send route":
+            from .cdp_driver import SendReadinessError
+
+            raise SendReadinessError("Type refused: wrong send route")
         if focus_result == "no composer":
             await d._capture_selector_diagnostic("composer (type_message)")
             if d._breakers:
@@ -454,17 +505,21 @@ class ChatGPTDom:
         while time.monotonic() < deadline:
             has_btn = await d._js(
                 "(function() {"
+                + self._send_route_guard_js()
                 + lookup_js
+                + "  if (!routeOk) return 'wrong send route';"
                 + "  return (!stopPresent && !stopLike && visible(btn)) ? 'yes' : 'no';"
                 "})()"
             )
-            if has_btn == "yes":
+            if has_btn in ("yes", "wrong send route"):
                 break
             await asyncio.sleep(SEND_BUTTON_POLL_INTERVAL_S)
 
         result = await d._js(
             "(function() {"
+            + self._send_route_guard_js()
             + lookup_js
+            + "  if (!routeOk) return 'wrong send route';"
             + "  if (stopPresent || stopLike) return 'stop button present';"
             "  if (!btn) return 'no send button';"
             "  if (!visible(btn)) return 'button disabled or hidden';"
