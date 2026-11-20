@@ -775,32 +775,26 @@ class CompletionDetector:
                     )
                     status = collapse_to_end_turn_status(end_result)
                     if status == "complete":
-                        # If the current markup has no usable text-bearing
-                        # assistant container, read the ANCHORED backend text.
-                        # This is observation-only; no message is resent.
-                        # Do not report success based on the Copy icon alone.
-                        if not last_dom_text:
-                            text_result = await d._fetch_text_for_turn(
-                                conv_id_for_check, turn_anchor,
-                            )
-                            if text_result.status == "matched" and text_result.text:
-                                yield StreamChunk(delta=text_result.text)
-                                last_dom_text = text_result.text
-                                self.last_dom_text = last_dom_text
-                        # STRICT: end_turn AND usable content. The saw_thinking
-                        # unlock lets us CONSULT the backend during thinking, but
-                        # we must not finish on a bare end_turn with no answer.
-                        if last_dom_text or had_non_text_content:
-                            logger.info(
-                                "Backend end_turn=true (primary completion) for %s",
-                                conv_id_for_check,
-                            )
-                            break
-                        logger.debug(
-                            "Backend end_turn=true but no content yet for %s — "
-                            "not completing (strict content guard)",
+                        # STRICT completion is established by the turn-anchored
+                        # selector, not a generic end_turn flag. Its "matched"
+                        # status requires an exact-turn assistant with
+                        # nonempty terminal text, OR a terminal non-text node
+                        # with the existing DOM non-text guard. "not_ready",
+                        # ambiguous and degraded states never enter here.
+                        #
+                        # IMPORTANT: this detector MUST NOT fetch or stream the
+                        # backend text here. The driver is the sole owner of
+                        # the final anchored text read/emission. Fetching once
+                        # here and again in the driver can produce different
+                        # snapshots of the same turn, causing a false prefix
+                        # mismatch after v1 has already escaped to the client.
+                        # Existing clean DOM streaming remains unchanged.
+                        logger.info(
+                            "Backend end_turn=true (primary completion) for %s; "
+                            "terminal text deferred to driver",
                             conv_id_for_check,
                         )
+                        break
                     elif status == "fetch_failed":
                         backend_fetch_failed = True
                         logger.debug(
