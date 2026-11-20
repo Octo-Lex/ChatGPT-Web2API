@@ -176,3 +176,65 @@ async def test_whitespace_only_difference_stays_fail_closed_and_private(caplog):
     assert answer not in caplog.text
     assert "whitespace_only=True" in caplog.text
     d.click_send.assert_awaited_once()
+
+
+
+@pytest.mark.asyncio
+async def test_r1_no_conversation_id_never_finishes_http_200(monkeypatch):
+    """Zero DOM/backend ID and no /c/ URL cannot be a successful empty REST."""
+    d = _driver_with_texts("", "PR57-LIVE-exact")
+    d._completion.last_anchored_conv_id = ""
+    d._js_strict = AsyncMock(return_value="https://chatgpt.com/")
+
+    from chatgpt_web2api import cdp_driver as drv_mod
+    monkeypatch.setattr(drv_mod.asyncio, "sleep", AsyncMock())
+
+    with pytest.raises(
+        TurnReconciliationError, match="conversation_id_unavailable"
+    ) as caught:
+        _ = [c async for c in d.send_and_stream("one send", timeout=5)]
+    assert caught.value.last_status == "conversation_id_unavailable"
+    d._fetch_text_for_turn.assert_not_awaited()
+    d.click_send.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_r1_anchored_midloop_id_rescues_missing_final_url():
+    """Only a matched per-turn backend end_turn can supply a fallback ID."""
+    sentinel = "PR57-LIVE-exact"
+    d = _driver_with_texts("", sentinel)
+    d._completion.last_anchored_conv_id = "conv-integrity"
+    d._js_strict = AsyncMock(return_value="https://chatgpt.com/")
+    chunks = [c async for c in d.send_and_stream("one send", timeout=5)]
+    assert "".join(c.delta for c in chunks) == sentinel
+    assert chunks[-1].finish_reason == "stop"
+    assert d._current_conv_id == "conv-integrity"
+    d._fetch_text_for_turn.assert_awaited_once()
+    d.click_send.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("visible_url,anchor_mode,anchor_conversation,expected_status", [
+    ("https://chatgpt.com/c/other-conv", "fresh_chat", None,
+     "conversation_id_mismatch"),
+    ("https://chatgpt.com/", "existing_conversation", "other-conv",
+     "conversation_id_anchor_mismatch"),
+])
+async def test_r1_trusted_id_refuses_foreign_url_or_anchor(
+    visible_url, anchor_mode, anchor_conversation, expected_status,
+):
+    d = _driver_with_texts("", "PR57-LIVE-exact")
+    d._completion.last_anchored_conv_id = "conv-integrity"
+    d._capture_pre_send_fallback_anchor = AsyncMock(
+        return_value=TurnAnchor(
+            sent_text="one send",
+            mode=anchor_mode,
+            conversation_id_at_capture=anchor_conversation,
+        )
+    )
+    d._js_strict = AsyncMock(return_value=visible_url)
+    with pytest.raises(TurnReconciliationError) as caught:
+        _ = [c async for c in d.send_and_stream("one send", timeout=5)]
+    assert caught.value.last_status == expected_status
+    d._fetch_text_for_turn.assert_not_awaited()
+    d.click_send.assert_awaited_once()
