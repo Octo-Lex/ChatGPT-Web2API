@@ -37,7 +37,7 @@ function el(kind) {
   };
 }
 const root = {
-  innerText: state.answer || 'Current UI answer.',
+  innerText: state.answer ?? 'Current UI answer.',
   innerHTML: '<p>Current UI answer</p>'.repeat(3),
   children: [1],
   parentElement: null,
@@ -317,3 +317,15 @@ async def test_copy_cannot_override_backend_not_ready_or_visible_stop(
     assert phase2_calls[0] == 5
     if backend_enabled:
         d._fetch_end_turn_for_turn.assert_awaited()
+
+
+
+@pytest.mark.asyncio
+async def test_action_toolbar_alone_is_not_a_non_text_response():
+    """A newly mounted Copy toolbar alone must not imply usable rich content."""
+    js = await _actual_phase2_expression(0)
+    state = json.loads(_eval_js(js, "current", copies=1, answer=""))
+    assert state["copy_delta"] is True
+    assert state["text"] == ""
+    assert state["html_len"] == 0
+    assert state["child_count"] == 0
