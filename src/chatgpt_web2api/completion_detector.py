@@ -531,7 +531,10 @@ class CompletionDetector:
                     "  var rawText = (last.innerText || '').trim();"
                     # Strip a leading "Thinking..." / "Thought for …" reasoning
                     # label so the innerText fallback can't leak it as a delta.
-                    # The current-only Copy/article root contains UI chrome"
+                    # The current Copy/article root can include role chrome
+                    # such as "ChatGPT said:" and action-toolbar labels. With
+                    # no semantic content descendant, its innerText is NOT
+                    # assistant text and must not be streamed optimistically.
                     "  var text = mdText || (fromCopyRoot ? '' :"
                     "    rawText.replace(/^Think(ing|\\s+for)[^\\n]*\\n?/i, ''));"
                     # A current article includes an action toolbar whose
