@@ -12,6 +12,7 @@ Provides typed primitives for:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -1856,6 +1857,36 @@ class CDPDriver:
                         # mixed/garbled answer. An empty DOM baseline safely
                         # emits the entire anchored backend text.
                         if not result.text.startswith(last_dom_text):
+                            # Log classification only, not raw assistant text:
+                            # private responses should not escape via WARN logs.
+                            # A whitespace-only difference is diagnostically
+                            # useful but is NOT an exact-match success.
+                            mismatch_at = next(
+                                (
+                                    i for i, (x, y) in enumerate(
+                                        zip(last_dom_text, result.text)
+                                    ) if x != y
+                                ),
+                                min(len(last_dom_text), len(result.text)),
+                            )
+                            dom_digest = hashlib.sha256(
+                                last_dom_text.encode("utf-8")
+                            ).hexdigest()[:12]
+                            backend_digest = hashlib.sha256(
+                                result.text.encode("utf-8")
+                            ).hexdigest()[:12]
+                            whitespace_only = (
+                                last_dom_text.strip() == result.text.strip()
+                            )
+                            logger.warning(
+                                "Anchored text prefix mismatch: conv_id=%s "
+                                "dom_len=%d backend_len=%d first_diff=%d "
+                                "whitespace_only=%s dom_sha256_12=%s "
+                                "backend_sha256_12=%s",
+                                conv_id, len(last_dom_text), len(result.text),
+                                mismatch_at, whitespace_only,
+                                dom_digest, backend_digest,
+                            )
                             raise TurnReconciliationError(
                                 conversation_id=conv_id,
                                 anchor_mode=turn_anchor.mode,
@@ -1864,6 +1895,10 @@ class CDPDriver:
                                     "captured_id": turn_anchor.captured_user_message_id,
                                     "dom_text_length": len(last_dom_text),
                                     "backend_text_length": len(result.text),
+                                    "first_mismatch_offset": mismatch_at,
+                                    "whitespace_only": whitespace_only,
+                                    "dom_sha256_12": dom_digest,
+                                    "backend_sha256_12": backend_digest,
                                     "reason": "DOM delta is not a prefix of anchored text",
                                 },
                             )
