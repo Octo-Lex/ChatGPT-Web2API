@@ -435,6 +435,11 @@ class CompletionDetector:
         # (either .markdown text OR non-trivial HTML footprint). The threshold
         # (> 50 chars) prevents false 'done' from an empty/partial node.
         last_dom_text = ""
+        # The emitted prefix must never be replaced by a shorter/unrelated
+        # DOM snapshot: emitted StreamChunks cannot be retracted. Track raw
+        # observations separately to detect real progress without advancing
+        # the emitted baseline on non-prefix revisions.
+        last_observed_dom_text = ""
         last_html_len = 0
         last_child_count = 0
         had_non_text_content = False
@@ -671,8 +676,12 @@ class CompletionDetector:
             # logging, but does NOT pause the stall clock (a stuck indicator
             # must not create an infinite hang).
             generation_active_signal = bool(is_thinking)
-            if current != last_dom_text:
+            observation_changed = current != last_observed_dom_text
+            if observation_changed:
+                last_observed_dom_text = current
                 last_change_time = time.monotonic()
+
+            if current.startswith(last_dom_text) and len(current) > len(last_dom_text):
                 # P1: first text content transitions us from awaiting_first_content
                 # to streaming_after_first_content. The stall budget changes with
                 # the state (see the stall check below). When the state flips,
@@ -682,11 +691,18 @@ class CompletionDetector:
                 if current and not first_content_seen:
                     first_content_seen = True
                     last_change_time = time.monotonic()  # reset stream-idle clock
-                if len(current) > len(last_dom_text):
-                    delta = current[len(last_dom_text) :]
-                    yield StreamChunk(delta=delta)
+                # Only a genuine append to bytes already emitted is a safe
+                # delta. Never slice a non-prefix DOM mutation by length.
+                delta = current[len(last_dom_text):]
+                yield StreamChunk(delta=delta)
                 last_dom_text = current
                 self.last_dom_text = last_dom_text
+            elif observation_changed and not current.startswith(last_dom_text):
+                logger.debug(
+                    "Non-prefix DOM text revision; retain emitted baseline "
+                    "(observed_len=%d, emitted_len=%d)",
+                    len(current), len(last_dom_text),
+                )
 
             # Non-text progress signals (images, tool-use, etc.)
             if html_len != last_html_len or child_count != last_child_count:
