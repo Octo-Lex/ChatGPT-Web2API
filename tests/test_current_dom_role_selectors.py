@@ -16,7 +16,10 @@ from chatgpt_web2api.cdp_driver import CDPDriver
 from chatgpt_web2api.completion_detector import CompletionDetector
 from chatgpt_web2api.dom_turn_signals import (
     ASSISTANT_TURN_COUNT_JS,
+    TURN_SIGNAL_COUNTS_JS,
     USER_TURN_COUNT_JS,
+    parse_turn_signal_counts,
+    turn_signal_increased,
 )
 from chatgpt_web2api.turn_anchor import TurnAnchor, TurnEndResult, TurnTextResult
 
@@ -47,6 +50,9 @@ const root = {
   getBoundingClientRect: () => ({top:100, bottom:180}),
   querySelector: selector => {
     if (selector.includes('result-thinking')) return null;
+    if (selector.includes('img, canvas, video, audio')) {
+      return state.richContent ? {nodeName:'IMG'} : null;
+    }
     if (mode === 'legacy' && selector.includes('markdown')) {
       return {textContent: state.answer || 'Legacy answer.'};
     }
@@ -61,13 +67,23 @@ const root = {
 };
 const copies = Array.from({length:state.copies ?? (mode === 'current' ? 1 : 0)}, () => el('Copy'));
 const edits = Array.from({length:state.edits ?? (mode === 'current' ? 1 : 0)}, () => el('Edit message'));
-const legacyAssistants = mode === 'legacy' || state.transientLegacyAssistant ? [root] : [];
-const legacyUsers = mode === 'legacy' ? [el('user')] : [];
+const legacyAssistants = Array.from({
+  length:state.legacyAssistantCount ??
+    ((mode === 'legacy' || state.transientLegacyAssistant) ? 1 : 0)
+}, () => root);
+const legacyUsers = Array.from({
+  length:state.legacyUserCount ?? (mode === 'legacy' ? 1 : 0)
+}, () => el('user'));
 const hiddenMenus = state.hiddenMenus || [];  // irrelevant role=menuitem nodes
 const assistantExtras = ['Read aloud', 'Share', 'More actions'];
 const userExtras = ['Share prompt'];
 const document = {
   body: {innerText: state.bodyText || '<script>Copy x12 Retry x12</script>'},
+  querySelector: selector => (
+    selector.includes('prompt-textarea') || selector.includes('role="textbox"')
+  ) ? (state.composerPresent === false ? null
+      : {innerText:state.composerText || '', value:state.composerText || ''})
+    : null,
   querySelectorAll: selector => {
     if (selector.startsWith('button[aria-label="Copy"]')) return copies;
     if (selector.startsWith('button[aria-label="Edit message"]')) return edits;
@@ -111,16 +127,21 @@ class _CapturedProbe(Exception):
     pass
 
 
-async def _actual_phase2_expression(initial_count=0):
+async def _actual_phase2_expression(initial_count=0, pre_signals=None):
     """Collect the actual generated JS, rather than reimplementing it in tests."""
     d = MagicMock()
     d._current_conv_id = None
     d._pre_send_user_count = None
+    d._pre_send_signal_counts = pre_signals
     seen = []
 
     async def _js(expr, timeout=15):
         if "body.innerText" in expr:
             return json.dumps({"text": ""})
+        if pre_signals is not None and expr == TURN_SIGNAL_COUNTS_JS:
+            new = dict(pre_signals)
+            new["copy"] += 1
+            return json.dumps(new)
         if "copyButtons" in expr and "has_action" in expr:
             seen.append(expr)
             raise _CapturedProbe
@@ -547,3 +568,156 @@ async def test_role_label_removed_only_when_standalone_and_only_in_raw_fallback(
     semantic = json.loads(_eval_js(script, "legacy", answer=literal))
     assert semantic["md_text"] == literal
     assert semantic["text"] == literal
+
+
+
+@pytest.mark.asyncio
+async def test_r2_mixed_dom_signals_and_phase2_copy_use_independent_baselines():
+    """Real executable JS: four legacy turns mask the new Copy/Edit in max()."""
+    before = parse_turn_signal_counts(_eval_js(
+        TURN_SIGNAL_COUNTS_JS, "current", copies=0, edits=0,
+        legacyAssistantCount=4, legacyUserCount=4,
+    ))
+    after = parse_turn_signal_counts(_eval_js(
+        TURN_SIGNAL_COUNTS_JS, "current", copies=1, edits=1,
+        legacyAssistantCount=4, legacyUserCount=4,
+    ))
+    assert max(before["copy"], before["legacy_assistant"]) == 4
+    assert max(after["copy"], after["legacy_assistant"]) == 4
+    assert turn_signal_increased(after, before, "assistant")
+    assert turn_signal_increased(after, before, "user")
+
+    # Capture the actual detector-composed JS for the mixed baseline of 4,
+    # rather than reimplementing the phase-2 selector in the test.
+    js = await _actual_phase2_expression(initial_count=4, pre_signals=before)
+    state = json.loads(_eval_js(
+        js, "current", copies=1, edits=1,
+        legacyAssistantCount=4, legacyUserCount=4, rootFound=False,
+    ))
+    assert state["copy_delta"] is True
+    assert state["text"] == ""  # old legacy nodes never treated as a new turn
+
+
+@pytest.mark.asyncio
+async def test_r2_mixed_dom_appearance_uses_independent_snapshot():
+    before = parse_turn_signal_counts(_eval_js(
+        TURN_SIGNAL_COUNTS_JS, "current", copies=0, edits=0,
+        legacyAssistantCount=4, legacyUserCount=4,
+    ))
+    after = _eval_js(
+        TURN_SIGNAL_COUNTS_JS, "current", copies=1, edits=1,
+        legacyAssistantCount=4, legacyUserCount=4,
+    )
+    d = MagicMock()
+    d._pre_send_signal_counts = before
+    d._pre_send_user_count = 4
+    d._current_conv_id = "conv-mixed"
+    d._fetch_end_turn_for_turn = AsyncMock(
+        return_value=TurnEndResult(status="matched")
+    )
+    script = await _actual_phase2_expression(initial_count=4, pre_signals=before)
+    counts_queried = [0]
+
+    async def evaluate(expr, timeout=15):
+        if "body.innerText" in expr:
+            return '{"text": ""}'
+        if expr == TURN_SIGNAL_COUNTS_JS:
+            counts_queried[0] += 1
+            return after
+        if "copyButtons" in expr and "has_action" in expr:
+            assert expr == script
+            return _eval_js(
+                expr, "current", copies=1, edits=1,
+                legacyAssistantCount=4, legacyUserCount=4,
+                rootFound=False,
+            )
+        raise AssertionError(expr)
+
+    d._js_strict = evaluate
+    det = CompletionDetector(d)
+    chunks = [c async for c in det.stream_until_complete(
+        initial_count=4, timeout=10,
+        turn_anchor=TurnAnchor(sent_text="one send", mode="fresh_chat"),
+    )]
+    assert counts_queried[0] > 0
+    assert chunks == []
+    assert det.last_anchored_conv_id == "conv-mixed"
+    d._fetch_end_turn_for_turn.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_r2_mixed_dom_send_acknowledgment_checks_edit_delta():
+    before = parse_turn_signal_counts(_eval_js(
+        TURN_SIGNAL_COUNTS_JS, "current", copies=0, edits=0,
+        legacyAssistantCount=4, legacyUserCount=4,
+    ))
+    d = CDPDriver(cdp_port=9222)
+    d._pre_send_signal_counts = before
+    d._pre_send_user_count = 4
+
+    async def evaluate(expr, timeout=15):
+        assert "userCount" in expr and "composerEmpty" in expr
+        return _eval_js(
+            expr, "current", copies=1, edits=1,
+            legacyAssistantCount=4, legacyUserCount=4, composerText="",
+        )
+
+    d._js_strict = evaluate
+    assert await d._verify_send_acknowledged() is True
+
+
+@pytest.mark.asyncio
+async def test_r3_role_only_html_does_not_set_sticky_non_text_evidence():
+    """Real detector loop: tall legacy chrome has no image/tool response."""
+    js = await _actual_phase2_expression(0)
+    raw = _eval_js(
+        js, "current", copies=0, edits=1,
+        transientLegacyAssistant=True, answer="",
+    )
+    state = json.loads(raw)
+    assert state["text"] == ""
+    assert state["html_len"] == 0
+    assert state["child_count"] == 0
+
+    d = MagicMock()
+    d._pre_send_signal_counts = None
+    d._pre_send_user_count = 0
+    d._current_conv_id = "conv-role-only"
+    d._fetch_end_turn_for_turn = AsyncMock(
+        return_value=TurnEndResult(status="matched")
+    )
+
+    async def evaluate(expr, timeout=15):
+        if "body.innerText" in expr:
+            return '{"text": ""}'
+        if expr == ASSISTANT_TURN_COUNT_JS:
+            return "0"
+        if expr == USER_TURN_COUNT_JS:
+            return "1"
+        if "copyButtons" in expr and "has_action" in expr:
+            assert expr == js
+            return raw
+        raise AssertionError(expr)
+
+    d._js_strict = evaluate
+    det = CompletionDetector(d)
+    _ = [c async for c in det.stream_until_complete(
+        initial_count=0, timeout=10,
+        turn_anchor=TurnAnchor(sent_text="one send", mode="fresh_chat"),
+    )]
+    assert det.had_non_text_content is False
+    assert d._fetch_end_turn_for_turn.await_args.kwargs[
+        "had_non_text_content"
+    ] is False
+
+
+@pytest.mark.asyncio
+async def test_r3_real_rich_content_not_removed_with_role_header():
+    js = await _actual_phase2_expression(0)
+    state = json.loads(_eval_js(
+        js, "current", copies=0, edits=1,
+        transientLegacyAssistant=True, answer="", richContent=True,
+    ))
+    assert state["text"] == ""
+    assert state["html_len"] > 50
+    assert state["child_count"] > 0
