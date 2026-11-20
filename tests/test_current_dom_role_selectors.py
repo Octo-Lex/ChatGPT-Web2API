@@ -257,3 +257,60 @@ async def test_anchored_backend_text_recovers_when_current_dom_has_no_container(
     assert [c.delta for c in chunks] == ["Anchored final text"]
     assert det.last_dom_text == "Anchored final text"
     d._fetch_text_for_turn.assert_awaited_once()
+
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend_enabled,stop_present", [
+    (True, False),   # backend 'not_ready' must not be overridden by Copy
+    (False, True),   # Stop still visible blocks DOM-only completion
+])
+async def test_copy_cannot_override_backend_not_ready_or_visible_stop(
+    backend_enabled, stop_present
+):
+    class _EndProbe(Exception):
+        pass
+
+    d = MagicMock()
+    d._current_conv_id = "known-conv" if backend_enabled else None
+    d._pre_send_user_count = 0
+    d._get_live_conversation_id_best_effort = AsyncMock(return_value="")
+    d._fetch_end_turn_for_turn = AsyncMock(
+        return_value=TurnEndResult(status="not_ready")
+    )
+    phase2_calls = [0]
+
+    async def evaluate(expr, timeout=15):
+        if "body.innerText" in expr:
+            return '{"text": ""}'
+        if expr == ASSISTANT_TURN_COUNT_JS:
+            return "0"
+        if expr == USER_TURN_COUNT_JS:
+            return "1"
+        if "has_action" in expr:
+            phase2_calls[0] += 1
+            if phase2_calls[0] > 4:
+                raise _EndProbe
+            return json.dumps({
+                "text": "In-progress answer",
+                "md_text": "In-progress answer",
+                "html_len": 60,
+                "child_count": 1,
+                "has_action": True,
+                "copy_delta": True,
+                "stop_present": stop_present,
+                "is_thinking": False,
+            })
+        raise AssertionError(expr)
+
+    d._js_strict = evaluate
+    det = CompletionDetector(d)
+    with pytest.raises(_EndProbe):
+        async for _ in det.stream_until_complete(
+            initial_count=0, timeout=10,
+            turn_anchor=TurnAnchor(sent_text="hello", mode="fresh_chat"),
+        ):
+            pass
+    assert phase2_calls[0] == 5
+    if backend_enabled:
+        d._fetch_end_turn_for_turn.assert_awaited()
