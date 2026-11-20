@@ -531,7 +531,9 @@ class CompletionDetector:
                     "  var rawText = (last.innerText || '').trim();"
                     # Strip a leading "Thinking..." / "Thought for …" reasoning
                     # label so the innerText fallback can't leak it as a delta.
-                    "  var text = mdText || rawText.replace(/^Think(ing|\\s+for)[^\\n]*\\n?/i, '');"
+                    # The current-only Copy/article root contains UI chrome"
+                    "  var text = mdText || (fromCopyRoot ? '' :"
+                    "    rawText.replace(/^Think(ing|\\s+for)[^\\n]*\\n?/i, ''));"
                     # A current article includes an action toolbar whose
                     # HTML can exceed 50 chars even with ZERO answer content.
                     # Do not mistake that wrapper for non-text assistant
