@@ -382,6 +382,10 @@ class CDPDriver:
         # refresh tried Ns ago" from "never refreshed."
         self._last_refresh_attempt_at: float = 0.0
         self._current_conv_id: str | None = None
+        # Last VERIFIED conversation/fresh-route target. Navigation establishes
+        # this authority; the send DOM uses it to reject a displaced tab.
+        # None remains possible for legacy GPT entrypoints (tracked NAV-07).
+        self._expected_send_context: tuple[str, str] | None = None
         self._current_model: str | None = None
         # CDP response routing (#7): id-keyed futures + background reader
         self._pending: dict[int, asyncio.Future] = {}
@@ -725,6 +729,7 @@ class CDPDriver:
             self._ws = None
         # Clear stale state (#18) — the page we reconnect to may be different
         self._current_conv_id = None
+        self._expected_send_context = None
         # PR4: capture the pre-reconnect target so we can detect a target change
         # (drift) after a successful reconnect in parallel mode.
         _pre_reconnect_target_id = self._target_id
@@ -1241,6 +1246,7 @@ class CDPDriver:
         """
         # Clear stale continuation state BEFORE any navigation or probe can fail.
         self._current_conv_id = None
+        self._expected_send_context = None
         if gizmo_id:
             url = f"https://chatgpt.com/g/{urllib.parse.quote(gizmo_id, safe='')}/project"
         else:
@@ -1303,6 +1309,10 @@ class CDPDriver:
                 await asyncio.sleep(0.25)
                 if is_ready(await self._js(probe_js)):
                     logger.info("Fresh chat ready: %s", last_state.get("url"))
+                    self._expected_send_context = (
+                        "fresh", f"/g/{urllib.parse.quote(gizmo_id, safe='')}/project"
+                        if gizmo_id else "/",
+                    )
                     return
             await asyncio.sleep(0.5)
 
@@ -1363,6 +1373,8 @@ class CDPDriver:
         fast-fails with ``nav_displaced`` if the URL moves away from the
         target mid-poll (detects SPA redirects / access-denied states).
         """
+        # Invalidate previous authority even if Page.navigate raises.
+        self._expected_send_context = None
         url = f"https://chatgpt.com/c/{conversation_id}"
         logger.info("Navigate to conversation: %s", url)
         await self._cdp("Page.navigate", {"url": url})
@@ -1451,6 +1463,7 @@ class CDPDriver:
 
         await asyncio.sleep(1)
         self._current_conv_id = conversation_id
+        self._expected_send_context = ("conversation", conversation_id)
 
     @staticmethod
     def _is_url_at_conversation(url: str, conversation_id: str) -> bool:
@@ -1468,7 +1481,7 @@ class CDPDriver:
             parsed = urllib.parse.urlparse(url)
         except ValueError:
             return False
-        if "chatgpt.com" not in (parsed.netloc or "").lower():
+        if parsed.scheme != "https" or parsed.netloc.lower() != "chatgpt.com":
             return False
         parts = [p for p in parsed.path.split("/") if p]
         # Find the ("c", conversation_id) adjacent pair — the conversation
@@ -1504,6 +1517,7 @@ class CDPDriver:
         (by ``navigate_conversation``); on failure it is cleared if it matched.
         """
         if await self._is_live_conversation_url(conversation_id):
+            self._expected_send_context = ("conversation", conversation_id)
             return
         await self.navigate_conversation(conversation_id)
         # navigate_conversation raises on failure, so reaching here means it
@@ -2147,6 +2161,9 @@ class CDPDriver:
 
     async def navigate_gpt(self, gizmo_id: str) -> None:
         """Navigate to a Custom GPT for interaction."""
+        # Legacy GPT navigation is not yet route-qualified (NAV-07).
+        # Never preserve authority from a previous fresh/conversation route.
+        self._expected_send_context = None
         url = f"https://chatgpt.com/g/{gizmo_id}"
         logger.info("Navigate to GPT: %s", url)
         await self._cdp("Page.navigate", {"url": url})
