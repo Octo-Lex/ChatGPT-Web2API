@@ -248,6 +248,9 @@ class CompletionDetector:
         # Per-call results surfaced for the driver tail; reset each call.
         self.last_dom_text: str = ""
         self.had_non_text_content: bool = False
+        # Only the exact-turn backend completion selector can attest this ID.
+        # A DOM action button alone must never populate the fallback ID.
+        self.last_anchored_conv_id: str = ""
 
     async def _reconcile_before_stall(
         self, d, conv_id: str, turn_anchor, had_non_text_content: bool,
@@ -281,7 +284,10 @@ class CompletionDetector:
                 had_non_text_content=had_non_text_content,
             )
             status = collapse_to_end_turn_status(end_result)
-            return status == "complete"
+            if status == "complete":
+                self.last_anchored_conv_id = conv_id
+                return True
+            return False
         except AuthExpiredError:
             raise  # never swallow auth expiry — it must surface as auth expiry
         except Exception as e:
@@ -349,6 +355,7 @@ class CompletionDetector:
         # Reset per-call results surfaced to the driver tail.
         self.last_dom_text = ""
         self.had_non_text_content = False
+        self.last_anchored_conv_id = ""
 
         # Wait for a new assistant message. The full `timeout` governs (was
         # capped at 60s, which killed slow-to-appear responses like image
@@ -784,6 +791,7 @@ class CompletionDetector:
                     )
                     status = collapse_to_end_turn_status(end_result)
                     if status == "complete":
+                        self.last_anchored_conv_id = conv_id_for_check
                         # STRICT completion is established by the turn-anchored
                         # selector, not a generic end_turn flag. Its "matched"
                         # status requires an exact-turn assistant with
