@@ -77,7 +77,10 @@ from .dom_turn_signals import (
     ASSISTANT_TURN_COUNT_JS,
     COPY_BUTTON_SELECTOR,
     LEGACY_ASSISTANT_SELECTOR,
+    TURN_SIGNAL_COUNTS_JS,
     USER_TURN_COUNT_JS,
+    parse_turn_signal_counts,
+    turn_signal_increased,
 )
 
 logger = logging.getLogger(__name__)
@@ -370,6 +373,13 @@ class CompletionDetector:
         last_node_count = initial_count
         last_progress = time.monotonic()
         user_turn_seen = False
+        # When supplied by the production driver, the atomic baseline keeps
+        # aria and legacy counters independent; mixed-layout growth must not
+        # disappear behind a Math.max of the two representations.
+        pre_signals = getattr(d, "_pre_send_signal_counts", None)
+        if not isinstance(pre_signals, dict):
+            pre_signals = None  # compatibility with lightweight detector mocks
+        last_observed_signals = pre_signals
         while time.monotonic() < deadline:
             # First check for ChatGPT's rate-limit pop-up — if present, fail
             # fast with a clear error instead of waiting out the whole timeout.
@@ -390,33 +400,49 @@ class CompletionDetector:
                 # from_text parses any explicit wait from the pop-up copy.
                 raise RateLimitError.from_text(scanned_text)
 
-            try:
-                raw = await d._js_strict(ASSISTANT_TURN_COUNT_JS)
-                current_count = int(raw or 0)
-            except CDPJSError:
-                current_count = last_node_count  # no progress signal
-            if current_count != last_node_count:
-                # Any node-count change is progress (incl. 0→1 with empty text,
-                # the slow-render case). Reset the stall clock.
-                last_node_count = current_count
-                last_progress = time.monotonic()
-            if current_count > initial_count:
-                break
-
-            # The current UI only adds the per-turn Copy affordance when
-            # the assistant FINISHES, so an assistant-count delta alone cannot
-            # start phase 2. The new user message's Edit message control is
-            # available earlier. It permits observation, NOT completion.
-            pre_user_count = getattr(d, "_pre_send_user_count", None)
-            if pre_user_count is not None:
+            if pre_signals is not None:
                 try:
-                    user_raw = await d._js_strict(USER_TURN_COUNT_JS)
-                    if int(user_raw) > pre_user_count:
-                        user_turn_seen = True
-                        logger.debug("User turn appeared via Edit-message delta")
-                        break
+                    raw = await d._js_strict(TURN_SIGNAL_COUNTS_JS)
+                    signals = parse_turn_signal_counts(raw)
                 except (CDPJSError, ValueError, TypeError):
-                    pass
+                    signals = None
+                if signals is not None:
+                    # Independent changes count as progress even when their
+                    # Math.max presentation remains unchanged (e.g. 4 legacy,
+                    # Copy 0 -> 1). This is an observation, not completion.
+                    if signals != last_observed_signals:
+                        last_progress = time.monotonic()
+                        last_observed_signals = signals
+                    if turn_signal_increased(signals, pre_signals, "assistant"):
+                        break
+                    if turn_signal_increased(signals, pre_signals, "user"):
+                        user_turn_seen = True
+                        logger.debug("User turn appeared via independent signal delta")
+                        break
+            else:
+                # Compatibility path for tests/older callers that supply only
+                # a numeric count; production must collect a full snapshot
+                # before sending, or fail closed.
+                try:
+                    raw = await d._js_strict(ASSISTANT_TURN_COUNT_JS)
+                    current_count = int(raw or 0)
+                except CDPJSError:
+                    current_count = last_node_count  # no progress signal
+                if current_count != last_node_count:
+                    last_node_count = current_count
+                    last_progress = time.monotonic()
+                if current_count > initial_count:
+                    break
+                pre_user_count = getattr(d, "_pre_send_user_count", None)
+                if pre_user_count is not None:
+                    try:
+                        user_raw = await d._js_strict(USER_TURN_COUNT_JS)
+                        if int(user_raw) > pre_user_count:
+                            user_turn_seen = True
+                            logger.debug("User turn appeared via Edit-message delta")
+                            break
+                    except (CDPJSError, ValueError, TypeError):
+                        pass
 
             if time.monotonic() - last_progress > PHASE_STALL_SECONDS:
                 raise GenerationStuckError("phase_1_appear", time.monotonic() - last_progress)
@@ -510,16 +536,21 @@ class CompletionDetector:
         # URL (cheap) until a conv_id is available, then the existing backend
         # check can fire. See _get_live_conversation_id_best_effort.
         last_conv_id_probe = 0.0
+        pre_copy_count = pre_signals["copy"] if pre_signals is not None else initial_count
+        pre_legacy_count = (
+            pre_signals["legacy_assistant"]
+            if pre_signals is not None else initial_count
+        )
         while time.monotonic() < deadline:
             try:
                 result = await d._js_strict(
                     "(function() {"
                     f"  var msgs = document.querySelectorAll('{LEGACY_ASSISTANT_SELECTOR}');"
                     f"  var copyButtons = document.querySelectorAll('{COPY_BUTTON_SELECTOR}');"
-                    f"  var copyDelta = copyButtons.length > {initial_count};"
+                    f"  var copyDelta = copyButtons.length > {pre_copy_count};"
                     # The old assistant node must not be read while a new
                     # USER node has appeared but no new assistant node yet.
-                    f"  var last = msgs.length > {initial_count} ? msgs[msgs.length - 1] : null;"
+                    f"  var last = msgs.length > {pre_legacy_count} ? msgs[msgs.length - 1] : null;"
                     # New layout: the completed Copy affordance anchors a
                     # semantic turn container; never fall back to body text.
                     "  var fromCopyRoot = false;"
