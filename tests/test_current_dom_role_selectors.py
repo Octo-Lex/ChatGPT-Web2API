@@ -37,7 +37,9 @@ function el(kind) {
   };
 }
 const root = {
-  innerText: state.answer ?? 'Current UI answer.',
+  innerText: mode === 'current'
+    ? 'ChatGPT said:\\n\\n' + (state.answer ?? 'Current UI answer.')
+    : (state.answer ?? 'Legacy answer.'),
   innerHTML: '<p>Current UI answer</p>'.repeat(3),
   children: [1],
   parentElement: null,
@@ -165,8 +167,14 @@ async def test_phase2_executes_real_js_in_new_and_legacy_layouts(
         )
     )
     assert output["copy_delta"] is expect_new
-    if expected_text:
+    if mode == "legacy":
         assert output["text"] == expected_text
+    else:
+        # The Copy/article wrapper is not a clean answer container: the
+        # current UI includes the prefix "ChatGPT said:" in innerText.
+        # Its text MUST NOT become any response delta, even on a new turn.
+        assert output["text"] == ""
+        assert output["md_text"] == ""
     if baseline:
         assert output["text"] == ""  # no stale previous turn
         assert output["has_action"] is False
@@ -350,3 +358,51 @@ def test_current_layout_exposes_exact_action_row_labels_without_role_attrs(
     expression = f"document.querySelectorAll({selector}).length"
     assert _eval_js(expression, "current", copies=1, edits=1) == 1
     assert _eval_js(expression, "legacy", copies=0, edits=0) == 0
+
+
+@pytest.mark.asyncio
+async def test_current_dom_role_chrome_is_replaced_by_anchored_final_text():
+    """Reproduce live HTTP-200 corruption: article has ChatGPT said + answer.
+
+    Phase 1 sees the new user Edit control, but no assistant role nodes.
+    Phase 2 executes the REAL detector JS in the Node current-DOM fixture,
+    where a Copy/article wrapper has the role label. Only the anchored
+    backend answer may be yielded; no role chrome or sliced head.
+    """
+    sentinel = "PR57-LIVE-dd2290aa"
+    expr = await _actual_phase2_expression(0)
+
+    d = MagicMock()
+    d._current_conv_id = "6b000e1c-5974-83eb-9691-bc3450677411"
+    d._pre_send_user_count = 0
+    d._fetch_end_turn_for_turn = AsyncMock(
+        return_value=TurnEndResult(status="matched")
+    )
+    d._fetch_text_for_turn = AsyncMock(
+        return_value=TurnTextResult(status="matched", text=sentinel)
+    )
+
+    async def evaluate(js, timeout=15):
+        if "body.innerText" in js:
+            return '{"text": ""}'
+        if js == ASSISTANT_TURN_COUNT_JS:
+            return "0"
+        if js == USER_TURN_COUNT_JS:
+            return "1"
+        if "copyButtons" in js and "has_action" in js:
+            assert js == expr
+            return _eval_js(expr, "current", copies=1, answer=sentinel)
+        raise AssertionError(js)
+
+    d._js_strict = evaluate
+    detector = CompletionDetector(d)
+    pieces = []
+    async for chunk in detector.stream_until_complete(
+        initial_count=0, timeout=10,
+        turn_anchor=TurnAnchor(sent_text="test", mode="fresh_chat"),
+    ):
+        pieces.append(chunk.delta)
+
+    assert pieces == [sentinel]  # no optimistic 'ChatGPT said:' chunk
+    assert detector.last_dom_text == sentinel
+    d._fetch_text_for_turn.assert_awaited_once()
