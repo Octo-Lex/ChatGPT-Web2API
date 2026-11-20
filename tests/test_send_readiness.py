@@ -137,13 +137,22 @@ async def test_send_diagnostic_probes_composer_and_send_state(caplog):
 
 
 @pytest.mark.asyncio
-async def test_send_succeeds_with_submit_type_fallback():
-    """If the aria-label selector fails but a type=submit button exists inside
-    the composer form, the broader fallback should find it."""
+async def test_send_rejects_unknown_submit_type_fallback():
+    """The unlabeled submit heuristic must not be used: it may be Stop."""
     dom, driver = _make_dom()
+    expressions = []
 
-    driver._js = _make_scripted_js(poll_result="yes", send_result="sent")
-    await dom.click_send()  # should NOT raise
+    async def fake_js(expr, timeout=15):
+        expressions.append(expr)
+        return "no send button" if "btn.dispatchEvent" in expr else "no"
+
+    driver._js = fake_js
+    with pytest.raises(SendReadinessError, match="no send button"):
+        await dom.click_send()
+
+    assert expressions
+    assert all('button[type="submit"]' not in expr for expr in expressions)
+    assert all("form.querySelector" in expr for expr in expressions)
 
 
 # ── 3. Distinguish injection-failed from send-button-missing ────────────

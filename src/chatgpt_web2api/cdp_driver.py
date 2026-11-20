@@ -382,6 +382,10 @@ class CDPDriver:
         # refresh tried Ns ago" from "never refreshed."
         self._last_refresh_attempt_at: float = 0.0
         self._current_conv_id: str | None = None
+        # Last VERIFIED conversation/fresh-route target. Navigation establishes
+        # this authority; the send DOM uses it to reject a displaced tab.
+        # None remains possible for legacy GPT entrypoints (tracked NAV-07).
+        self._expected_send_context: tuple[str, str] | None = None
         self._current_model: str | None = None
         # CDP response routing (#7): id-keyed futures + background reader
         self._pending: dict[int, asyncio.Future] = {}
@@ -475,6 +479,9 @@ class CDPDriver:
         If already connected (e.g. Service reconnects after login), reuses the
         existing owned tab instead of creating a new one.
         """
+        # CDP attachment can change on reconnect; do not carry an old
+        # route proof across a new WebSocket/target association.
+        self._expected_send_context = None
         # If we already own a tab from a prior connect attempt, reuse it
         if self._ws is not None:
             await self._ws.close()
@@ -725,6 +732,7 @@ class CDPDriver:
             self._ws = None
         # Clear stale state (#18) — the page we reconnect to may be different
         self._current_conv_id = None
+        self._expected_send_context = None
         # PR4: capture the pre-reconnect target so we can detect a target change
         # (drift) after a successful reconnect in parallel mode.
         _pre_reconnect_target_id = self._target_id
@@ -1209,53 +1217,125 @@ class CDPDriver:
 
     # ── Navigation ────────────────────────────────────────────
 
+    @staticmethod
+    def _is_url_at_new_chat(url: str, gizmo_id: str | None = None) -> bool:
+        """Require the exact HTTPS ChatGPT origin and the requested fresh route.
+
+        A composer's presence on /c/{id}, a different project, or a host
+        merely containing 'chatgpt.com' must never qualify a new chat.
+        Query parameters and a trailing slash may be normalized by the SPA.
+        """
+        if not url:
+            return False
+        try:
+            parsed = urllib.parse.urlparse(url)
+        except ValueError:
+            return False
+        if parsed.scheme != "https" or parsed.netloc.lower() != "chatgpt.com":
+            return False
+        expected = (
+            f"/g/{urllib.parse.quote(gizmo_id, safe='')}/project"
+            if gizmo_id else "/"
+        )
+        return parsed.path.rstrip("/") == expected.rstrip("/")
+
     async def navigate_new_chat(self, gizmo_id: str = None) -> None:
-        """Navigate to a fresh chat. Optionally scope to a project gizmo."""
+        """Navigate to a verified, idle fresh-chat composer or fail closed.
+
+        An old conversation ID must not survive a failed new-chat navigation.
+        A usable editor and the exact requested route are verified together;
+        an in-progress generation (Stop visible) is not send-ready. A second
+        probe after a short settle detects immediate SPA displacement.
+        """
+        # Clear stale continuation state BEFORE any navigation or probe can fail.
+        self._current_conv_id = None
+        self._expected_send_context = None
         if gizmo_id:
-            url = f"https://chatgpt.com/g/{gizmo_id}/project"
+            url = f"https://chatgpt.com/g/{urllib.parse.quote(gizmo_id, safe='')}/project"
         else:
-            # The bare ``chatgpt.com/`` home shell renders only the hidden
-            # fallback textarea (``name=prompt-textarea``, no id, not visible),
-            # so neither COMPOSER_SELECTOR nor COMPOSER_FALLBACK_SELECTOR matches
-            # and type_message fails with "No composer found". The
-            # ``?model=auto`` query triggers the SPA to render the real
-            # ProseMirror composer reliably. Verified live: bare home → no
-            # composer after 20s; ``?model=auto`` → composer present.
+            # The bare home shell may render only a hidden fallback textarea;
+            # ?model=auto has been observed to hydrate the real composer.
             url = "https://chatgpt.com/?model=auto"
         logger.info("Navigate: %s", url)
-        await self._cdp("Page.navigate", {"url": url})
+        navigation = await self._cdp("Page.navigate", {"url": url})
+        if isinstance(navigation, dict) and navigation.get("errorText"):
+            raise SendReadinessError(
+                f"Fresh chat navigation rejected: {navigation['errorText']}"
+            )
         await asyncio.sleep(2)
 
-        # Wait for the composer. The new composer is a contenteditable
-        # ProseMirror div (#prompt-textarea is now a hidden fallback);
-        # COMPOSER_SELECTOR matches the real textbox, with the legacy
-        # textarea as a last resort for older deployments.
-        for _ in range(30):
-            result = await self._js(
-                "(function() {"
-                "  return JSON.stringify({"
-                f"    ready: !!document.querySelector('{COMPOSER_SELECTOR}') || !!document.querySelector('{COMPOSER_FALLBACK_SELECTOR}'),"
-                "    url: location.href"
-                "  });"
-                "})()"
-            )
+        # This probe is read-only. In particular, never try a submit-button
+        # fallback to infer readiness: the same button can become Stop while
+        # a foreign tab is generating.
+        probe_js = (
+            "(function(){"
+            "  function visible(el) {"
+            "    return !!el && el.getClientRects().length > 0 &&"
+            "      !el.disabled && el.getAttribute('aria-disabled') !== 'true';"
+            "  }"
+            f"  var composer = document.querySelector('{COMPOSER_SELECTOR}')"
+            f"    || document.querySelector('{COMPOSER_FALLBACK_SELECTOR}');"
+            '  var stops = document.querySelectorAll(\'[data-testid="stop-button"], '
+            'button[aria-label*="Stop" i]\');'
+            "  var stopPresent = false;"
+            "  for (var si = 0; si < stops.length; si++) {"
+            "    if (stops[si].getClientRects().length > 0) {"
+            "      stopPresent = true; break;"
+            "    }"
+            "  }"
+            "  return JSON.stringify({"
+            "    url: location.href, ready_state: document.readyState,"
+            "    composer: visible(composer), stop_present: stopPresent"
+            "  });"
+            "})()"
+        )
+        last_state: dict | None = None
+
+        def is_ready(raw: str) -> bool:
+            nonlocal last_state
             try:
-                state = json.loads(result)
-                if state.get("ready"):
-                    actual_url = state.get("url", "")
-                    # #14: verify we actually landed on chatgpt.com, not an
-                    # error/recovery page that happens to have a textarea.
-                    if "chatgpt.com" not in actual_url:
-                        raise RuntimeError(f"Navigation landed on unexpected URL: {actual_url}")
-                    logger.info("Page ready: %s", actual_url)
-                    break
-            except (json.JSONDecodeError, TypeError):
-                pass
+                state = json.loads(raw)
+            except (ValueError, TypeError):
+                return False
+            if not isinstance(state, dict):
+                return False
+            last_state = state
+            return (
+                self._is_url_at_new_chat(state.get("url", ""), gizmo_id)
+                and state.get("ready_state") == "complete"
+                and state.get("composer") is True
+                and state.get("stop_present") is False
+            )
+
+        for _ in range(30):
+            if is_ready(await self._js(probe_js)):
+                await asyncio.sleep(0.25)
+                if is_ready(await self._js(probe_js)):
+                    logger.info("Fresh chat ready: %s", last_state.get("url"))
+                    self._expected_send_context = (
+                        "fresh", f"/g/{urllib.parse.quote(gizmo_id, safe='')}/project"
+                        if gizmo_id else "/",
+                    )
+                    return
             await asyncio.sleep(0.5)
 
-        # Settle time for sentinel init
-        await asyncio.sleep(2)
-        self._current_conv_id = None
+        if last_state is None:
+            stage = "no readable readiness probes"
+        elif not self._is_url_at_new_chat(last_state.get("url", ""), gizmo_id):
+            stage = "wrong fresh-chat route"
+        elif last_state.get("stop_present") is True:
+            stage = "generation active (Stop visible)"
+        elif last_state.get("ready_state") != "complete":
+            stage = "document not ready"
+        elif last_state.get("composer") is not True:
+            stage = "usable composer absent"
+        else:
+            stage = "readiness not stable"
+        if self._breakers:
+            self._breakers.record_failure(BreakerKind.COMPOSER_SEND_READINESS)
+        raise SendReadinessError(
+            f"Fresh chat navigation failed closed after readiness polling: {stage}"
+        )
 
     async def _has_composer(self) -> bool:
         """Is a send-capable composer present on the live tab?
@@ -1296,6 +1376,8 @@ class CDPDriver:
         fast-fails with ``nav_displaced`` if the URL moves away from the
         target mid-poll (detects SPA redirects / access-denied states).
         """
+        # Invalidate previous authority even if Page.navigate raises.
+        self._expected_send_context = None
         url = f"https://chatgpt.com/c/{conversation_id}"
         logger.info("Navigate to conversation: %s", url)
         await self._cdp("Page.navigate", {"url": url})
@@ -1384,6 +1466,7 @@ class CDPDriver:
 
         await asyncio.sleep(1)
         self._current_conv_id = conversation_id
+        self._expected_send_context = ("conversation", conversation_id)
 
     @staticmethod
     def _is_url_at_conversation(url: str, conversation_id: str) -> bool:
@@ -1401,7 +1484,7 @@ class CDPDriver:
             parsed = urllib.parse.urlparse(url)
         except ValueError:
             return False
-        if "chatgpt.com" not in (parsed.netloc or "").lower():
+        if parsed.scheme != "https" or parsed.netloc.lower() != "chatgpt.com":
             return False
         parts = [p for p in parsed.path.split("/") if p]
         # Find the ("c", conversation_id) adjacent pair — the conversation
@@ -1437,6 +1520,7 @@ class CDPDriver:
         (by ``navigate_conversation``); on failure it is cleared if it matched.
         """
         if await self._is_live_conversation_url(conversation_id):
+            self._expected_send_context = ("conversation", conversation_id)
             return
         await self.navigate_conversation(conversation_id)
         # navigate_conversation raises on failure, so reaching here means it
@@ -1596,7 +1680,8 @@ class CDPDriver:
         Polls briefly (3s at 0.5s intervals). Never raises.
         """
         import time as _time
-        from .chatgpt_dom import COMPOSER_SELECTOR, COMPOSER_FALLBACK_SELECTOR
+
+        from .chatgpt_dom import COMPOSER_FALLBACK_SELECTOR, COMPOSER_SELECTOR
 
         pre_send_count = getattr(self, "_pre_send_user_count", None)
         if pre_send_count is None:
@@ -1839,6 +1924,7 @@ class CDPDriver:
             if conv_id:
                 logger.info("Conversation: %s", conv_id)
                 self._current_conv_id = conv_id
+                self._expected_send_context = ("conversation", conv_id)
                 last_dom_text = self._completion.last_dom_text
                 had_non_text_content = self._completion.had_non_text_content
                 # A2: anchored final-text reconciliation. The selector resolves
@@ -2079,6 +2165,9 @@ class CDPDriver:
 
     async def navigate_gpt(self, gizmo_id: str) -> None:
         """Navigate to a Custom GPT for interaction."""
+        # Legacy GPT navigation is not yet route-qualified (NAV-07).
+        # Never preserve authority from a previous fresh/conversation route.
+        self._expected_send_context = None
         url = f"https://chatgpt.com/g/{gizmo_id}"
         logger.info("Navigate to GPT: %s", url)
         await self._cdp("Page.navigate", {"url": url})
@@ -2126,6 +2215,7 @@ class CDPDriver:
     # ── Lifecycle ─────────────────────────────────────────────
 
     async def close(self) -> None:
+        self._expected_send_context = None
         # Stop the background reader first
         if self._reader_task and not self._reader_task.done():
             self._reader_task.cancel()

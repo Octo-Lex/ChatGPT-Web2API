@@ -266,8 +266,10 @@ async def test_navigate_new_chat_ready_when_prosemirror_present(monkeypatch):
     d._cdp = AsyncMock(return_value={})  # Page.navigate
 
     ready_returned = {"v": json.dumps({
-        "ready": True,
-        "url": "https://chatgpt.com/",
+        "composer": True,
+        "stop_present": False,
+        "ready_state": "complete",
+        "url": "https://chatgpt.com/?model=auto",
     })}
 
     async def _fake_js(expr, timeout=15):
