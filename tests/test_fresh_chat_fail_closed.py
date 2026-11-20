@@ -80,6 +80,7 @@ async def test_fresh_navigation_requires_two_readiness_samples():
         "Page.navigate", {"url": "https://chatgpt.com/?model=auto"}
     )
     assert d._current_conv_id is None
+    assert d._expected_send_context == ("fresh", "/")
     assert d._js.await_count == 2
     js = d._js.call_args.args[0]
     assert "getClientRects" in js
@@ -97,6 +98,7 @@ async def test_project_navigation_requires_matching_project():
     d._cdp.assert_awaited_once_with(
         "Page.navigate", {"url": "https://chatgpt.com/g/g-123/project"}
     )
+    assert d._expected_send_context == ("fresh", "/g/g-123/project")
 
 
 @pytest.mark.asyncio
@@ -230,3 +232,29 @@ async def test_stop_state_change_at_click_is_rejected():
     assert 'button[type="submit"]' not in click_js
     assert click_js.index("stop button present") < click_js.index("btn.dispatchEvent")
     d._capture_selector_diagnostic.assert_awaited_once()
+
+
+
+@pytest.mark.asyncio
+async def test_failed_fresh_navigation_clears_prior_route_binding():
+    d = _driver()
+    d._expected_send_context = ("conversation", "foreign")
+    d._js = AsyncMock(return_value=_probe("https://chatgpt.com/c/foreign"))
+
+    with pytest.raises(SendReadinessError, match="wrong fresh-chat route"):
+        await d.navigate_new_chat()
+
+    assert d._expected_send_context is None
+
+
+@pytest.mark.asyncio
+async def test_navigation_failure_does_not_reuse_previous_route():
+    d = _driver()
+    d._expected_send_context = ("fresh", "/")
+    d._cdp = AsyncMock(side_effect=RuntimeError("CDP disconnected"))
+
+    with pytest.raises(RuntimeError, match="CDP disconnected"):
+        await d.navigate_new_chat()
+
+    assert d._current_conv_id is None
+    assert d._expected_send_context is None
