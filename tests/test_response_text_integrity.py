@@ -82,6 +82,9 @@ async def test_nonprefix_dom_text_fails_closed_not_http_200(untrusted_dom):
 
     assert caught.value.diagnostic["dom_text_length"] == len(untrusted_dom)
     assert caught.value.diagnostic["backend_text_length"] == len(canonical)
+    assert 0 <= caught.value.diagnostic["first_mismatch_offset"] <= len(untrusted_dom)
+    assert len(caught.value.diagnostic["dom_sha256_12"]) == 12
+    assert len(caught.value.diagnostic["backend_sha256_12"]) == 12
     # The observation reconciliation must NOT resend the user message.
     d.click_send.assert_awaited_once()
 
@@ -150,3 +153,26 @@ async def test_phase2_ignores_nonprefix_hydration_rewrite(monkeypatch):
     assert chunks == ["PR57-LIVE-"]
     assert detector.last_dom_text == "PR57-LIVE-"
     assert d._fetch_end_turn_for_turn.await_count == 2
+
+
+
+@pytest.mark.asyncio
+async def test_whitespace_only_difference_stays_fail_closed_and_private(caplog):
+    """Literal REST equality is mandatory: strip-equality is diagnostic only.
+
+    Logs may include lengths, first differing offset, and short hashes,
+    never the actual assistant answer (even under mismatch).
+    """
+    import logging
+
+    answer = "CANARY-PRIVATE-DO-NOT-LOG"
+    d = _driver_with_texts("  " + answer, answer)
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(TurnReconciliationError) as raised:
+            _ = [c async for c in d.send_and_stream("one send", timeout=5)]
+
+    assert raised.value.last_status == "text_prefix_mismatch"
+    assert raised.value.diagnostic["whitespace_only"] is True
+    assert answer not in caplog.text
+    assert "whitespace_only=True" in caplog.text
+    d.click_send.assert_awaited_once()
