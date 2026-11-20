@@ -1820,18 +1820,67 @@ class CDPDriver:
             ):
                 yield chunk
 
-            # Wait for URL to become /c/{id}
+            # R1: Prefer the ID independently confirmed by the detector's
+            # *anchored* end_turn selector. This is NOT the old _current_conv_id
+            # or an uncorrelated DOM Copy button. Verify ownership, the
+            # pre-send anchor, and any currently visible conversation URL.
+            # Otherwise use the bounded live-URL probe as before.
+            trusted_id = getattr(self._completion, "last_anchored_conv_id", "")
+            if not isinstance(trusted_id, str):
+                trusted_id = ""
             conv_id = ""
-            for _ in range(30):
+            if trusted_id:
+                self._assert_owned_tab_required()
+                expected_id = turn_anchor.conversation_id_at_capture
+                if expected_id and trusted_id != expected_id:
+                    raise TurnReconciliationError(
+                        conversation_id=trusted_id,
+                        anchor_mode=turn_anchor.mode,
+                        last_status="conversation_id_anchor_mismatch",
+                        diagnostic={"captured_id": turn_anchor.captured_user_message_id,
+                                    "expected_id": expected_id},
+                    )
                 try:
-                    url = await self._js_strict("window.location.href")
+                    live_url = await self._js_strict("window.location.href")
                 except CDPJSError:
+                    live_url = ""
+                if isinstance(live_url, str) and "/c/" in live_url:
+                    live_id = live_url.split("/c/")[1].split("/")[0].split("?")[0]
+                    if live_id != trusted_id:
+                        raise TurnReconciliationError(
+                            conversation_id=trusted_id,
+                            anchor_mode=turn_anchor.mode,
+                            last_status="conversation_id_mismatch",
+                            diagnostic={"captured_id": turn_anchor.captured_user_message_id,
+                                        "url_conversation_id": live_id},
+                        )
+                conv_id = trusted_id
+            else:
+                # Without backend proof, the only usable ID is the live
+                # conversation URL. No old/stale _current_conv_id fallback.
+                for _ in range(30):
+                    try:
+                        url = await self._js_strict("window.location.href")
+                    except CDPJSError:
+                        await asyncio.sleep(0.5)
+                        continue
+                    if isinstance(url, str) and "/c/" in url:
+                        conv_id = url.split("/c/")[1].split("/")[0].split("?")[0]
+                        if conv_id:
+                            break
                     await asyncio.sleep(0.5)
-                    continue
-                if "/c/" in url:
-                    conv_id = url.split("/c/")[1].split("/")[0].split("?")[0]
-                    break
-                await asyncio.sleep(0.5)
+
+            # The driver is now the SOLE text owner. Skipping reconciliation
+            # and emitting finish_reason=stop would create an HTTP 200 with
+            # empty/unverified text in both REST and SSE.
+            if not conv_id:
+                raise TurnReconciliationError(
+                    conversation_id="",
+                    anchor_mode=turn_anchor.mode,
+                    last_status="conversation_id_unavailable",
+                    diagnostic={"captured_id": turn_anchor.captured_user_message_id,
+                                "reason": "No trusted backend ID or conversation URL"},
+                )
 
             if conv_id:
                 logger.info("Conversation: %s", conv_id)
