@@ -1848,9 +1848,29 @@ class CDPDriver:
                     last_status = result.status
                     last_diagnostic = result.diagnostic or {}
                     if result.status == "matched" and result.text:
-                        if len(result.text) > len(last_dom_text):
-                            yield StreamChunk(delta=result.text[len(last_dom_text):])
-                            last_dom_text = result.text
+                        # DOM deltas may contain stale UI chrome or shift
+                        # their prefix during hydration. A length-only suffix
+                        # silently truncates canonical text in either case.
+                        # Once a chunk was streamed it cannot be retracted:
+                        # fail closed instead of returning HTTP 200 with a
+                        # mixed/garbled answer. An empty DOM baseline safely
+                        # emits the entire anchored backend text.
+                        if not result.text.startswith(last_dom_text):
+                            raise TurnReconciliationError(
+                                conversation_id=conv_id,
+                                anchor_mode=turn_anchor.mode,
+                                last_status="text_prefix_mismatch",
+                                diagnostic={
+                                    "captured_id": turn_anchor.captured_user_message_id,
+                                    "dom_text_length": len(last_dom_text),
+                                    "backend_text_length": len(result.text),
+                                    "reason": "DOM delta is not a prefix of anchored text",
+                                },
+                            )
+                        suffix = result.text[len(last_dom_text):]
+                        if suffix:
+                            yield StreamChunk(delta=suffix)
+                        last_dom_text = result.text
                         break
                     if result.status == "non_text":
                         # P2.5 RCA fix: non_text is NOT terminal here. The backend
