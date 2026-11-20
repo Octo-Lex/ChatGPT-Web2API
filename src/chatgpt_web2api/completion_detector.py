@@ -563,8 +563,16 @@ class CompletionDetector:
                     # Do not mistake that wrapper for non-text assistant
                     # content (which would bypass strict backend text gating).
                     "  var hasRichContent = !!last.querySelector('img, canvas, video, audio');"
-                    "  var html_len = fromCopyRoot && !hasRichContent ? 0 : last.innerHTML.length;"
-                    "  var child_count = fromCopyRoot && !hasRichContent ? 0 : last.children.length;"
+                    # R3: during hydration a transient legacy role node can
+                    # contain ONLY the screen-reader role label yet have a
+                    # large HTML wrapper. Its label is already stripped from
+                    # text; do not set the sticky non-text evidence flag from
+                    # its empty UI shell. Real image/media content is retained.
+                    "  var roleChromeOnly = !mdText && !hasRichContent"
+                    "    && /^ChatGPT said:\\s*$/i.test(rawText);"
+                    "  var wrapperOnly = (fromCopyRoot && !hasRichContent) || roleChromeOnly;"
+                    "  var html_len = wrapperOnly ? 0 : last.innerHTML.length;"
+                    "  var child_count = wrapperOnly ? 0 : last.children.length;"
                     # has_action: the per-turn copy/feedback action row appears
                     # only on a COMPLETED message. ChatGPT's DOM layout puts these
                     # buttons in a SIBLING/UNCLE container, NOT as descendants of
