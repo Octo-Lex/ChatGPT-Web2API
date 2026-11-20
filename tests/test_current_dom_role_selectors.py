@@ -235,7 +235,7 @@ async def test_phase1_user_edit_delta_unblocks_before_copy_action():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("copy_delta", [False, True])
-async def test_anchored_backend_text_recovers_when_current_dom_has_no_container(
+async def test_anchored_backend_text_is_deferred_when_current_dom_has_no_container(
     copy_delta,
 ):
     d = MagicMock()
@@ -272,9 +272,10 @@ async def test_anchored_backend_text_recovers_when_current_dom_has_no_container(
         turn_anchor=TurnAnchor(sent_text="hello", mode="fresh_chat"),
     ):
         chunks.append(chunk)
-    assert [c.delta for c in chunks] == ["Anchored final text"]
-    assert det.last_dom_text == "Anchored final text"
-    d._fetch_text_for_turn.assert_awaited_once()
+    assert chunks == []  # no double-fetched text escapes from detector
+    assert det.last_dom_text == ""
+    d._fetch_text_for_turn.assert_not_awaited()
+    d._fetch_end_turn_for_turn.assert_awaited_once()
 
 
 
@@ -361,7 +362,7 @@ def test_current_layout_exposes_exact_action_row_labels_without_role_attrs(
 
 
 @pytest.mark.asyncio
-async def test_current_dom_role_chrome_is_replaced_by_anchored_final_text():
+async def test_current_dom_role_chrome_is_not_streamed_by_detector():
     """Reproduce live HTTP-200 corruption: article has ChatGPT said + answer.
 
     Phase 1 sees the new user Edit control, but no assistant role nodes.
@@ -403,6 +404,7 @@ async def test_current_dom_role_chrome_is_replaced_by_anchored_final_text():
     ):
         pieces.append(chunk.delta)
 
-    assert pieces == [sentinel]  # no optimistic 'ChatGPT said:' chunk
-    assert detector.last_dom_text == sentinel
-    d._fetch_text_for_turn.assert_awaited_once()
+    assert pieces == []  # the driver will emit ONE canonical text fetch
+    assert detector.last_dom_text == ""
+    d._fetch_text_for_turn.assert_not_awaited()
+    d._fetch_end_turn_for_turn.assert_awaited_once()
