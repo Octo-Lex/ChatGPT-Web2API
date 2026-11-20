@@ -61,7 +61,7 @@ const root = {
 };
 const copies = Array.from({length:state.copies ?? (mode === 'current' ? 1 : 0)}, () => el('Copy'));
 const edits = Array.from({length:state.edits ?? (mode === 'current' ? 1 : 0)}, () => el('Edit message'));
-const legacyAssistants = mode === 'legacy' ? [root] : [];
+const legacyAssistants = mode === 'legacy' || state.transientLegacyAssistant ? [root] : [];
 const legacyUsers = mode === 'legacy' ? [el('user')] : [];
 const hiddenMenus = state.hiddenMenus || [];  // irrelevant role=menuitem nodes
 const assistantExtras = ['Read aloud', 'Share', 'More actions'];
@@ -412,7 +412,10 @@ async def test_current_dom_role_chrome_is_not_streamed_by_detector():
 
 
 @pytest.mark.asyncio
-async def test_live_shape_driver_fetches_anchored_text_once_after_end_turn():
+@pytest.mark.parametrize("transient_legacy_assistant", [False, True])
+async def test_live_shape_driver_fetches_anchored_text_once_after_end_turn(
+    transient_legacy_assistant,
+):
     """One Send, current DOM with no assistant root, two DIFFERENT snapshots.
 
     v1 and v2 are intentionally divergent to reproduce the confirmed
@@ -463,8 +466,11 @@ async def test_live_shape_driver_fetches_anchored_text_once_after_end_turn():
         if "copyButtons" in expr and "has_action" in expr:
             assert expr == phase2_js
             return _eval_js(
-                phase2_js, "current", copies=1,
-                answer=sentinel, rootFound=False,
+                phase2_js, "current",
+                copies=0 if transient_legacy_assistant else 1,
+                answer="" if transient_legacy_assistant else sentinel,
+                transientLegacyAssistant=transient_legacy_assistant,
+                rootFound=False,
             )
         raise AssertionError(expr)
 
@@ -491,3 +497,53 @@ async def test_copy_button_without_any_turn_root_keeps_dom_text_empty():
     assert result["text"] == ""
     assert result["md_text"] == ""
     assert result["html_len"] == 0
+
+
+@pytest.mark.asyncio
+async def test_transient_legacy_role_label_then_empty_dom_before_copy():
+    """A hydration-only legacy assistant wrapper must never emit h4 chrome.
+
+    Simulates the observed first poll "ChatGPT said:" followed by disappearance
+    of the transient role attribute and finally a completed Copy affordance
+    without an article/turn ancestor. The actual detector JS is executed in
+    Node vm for all three snapshots.
+    """
+    script = await _actual_phase2_expression(0)
+    snapshots = [
+        dict(copies=0, edits=1, transientLegacyAssistant=True, answer=""),
+        dict(copies=0, edits=1, transientLegacyAssistant=False, answer=""),
+        dict(copies=1, edits=1, rootFound=False, answer="PR57-LIVE-dd2290aa"),
+    ]
+    values = [json.loads(_eval_js(script, "current", **snapshot))
+              for snapshot in snapshots]
+    assert all(value["text"] == "" for value in values)
+    assert all(value["md_text"] == "" for value in values)
+    assert [value["copy_delta"] for value in values] == [
+        False, False, True,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_role_label_removed_only_when_standalone_and_only_in_raw_fallback():
+    """Protect legitimate content and legacy semantic markdown from regex.
+
+    A line-level role heading may be removed from raw innerText, but a reply
+    that literally starts "ChatGPT said:" on its own content line must remain
+    untouched when that content follows the separate header.
+    """
+    script = await _actual_phase2_expression(0)
+    sentinel = "PR57-LIVE-dd2290aa"
+    transient = json.loads(_eval_js(
+        script, "current", copies=0, transientLegacyAssistant=True,
+        answer=sentinel,
+    ))
+    assert transient["text"] == sentinel
+    literal = "ChatGPT said: literal answer text"
+    raw = json.loads(_eval_js(
+        script, "current", copies=0, transientLegacyAssistant=True,
+        answer=literal,
+    ))
+    assert raw["text"] == literal
+    semantic = json.loads(_eval_js(script, "legacy", answer=literal))
+    assert semantic["md_text"] == literal
+    assert semantic["text"] == literal
