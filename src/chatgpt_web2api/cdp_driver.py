@@ -77,6 +77,10 @@ _CONNECT_READY_TIMEOUT = 10
 # Canonical home moved to chatgpt_dom.py in Phase 5 PR3; re-exported here for
 # back-compat (tests import these from cdp_driver, and the navigation methods
 # that stay here still reference them).
+from .dom_turn_signals import (  # noqa: E402
+    ASSISTANT_TURN_COUNT_JS,
+    USER_TURN_COUNT_JS,
+)
 from .chatgpt_dom import (  # noqa: E402,F401
     COMPOSER_FALLBACK_SELECTOR,
     COMPOSER_SELECTOR,
@@ -1497,16 +1501,8 @@ class CDPDriver:
         """
         import time as _time
 
-        selector = (
-            "document.querySelectorAll("
-            "'[data-message-author-role=\"assistant\"], [data-content-search-unit-key$=\":assistant\"], [data-chatgpt-search-unit-key$=\":assistant\"]'"
-            ").length"
-        )
-        user_selector = (
-            "document.querySelectorAll("
-            "'[data-message-author-role=\"user\"], [data-content-search-unit-key$=\":user\"], [data-chatgpt-search-unit-key$=\":user\"]'"
-            ").length"
-        )
+        selector = ASSISTANT_TURN_COUNT_JS
+        user_selector = USER_TURN_COUNT_JS
         max_attempts = 3
         for attempt in range(1, max_attempts + 1):
             t0 = _time.monotonic()
@@ -1596,7 +1592,8 @@ class CDPDriver:
         Polls briefly (3s at 0.5s intervals). Never raises.
         """
         import time as _time
-        from .chatgpt_dom import COMPOSER_SELECTOR, COMPOSER_FALLBACK_SELECTOR
+
+        from .chatgpt_dom import COMPOSER_FALLBACK_SELECTOR, COMPOSER_SELECTOR
 
         pre_send_count = getattr(self, "_pre_send_user_count", None)
         if pre_send_count is None:
@@ -1609,8 +1606,7 @@ class CDPDriver:
             try:
                 result = await self._js_strict(
                     "(function() {"
-                    "  var userMsgs = document.querySelectorAll("
-                    "    '[data-message-author-role=\"user\"], [data-content-search-unit-key$=\":user\"], [data-chatgpt-search-unit-key$=\":user\"]').length;"
+                    f"  var userMsgs = {USER_TURN_COUNT_JS};"
                     f"  var composer = document.querySelector('{COMPOSER_SELECTOR}')"
                     f"       || document.querySelector('{COMPOSER_FALLBACK_SELECTOR}');"
                     "  var composerPresent = !!composer;"
