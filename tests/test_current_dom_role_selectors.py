@@ -200,7 +200,7 @@ async def test_phase1_user_edit_delta_unblocks_before_copy_action():
             return json.dumps({
                 "text": "Answer", "md_text": "Answer", "html_len": 60,
                 "child_count": 1, "has_action": True,
-                "copy_delta": copy_delta, "stop_present": False,
+                "copy_delta": True, "stop_present": False,
                 "is_thinking": False,
             })
         raise AssertionError(expr)
@@ -244,7 +244,7 @@ async def test_anchored_backend_text_recovers_when_current_dom_has_no_container(
             return json.dumps({
                 "text": "", "md_text": "", "html_len": 0,
                 "child_count": 0, "has_action": False,
-                "copy_delta": True, "stop_present": False,
+                "copy_delta": copy_delta, "stop_present": False,
                 "is_thinking": False,
             })
         raise AssertionError(expr)
