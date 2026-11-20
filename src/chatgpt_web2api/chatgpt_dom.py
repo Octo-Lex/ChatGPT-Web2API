@@ -147,7 +147,7 @@ class ChatGPTDom:
             "  var routeOk = false;"
             "  try {"
             "    var currentUrl = new URL(location.href);"
-            "    var path = currentUrl.pathname.replace(/\/+$/, '') || '/';"
+            r"    var path = currentUrl.pathname.replace(/\/+$/, '') || '/';"
             "    routeOk = currentUrl.protocol === 'https:' &&"
             "      currentUrl.hostname === 'chatgpt.com' &&"
             "      currentUrl.port === '' &&"
@@ -265,7 +265,7 @@ class ChatGPTDom:
             from .cdp_driver import SendReadinessError
 
             raise SendReadinessError("Type refused: wrong send route")
-        if focus_result == "no composer":
+        if focus_result not in ("composer", "fallback"):
             await d._capture_selector_diagnostic("composer (type_message)")
             if d._breakers:
                 d._breakers.record_failure(BreakerKind.COMPOSER_SEND_READINESS)
