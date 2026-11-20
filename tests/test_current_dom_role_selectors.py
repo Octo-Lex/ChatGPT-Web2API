@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from chatgpt_web2api.cdp_driver import CDPDriver
 from chatgpt_web2api.completion_detector import CompletionDetector
 from chatgpt_web2api.dom_turn_signals import (
     ASSISTANT_TURN_COUNT_JS,
@@ -408,3 +409,69 @@ async def test_current_dom_role_chrome_is_not_streamed_by_detector():
     assert detector.last_dom_text == ""
     d._fetch_text_for_turn.assert_not_awaited()
     d._fetch_end_turn_for_turn.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_live_shape_driver_fetches_anchored_text_once_after_end_turn():
+    """One Send, current DOM with no assistant root, two DIFFERENT snapshots.
+
+    v1 and v2 are intentionally divergent to reproduce the confirmed
+    two-fetch failure class. The driver should only ever request the first
+    matched snapshot: the detector proves end_turn but does not fetch text.
+    """
+    sentinel = "PR57-LIVE-dd2290aa"
+    conv_id = "6b0016ad-different-from-the-prior-live-conversation"
+    phase2_js = await _actual_phase2_expression(0)
+    d = CDPDriver(cdp_port=9222)
+    d._current_conv_id = conv_id
+    d._identity_listener = None
+    d._assert_owned_tab_required = MagicMock()
+    d._read_assistant_count_baseline = AsyncMock(return_value=0)
+    d._pre_send_user_count = 0
+    d._capture_pre_send_fallback_anchor = AsyncMock(
+        return_value=TurnAnchor(sent_text="single send", mode="fresh_chat")
+    )
+    d.type_message = AsyncMock()
+    d.click_send = AsyncMock()
+    d._verify_send_acknowledged = AsyncMock(return_value=True)
+    d._completion = CompletionDetector(d)
+    d._fetch_end_turn_for_turn = AsyncMock(
+        return_value=TurnEndResult(
+            status="matched",
+            diagnostic={"reason": "text_end_turn"},
+        )
+    )
+    # If the implementation reintroduces a second text read, the returned
+    # canonical text will disagree and the old mismatch defect reappears.
+    d._fetch_text_for_turn = AsyncMock(
+        side_effect=[
+            TurnTextResult(status="matched", text=sentinel),
+            TurnTextResult(status="matched", text="different second version"),
+        ]
+    )
+
+    async def evaluate(expr, timeout=15):
+        if expr == "window.location.href":
+            return f"https://chatgpt.com/c/{conv_id}"
+        if "body.innerText" in expr:
+            return '{"text": ""}'
+        if expr == ASSISTANT_TURN_COUNT_JS:
+            return "0"
+        if expr == USER_TURN_COUNT_JS:
+            return "1"
+        if "copyButtons" in expr and "has_action" in expr:
+            assert expr == phase2_js
+            return _eval_js(
+                phase2_js, "current", copies=1, answer=sentinel
+            )
+        raise AssertionError(expr)
+
+    d._js_strict = evaluate
+    chunks = [c async for c in d.send_and_stream("single send", timeout=10)]
+
+    assert "".join(c.delta for c in chunks) == sentinel
+    assert chunks[-1].finish_reason == "stop"
+    d._fetch_end_turn_for_turn.assert_awaited_once()
+    d._fetch_text_for_turn.assert_awaited_once()
+    d.click_send.assert_awaited_once()
+    assert d._completion.last_dom_text == ""  # zero untrusted DOM bytes
