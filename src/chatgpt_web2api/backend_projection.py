@@ -41,7 +41,7 @@ TURN_PROJECTION_LIMIT = int(os.getenv("W2A_TURN_PROJECTION_LIMIT", "50"))
 CONVERSATION_PROJECTION_JS = """
 (async function() {
   try {
-    var r = await fetch('/backend-api/conversation/' + __D.conv_id + '?offset=0&limit=' + __D.limit, {
+    var r = await fetch('/backend-api/conversation/' + __D.conv_id, {
       headers: {'Authorization': 'Bearer ' + __D.token}
     });
     if (!r.ok) return JSON.stringify({__status: r.status});

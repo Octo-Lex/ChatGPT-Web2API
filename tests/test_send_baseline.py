@@ -13,11 +13,19 @@ Tests:
 - The returned count is never 0 when the DOM actually has assistants.
 """
 
+import json
 from unittest.mock import AsyncMock
 
 import pytest
 
 from chatgpt_web2api.cdp_driver import CDPDriver, CDPJSError, SendReadinessError
+
+
+def _snapshot(copy=0, legacy_assistant=0, edit=0, legacy_user=0):
+    return json.dumps({
+        "copy": copy, "legacy_assistant": legacy_assistant,
+        "edit": edit, "legacy_user": legacy_user,
+    })
 
 
 def _make_driver() -> CDPDriver:
@@ -32,7 +40,7 @@ def _make_driver() -> CDPDriver:
 async def test_baseline_succeeds_first_try(monkeypatch):
     """Normal path: _js_strict returns a valid count on the first attempt."""
     d = _make_driver()
-    d._js_strict = AsyncMock(side_effect=["3", "5"])  # assistant=3, user=5
+    d._js_strict = AsyncMock(return_value=_snapshot(copy=3, edit=5))
 
     # Patch asyncio.sleep so retries don't actually wait
     import chatgpt_web2api.cdp_driver as drv_mod
@@ -47,7 +55,7 @@ async def test_baseline_retries_then_succeeds(monkeypatch):
     """First attempt fails (CDPJSError), second succeeds → returns count."""
     d = _make_driver()
     d._js_strict = AsyncMock(
-        side_effect=[CDPJSError("timeout"), "2", "1"]  # fail, then assistant=2, user=1
+        side_effect=[CDPJSError("timeout"), _snapshot(copy=2, edit=1)]
     )
 
     import chatgpt_web2api.cdp_driver as drv_mod
@@ -105,7 +113,7 @@ async def test_baseline_logs_diagnostics(monkeypatch, caplog):
     import logging
 
     d = _make_driver()
-    d._js_strict = AsyncMock(side_effect=["7", "4"])  # assistant=7, user=4
+    d._js_strict = AsyncMock(return_value=_snapshot(copy=7, edit=4))
     d._current_conv_id = "test-conv-123"
 
     import chatgpt_web2api.cdp_driver as drv_mod
@@ -125,12 +133,10 @@ async def test_baseline_logs_diagnostics(monkeypatch, caplog):
 
 @pytest.mark.asyncio
 async def test_baseline_accepts_numeric_zero_when_dom_is_empty(monkeypatch):
-    """If the DOM genuinely has 0 assistant messages (fresh chat), count=0 is
-    correct and must be accepted — it's not a failure, just a new conversation.
-    CDP returns numeric 0, not string '0' — ChatGPT's review caught that the
-    truthiness check rejected numeric 0."""
+    """A full four-counter snapshot of zeros is valid for a fresh chat.
+    Count=0 is not a transport failure or a reason to fabricate stale turns."""
     d = _make_driver()
-    d._js_strict = AsyncMock(side_effect=[0, 0])  # numeric 0, not string
+    d._js_strict = AsyncMock(return_value=_snapshot())  # valid zero counts
 
     import chatgpt_web2api.cdp_driver as drv_mod
     monkeypatch.setattr(drv_mod.asyncio, "sleep", AsyncMock())
@@ -151,3 +157,36 @@ async def test_baseline_malformed_string_retries_then_fails(monkeypatch):
 
     with pytest.raises(SendReadinessError, match="Cannot establish pre-send"):
         await d._read_assistant_count_baseline()
+
+
+
+@pytest.mark.asyncio
+async def test_mixed_layout_snapshot_preserves_each_counter():
+    """max(4 legacy, 0 Copy) == max(4 legacy, 1 Copy), but the raw
+    baseline must retain Copy=0 so phase-1 and action rows detect growth.
+    """
+    d = _make_driver()
+    d._js_strict = AsyncMock(
+        return_value=_snapshot(copy=0, legacy_assistant=4,
+                               edit=0, legacy_user=4)
+    )
+    count = await d._read_assistant_count_baseline()
+    assert count == 4
+    assert d._pre_send_user_count == 4
+    assert d._pre_send_signal_counts == {
+        "copy": 0, "legacy_assistant": 4,
+        "edit": 0, "legacy_user": 4,
+    }
+    d._js_strict.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_malformed_mixed_snapshot_fails_closed_before_send(monkeypatch):
+    d = _make_driver()
+    d._js_strict = AsyncMock(return_value=_snapshot(copy=-1, legacy_assistant=4))
+    import chatgpt_web2api.cdp_driver as drv_mod
+    monkeypatch.setattr(drv_mod.asyncio, "sleep", AsyncMock())
+    with pytest.raises(SendReadinessError, match="Cannot establish pre-send"):
+        await d._read_assistant_count_baseline()
+    assert d._js_strict.await_count == 3
+    assert d._pre_send_signal_counts is None

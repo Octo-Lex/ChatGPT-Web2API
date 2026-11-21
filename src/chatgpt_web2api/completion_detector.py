@@ -73,6 +73,16 @@ if TYPE_CHECKING:
     from .cdp_driver import StreamChunk
     from .config import ChatGPTConfig
 
+from .dom_turn_signals import (
+    ASSISTANT_TURN_COUNT_JS,
+    COPY_BUTTON_SELECTOR,
+    LEGACY_ASSISTANT_SELECTOR,
+    TURN_SIGNAL_COUNTS_JS,
+    USER_TURN_COUNT_JS,
+    parse_turn_signal_counts,
+    turn_signal_increased,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -241,6 +251,9 @@ class CompletionDetector:
         # Per-call results surfaced for the driver tail; reset each call.
         self.last_dom_text: str = ""
         self.had_non_text_content: bool = False
+        # Only the exact-turn backend completion selector can attest this ID.
+        # A DOM action button alone must never populate the fallback ID.
+        self.last_anchored_conv_id: str = ""
 
     async def _reconcile_before_stall(
         self, d, conv_id: str, turn_anchor, had_non_text_content: bool,
@@ -274,7 +287,10 @@ class CompletionDetector:
                 had_non_text_content=had_non_text_content,
             )
             status = collapse_to_end_turn_status(end_result)
-            return status == "complete"
+            if status == "complete":
+                self.last_anchored_conv_id = conv_id
+                return True
+            return False
         except AuthExpiredError:
             raise  # never swallow auth expiry — it must surface as auth expiry
         except Exception as e:
@@ -342,6 +358,7 @@ class CompletionDetector:
         # Reset per-call results surfaced to the driver tail.
         self.last_dom_text = ""
         self.had_non_text_content = False
+        self.last_anchored_conv_id = ""
 
         # Wait for a new assistant message. The full `timeout` governs (was
         # capped at 60s, which killed slow-to-appear responses like image
@@ -355,6 +372,14 @@ class CompletionDetector:
         deadline = time.monotonic() + timeout
         last_node_count = initial_count
         last_progress = time.monotonic()
+        user_turn_seen = False
+        # When supplied by the production driver, the atomic baseline keeps
+        # aria and legacy counters independent; mixed-layout growth must not
+        # disappear behind a Math.max of the two representations.
+        pre_signals = getattr(d, "_pre_send_signal_counts", None)
+        if not isinstance(pre_signals, dict):
+            pre_signals = None  # compatibility with lightweight detector mocks
+        last_observed_signals = pre_signals
         while time.monotonic() < deadline:
             # First check for ChatGPT's rate-limit pop-up — if present, fail
             # fast with a clear error instead of waiting out the whole timeout.
@@ -375,20 +400,50 @@ class CompletionDetector:
                 # from_text parses any explicit wait from the pop-up copy.
                 raise RateLimitError.from_text(scanned_text)
 
-            try:
-                raw = await d._js_strict(
-                    "document.querySelectorAll('[data-message-author-role=\"assistant\"]').length"
-                )
-                current_count = int(raw or 0)
-            except CDPJSError:
-                current_count = last_node_count  # no progress signal
-            if current_count != last_node_count:
-                # Any node-count change is progress (incl. 0→1 with empty text,
-                # the slow-render case). Reset the stall clock.
-                last_node_count = current_count
-                last_progress = time.monotonic()
-            if current_count > initial_count:
-                break
+            if pre_signals is not None:
+                try:
+                    raw = await d._js_strict(TURN_SIGNAL_COUNTS_JS)
+                    signals = parse_turn_signal_counts(raw)
+                except (CDPJSError, ValueError, TypeError):
+                    signals = None
+                if signals is not None:
+                    # Independent changes count as progress even when their
+                    # Math.max presentation remains unchanged (e.g. 4 legacy,
+                    # Copy 0 -> 1). This is an observation, not completion.
+                    if signals != last_observed_signals:
+                        last_progress = time.monotonic()
+                        last_observed_signals = signals
+                    if turn_signal_increased(signals, pre_signals, "assistant"):
+                        break
+                    if turn_signal_increased(signals, pre_signals, "user"):
+                        user_turn_seen = True
+                        logger.debug("User turn appeared via independent signal delta")
+                        break
+            else:
+                # Compatibility path for tests/older callers that supply only
+                # a numeric count; production must collect a full snapshot
+                # before sending, or fail closed.
+                try:
+                    raw = await d._js_strict(ASSISTANT_TURN_COUNT_JS)
+                    current_count = int(raw or 0)
+                except CDPJSError:
+                    current_count = last_node_count  # no progress signal
+                if current_count != last_node_count:
+                    last_node_count = current_count
+                    last_progress = time.monotonic()
+                if current_count > initial_count:
+                    break
+                pre_user_count = getattr(d, "_pre_send_user_count", None)
+                if pre_user_count is not None:
+                    try:
+                        user_raw = await d._js_strict(USER_TURN_COUNT_JS)
+                        if int(user_raw) > pre_user_count:
+                            user_turn_seen = True
+                            logger.debug("User turn appeared via Edit-message delta")
+                            break
+                    except (CDPJSError, ValueError, TypeError):
+                        pass
+
             if time.monotonic() - last_progress > PHASE_STALL_SECONDS:
                 raise GenerationStuckError("phase_1_appear", time.monotonic() - last_progress)
             await asyncio.sleep(0.5)
@@ -413,6 +468,11 @@ class CompletionDetector:
         # (either .markdown text OR non-trivial HTML footprint). The threshold
         # (> 50 chars) prevents false 'done' from an empty/partial node.
         last_dom_text = ""
+        # The emitted prefix must never be replaced by a shorter/unrelated
+        # DOM snapshot: emitted StreamChunks cannot be retracted. Track raw
+        # observations separately to detect real progress without advancing
+        # the emitted baseline on non-prefix revisions.
+        last_observed_dom_text = ""
         last_html_len = 0
         last_child_count = 0
         had_non_text_content = False
@@ -453,6 +513,12 @@ class CompletionDetector:
         # think silently); stream-idle uses budgets.stream_idle_timeout_seconds.
         phase_2_start = time.monotonic()
         first_content_seen = False
+        # A current-DOM Copy affordance appears only after a completed turn.
+        # Require its count to grow beyond the pre-send baseline AND one
+        # subsequent identical-text observation before enabling DOM fallback.
+        # An old Copy button may never mark the new turn complete.
+        last_copy_text = ""
+        copy_stable_polls = 0
         generation_active_signal = False  # advisory liveness (DOM thinking/generating)
         # Backend end_turn fallback throttle (R4): if the DOM action-button
         # selector drifts again, the conversation API's end_turn flag is a
@@ -470,13 +536,32 @@ class CompletionDetector:
         # URL (cheap) until a conv_id is available, then the existing backend
         # check can fire. See _get_live_conversation_id_best_effort.
         last_conv_id_probe = 0.0
+        pre_copy_count = pre_signals["copy"] if pre_signals is not None else initial_count
+        pre_legacy_count = (
+            pre_signals["legacy_assistant"]
+            if pre_signals is not None else initial_count
+        )
         while time.monotonic() < deadline:
             try:
                 result = await d._js_strict(
                     "(function() {"
-                    "  var msgs = document.querySelectorAll('[data-message-author-role=\"assistant\"]');"
-                    "  if (!msgs.length) return JSON.stringify({text:'', md_text:'', html_len:0, child_count:0, has_action:false, is_thinking:false});"
-                    "  var last = msgs[msgs.length - 1];"
+                    f"  var msgs = document.querySelectorAll('{LEGACY_ASSISTANT_SELECTOR}');"
+                    f"  var copyButtons = document.querySelectorAll('{COPY_BUTTON_SELECTOR}');"
+                    f"  var copyDelta = copyButtons.length > {pre_copy_count};"
+                    # The old assistant node must not be read while a new
+                    # USER node has appeared but no new assistant node yet.
+                    f"  var last = msgs.length > {pre_legacy_count} ? msgs[msgs.length - 1] : null;"
+                    # New layout: the completed Copy affordance anchors a
+                    # semantic turn container; never fall back to body text.
+                    "  var fromCopyRoot = false;"
+                    "  if (!last && copyDelta) {"
+                    "    var copyBtn = copyButtons[copyButtons.length - 1];"
+                    '    var root = copyBtn.closest(\'[data-testid^="conversation-turn-"], article\');'
+                    "    if (root) { last = root; fromCopyRoot = true; }"
+                    "  }"
+                    "  var stops = document.querySelectorAll('[data-testid=\\\"stop-button\\\"], button[aria-label*=\\\"Stop\\\" i]');"
+                    "  var stopPresent = Array.prototype.some.call(stops, function(b){return b.getClientRects().length > 0;});"
+                    "  if (!last) return JSON.stringify({text:'', md_text:'', html_len:0, child_count:0, has_action:false, copy_delta:copyDelta, stop_present:stopPresent, is_thinking:false});"
                     # Text: the clean answer lives in ``.markdown`` textContent.
                     # It's empty during streaming and populates as the turn
                     # settles — so we ALSO capture ``innerText`` (populated
@@ -484,14 +569,41 @@ class CompletionDetector:
                     # reasoning UI label ("Thinking.../Thought for N seconds"),
                     # so md_text is captured SEPARATELY and Python prefers it;
                     # the innerText fallback is trimmed of the leading label.
-                    "  var md = last.querySelector('.markdown');"
+                    "  var md = last.querySelector('.markdown, .prose, [data-message-content]');"
                     "  var mdText = md ? (md.textContent || '') : '';"
                     "  var rawText = (last.innerText || '').trim();"
                     # Strip a leading "Thinking..." / "Thought for …" reasoning
                     # label so the innerText fallback can't leak it as a delta.
-                    "  var text = mdText || rawText.replace(/^Think(ing|\\s+for)[^\\n]*\\n?/i, '');"
-                    "  var html_len = last.innerHTML.length;"
-                    "  var child_count = last.children.length;"
+                    # The current Copy/article root can include role chrome
+                    # such as "ChatGPT said:" and action-toolbar labels. With
+                    # no semantic content descendant, its innerText is NOT
+                    # assistant text and must not be streamed optimistically.
+                    # The fallback can briefly bind a legacy role wrapper
+                    # during UI hydration. Its screen-reader h4 label may be
+                    # the ONLY text: "ChatGPT said:". Strip that standalone
+                    # role header BEFORE any StreamChunk can be committed.
+                    # Never remove same-line actual answer content or modify
+                    # text from a semantic .markdown/.prose container.
+                    "  var fallbackText = rawText"
+                    "    .replace(/^Think(ing|\\s+for)[^\\n]*\\n?/i, '')"
+                    "    .replace(/^ChatGPT said:(?:[ \\t]*\\r?\\n|$)/i, '')"
+                    "    .trim();"
+                    "  var text = mdText || (fromCopyRoot ? '' : fallbackText);"
+                    # A current article includes an action toolbar whose
+                    # HTML can exceed 50 chars even with ZERO answer content.
+                    # Do not mistake that wrapper for non-text assistant
+                    # content (which would bypass strict backend text gating).
+                    "  var hasRichContent = !!last.querySelector('img, canvas, video, audio');"
+                    # R3: during hydration a transient legacy role node can
+                    # contain ONLY the screen-reader role label yet have a
+                    # large HTML wrapper. Its label is already stripped from
+                    # text; do not set the sticky non-text evidence flag from
+                    # its empty UI shell. Real image/media content is retained.
+                    "  var roleChromeOnly = !mdText && !hasRichContent"
+                    "    && /^ChatGPT said:\\s*$/i.test(rawText);"
+                    "  var wrapperOnly = (fromCopyRoot && !hasRichContent) || roleChromeOnly;"
+                    "  var html_len = wrapperOnly ? 0 : last.innerHTML.length;"
+                    "  var child_count = wrapperOnly ? 0 : last.children.length;"
                     # has_action: the per-turn copy/feedback action row appears
                     # only on a COMPLETED message. ChatGPT's DOM layout puts these
                     # buttons in a SIBLING/UNCLE container, NOT as descendants of
@@ -519,7 +631,7 @@ class CompletionDetector:
                     '            [data-testid*="turn-action-button"],'
                     '            [data-testid*="copy"],'
                     '            [data-testid*="response-turn"]\';'
-                    "  var has_action = (function() {"
+                    "  var legacy_action = (function() {"
                     "    var lastRect = last.getBoundingClientRect();"
                     "    var scope = last;"
                     "    for (var d = 0; scope && d <= 8; d++, scope = scope.parentElement) {"
@@ -554,8 +666,9 @@ class CompletionDetector:
                     # so the stall clock treats it as active generation, not a stall.
                     "  var hasThinkingEl = !!last.querySelector('.result-thinking');"
                     "  var visibleThinking = /^(thinking|reasoning)\\b/i.test(rawText.trim());"
+                    "  var has_action = legacy_action || copyDelta;"
                     "  var is_thinking = !has_action && (hasThinkingEl || (visibleThinking && !mdText));"
-                    "  return JSON.stringify({text: text, md_text: mdText, html_len: html_len, child_count: child_count, has_action: has_action, is_thinking: is_thinking});"
+                    "  return JSON.stringify({text: text, md_text: mdText, html_len: html_len, child_count: child_count, has_action: has_action, copy_delta:copyDelta, stop_present:stopPresent, is_thinking: is_thinking});"
                     "})()",
                 )
                 data = json.loads(result)
@@ -568,6 +681,8 @@ class CompletionDetector:
             html_len = data.get("html_len", 0)
             child_count = data.get("child_count", 0)
             has_action = data.get("has_action", False)
+            copy_delta = data.get("copy_delta", False)
+            stop_present = data.get("stop_present", False)
             is_thinking = data.get("is_thinking", False)
 
             # Streaming source: prefer the clean .markdown answer container
@@ -576,6 +691,20 @@ class CompletionDetector:
             # the innerText fallback (with its leading label already stripped
             # in JS) is what carries the streamed answer.
             current = md_text or current
+
+            if copy_delta:
+                if current and current == last_copy_text and not stop_present:
+                    copy_stable_polls += 1
+                else:
+                    copy_stable_polls = 0
+                last_copy_text = current
+                # A Copy delta is a terminal DOM signal only after one extra
+                # same-text poll, with Stop absent as a prerequisite. Do not
+                # use Stop *absence* as proof of completion.
+                has_action = bool(current) and copy_stable_polls >= 1 and not stop_present
+            else:
+                copy_stable_polls = 0
+                last_copy_text = ""
 
             # is_thinking means the model is actively reasoning — the DOM is
             # legitimately static for tens of seconds, which is NOT a stall.
@@ -602,8 +731,12 @@ class CompletionDetector:
             # logging, but does NOT pause the stall clock (a stuck indicator
             # must not create an infinite hang).
             generation_active_signal = bool(is_thinking)
-            if current != last_dom_text:
+            observation_changed = current != last_observed_dom_text
+            if observation_changed:
+                last_observed_dom_text = current
                 last_change_time = time.monotonic()
+
+            if current.startswith(last_dom_text) and len(current) > len(last_dom_text):
                 # P1: first text content transitions us from awaiting_first_content
                 # to streaming_after_first_content. The stall budget changes with
                 # the state (see the stall check below). When the state flips,
@@ -613,11 +746,18 @@ class CompletionDetector:
                 if current and not first_content_seen:
                     first_content_seen = True
                     last_change_time = time.monotonic()  # reset stream-idle clock
-                if len(current) > len(last_dom_text):
-                    delta = current[len(last_dom_text) :]
-                    yield StreamChunk(delta=delta)
+                # Only a genuine append to bytes already emitted is a safe
+                # delta. Never slice a non-prefix DOM mutation by length.
+                delta = current[len(last_dom_text):]
+                yield StreamChunk(delta=delta)
                 last_dom_text = current
                 self.last_dom_text = last_dom_text
+            elif observation_changed and not current.startswith(last_dom_text):
+                logger.debug(
+                    "Non-prefix DOM text revision; retain emitted baseline "
+                    "(observed_len=%d, emitted_len=%d)",
+                    len(current), len(last_dom_text),
+                )
 
             # Non-text progress signals (images, tool-use, etc.)
             if html_len != last_html_len or child_count != last_child_count:
@@ -669,7 +809,10 @@ class CompletionDetector:
             backend_fetch_failed = False
             if (
                 conv_id_for_check
-                and (last_dom_text or saw_thinking or is_thinking or had_non_text_content)
+                and (
+                    last_dom_text or saw_thinking or is_thinking
+                    or had_non_text_content or copy_delta or user_turn_seen
+                )
                 and time.monotonic() - last_backend_check > 3.0
             ):
                 last_backend_check = time.monotonic()
@@ -687,20 +830,27 @@ class CompletionDetector:
                     )
                     status = collapse_to_end_turn_status(end_result)
                     if status == "complete":
-                        # STRICT: end_turn AND usable content. The saw_thinking
-                        # unlock lets us CONSULT the backend during thinking, but
-                        # we must not finish on a bare end_turn with no answer.
-                        if last_dom_text or had_non_text_content:
-                            logger.info(
-                                "Backend end_turn=true (primary completion) for %s",
-                                conv_id_for_check,
-                            )
-                            break
-                        logger.debug(
-                            "Backend end_turn=true but no content yet for %s — "
-                            "not completing (strict content guard)",
+                        self.last_anchored_conv_id = conv_id_for_check
+                        # STRICT completion is established by the turn-anchored
+                        # selector, not a generic end_turn flag. Its "matched"
+                        # status requires an exact-turn assistant with
+                        # nonempty terminal text, OR a terminal non-text node
+                        # with the existing DOM non-text guard. "not_ready",
+                        # ambiguous and degraded states never enter here.
+                        #
+                        # IMPORTANT: this detector MUST NOT fetch or stream the
+                        # backend text here. The driver is the sole owner of
+                        # the final anchored text read/emission. Fetching once
+                        # here and again in the driver can produce different
+                        # snapshots of the same turn, causing a false prefix
+                        # mismatch after v1 has already escaped to the client.
+                        # Existing clean DOM streaming remains unchanged.
+                        logger.info(
+                            "Backend end_turn=true (primary completion) for %s; "
+                            "terminal text deferred to driver",
                             conv_id_for_check,
                         )
+                        break
                     elif status == "fetch_failed":
                         backend_fetch_failed = True
                         logger.debug(
@@ -732,6 +882,7 @@ class CompletionDetector:
                 has_action
                 and (not conv_id_for_check or backend_fetch_failed)
                 and (last_dom_text or had_non_text_content)
+                and not stop_present
             ):
                 logger.info("DOM has_action (fallback completion) — no backend signal")
                 break

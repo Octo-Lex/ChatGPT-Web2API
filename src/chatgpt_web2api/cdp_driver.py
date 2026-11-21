@@ -12,6 +12,7 @@ Provides typed primitives for:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -82,6 +83,12 @@ from .chatgpt_dom import (  # noqa: E402,F401
     COMPOSER_SELECTOR,
     SEND_BUTTON_FALLBACK_SELECTOR,
     SEND_BUTTON_SELECTOR,
+)
+from .dom_turn_signals import (  # noqa: E402
+    EDIT_MESSAGE_BUTTON_SELECTOR,
+    LEGACY_USER_SELECTOR,
+    TURN_SIGNAL_COUNTS_JS,
+    parse_turn_signal_counts,
 )
 
 # ── P2: Navigation readiness probe ────────────────────────────────────────
@@ -1497,66 +1504,42 @@ class CDPDriver:
         """
         import time as _time
 
-        selector = (
-            "document.querySelectorAll("
-            "'[data-message-author-role=\"assistant\"]'"
-            ").length"
-        )
-        user_selector = (
-            "document.querySelectorAll("
-            "'[data-message-author-role=\"user\"]'"
-            ").length"
-        )
+        # One atomic pre-send DOM snapshot. The four counts are kept
+        # separately because Math.max masks growth in mixed old/new layouts.
+        # Bad/partial snapshots retry and ultimately fail closed before Send.
+        self._pre_send_signal_counts = None
+        self._pre_send_user_count = None
         max_attempts = 3
         for attempt in range(1, max_attempts + 1):
             t0 = _time.monotonic()
-            err: Exception | None = None
+            last_error: Exception | None = None
             try:
-                raw = await self._js_strict(selector)
-            except CDPJSError as e:
-                err = e
+                raw = await self._js_strict(TURN_SIGNAL_COUNTS_JS)
+                signals = parse_turn_signal_counts(raw)
+            except (CDPJSError, ValueError, TypeError) as caught:
+                # Python clears an `except ... as caught` binding after its
+                # suite. Preserve it outside the handler for retry logging
+                # and the final typed fail-closed exception.
+                last_error = caught
             else:
-                try:
-                    # Explicit parse — do NOT use truthiness (numeric 0 from
-                    # CDP is falsy but valid for a fresh chat). ChatGPT's
-                    # review caught that `raw and int(raw)` rejects numeric 0.
-                    count = int(raw)
-                except (ValueError, TypeError) as e:
-                    err = e
-                else:
-                    if count < 0:
-                        err = ValueError(f"negative assistant count: {count}")
-
-            # If we got a valid count, log + return.
-            if err is None:
+                count = max(signals["copy"], signals["legacy_assistant"])
+                user_count = max(signals["edit"], signals["legacy_user"])
+                self._pre_send_signal_counts = signals
+                self._pre_send_user_count = user_count
                 elapsed_ms = int((_time.monotonic() - t0) * 1000)
-                # Best-effort user-count for diagnostics (non-fatal).
-                try:
-                    user_raw = await self._js_strict(user_selector)
-                    user_count = int(user_raw)
-                except (CDPJSError, ValueError, TypeError):
-                    user_count = None
                 logger.info(
                     "send_baseline: attempt=%d assistant_count=%d "
                     "user_count=%s elapsed_ms=%d conv_id=%s",
-                    attempt,
-                    count,
-                    user_count,
-                    elapsed_ms,
+                    attempt, count, user_count, elapsed_ms,
                     self._current_conv_id or "(none)",
                 )
-                # Store for send-acknowledgment baseline (ChatGPT review A).
-                self._pre_send_user_count = user_count
                 return count
 
-            # Retry or fail-closed.
             if attempt < max_attempts:
                 logger.warning(
                     "send_baseline_failed: attempt=%d error=%s "
                     "conv_id=%s — retrying",
-                    attempt,
-                    err,
-                    self._current_conv_id or "(none)",
+                    attempt, last_error, self._current_conv_id or "(none)",
                 )
                 await asyncio.sleep(0.3 * attempt)
             else:
@@ -1564,15 +1547,13 @@ class CDPDriver:
                     "send_baseline_unavailable: attempts=%d last_error=%s "
                     "conv_id=%s — refusing to send with untrusted baseline "
                     "(stale-return risk)",
-                    attempt,
-                    err,
-                    self._current_conv_id or "(none)",
+                    attempt, last_error, self._current_conv_id or "(none)",
                 )
                 raise SendReadinessError(
                     f"Cannot establish pre-send assistant-count baseline "
-                    f"after {max_attempts} attempts: {err}. Refusing to send "
+                    f"after {max_attempts} attempts: {last_error}. Refusing to send "
                     f"with an untrusted baseline (would risk stale-return)."
-                ) from err
+                ) from last_error
         # Unreachable (the loop either returns or raises).
         raise SendReadinessError("send_baseline: exhausted retries unexpectedly")
 
@@ -1596,9 +1577,11 @@ class CDPDriver:
         Polls briefly (3s at 0.5s intervals). Never raises.
         """
         import time as _time
-        from .chatgpt_dom import COMPOSER_SELECTOR, COMPOSER_FALLBACK_SELECTOR
+
+        from .chatgpt_dom import COMPOSER_FALLBACK_SELECTOR, COMPOSER_SELECTOR
 
         pre_send_count = getattr(self, "_pre_send_user_count", None)
+        pre_signals = getattr(self, "_pre_send_signal_counts", None)
         if pre_send_count is None:
             # No baseline — can't verify a delta. Non-blocking.
             return None
@@ -1609,13 +1592,14 @@ class CDPDriver:
             try:
                 result = await self._js_strict(
                     "(function() {"
-                    "  var userMsgs = document.querySelectorAll("
-                    "    '[data-message-author-role=\"user\"]').length;"
+                    f"  var editCount = document.querySelectorAll('{EDIT_MESSAGE_BUTTON_SELECTOR}').length;"
+                    f"  var legacyCount = document.querySelectorAll('{LEGACY_USER_SELECTOR}').length;"
+                    "  var userMsgs = Math.max(editCount, legacyCount);"
                     f"  var composer = document.querySelector('{COMPOSER_SELECTOR}')"
                     f"       || document.querySelector('{COMPOSER_FALLBACK_SELECTOR}');"
                     "  var composerPresent = !!composer;"
                     "  var composerEmpty = composer ? !(composer.innerText || composer.value || '').trim() : false;"
-                    "  return JSON.stringify({userCount: userMsgs, composerPresent: composerPresent, composerEmpty: composerEmpty});"
+                    "  return JSON.stringify({userCount: userMsgs, editCount: editCount, legacyCount: legacyCount, composerPresent: composerPresent, composerEmpty: composerEmpty});"
                     "})()"
                 )
                 if not result or not result.strip().startswith("{"):
@@ -1630,9 +1614,23 @@ class CDPDriver:
                     continue  # wait for next poll — might be transient
                 # Only count as a valid probe when the composer is present
                 # and we can actually evaluate the acknowledgment condition.
+                if pre_signals is not None:
+                    edit_count = state.get("editCount")
+                    legacy_count = state.get("legacyCount")
+                    if (
+                        type(edit_count) is not int or type(legacy_count) is not int
+                        or edit_count < 0 or legacy_count < 0
+                    ):
+                        return None  # no trustworthy per-signal observation
+                    user_delta = (
+                        edit_count > pre_signals["edit"]
+                        or legacy_count > pre_signals["legacy_user"]
+                    )
+                else:
+                    # Compatibility with callers that mock the baseline read.
+                    user_delta = state.get("userCount", 0) > pre_send_count
                 valid_probe_seen = True
-                current_count = state.get("userCount", 0)
-                if current_count > pre_send_count and state.get("composerEmpty"):
+                if user_delta and state.get("composerEmpty"):
                     return True
             except Exception:
                 pass
@@ -1747,6 +1745,9 @@ class CDPDriver:
         # PR4 belt-and-suspenders: refuse to mutate the DOM in parallel mode.
         self._assert_owned_tab_required()
         # A1: count existing assistants BEFORE sending (fail-closed baseline).
+        # Clear stale per-signal state even if a test or subclass overrides
+        # _read_assistant_count_baseline.
+        self._pre_send_signal_counts = None
         initial_count = await self._read_assistant_count_baseline()
 
         # A2 Step 2: identity-listener health check.
@@ -1823,18 +1824,67 @@ class CDPDriver:
             ):
                 yield chunk
 
-            # Wait for URL to become /c/{id}
+            # R1: Prefer the ID independently confirmed by the detector's
+            # *anchored* end_turn selector. This is NOT the old _current_conv_id
+            # or an uncorrelated DOM Copy button. Verify ownership, the
+            # pre-send anchor, and any currently visible conversation URL.
+            # Otherwise use the bounded live-URL probe as before.
+            trusted_id = getattr(self._completion, "last_anchored_conv_id", "")
+            if not isinstance(trusted_id, str):
+                trusted_id = ""
             conv_id = ""
-            for _ in range(30):
+            if trusted_id:
+                self._assert_owned_tab_required()
+                expected_id = turn_anchor.conversation_id_at_capture
+                if expected_id and trusted_id != expected_id:
+                    raise TurnReconciliationError(
+                        conversation_id=trusted_id,
+                        anchor_mode=turn_anchor.mode,
+                        last_status="conversation_id_anchor_mismatch",
+                        diagnostic={"captured_id": turn_anchor.captured_user_message_id,
+                                    "expected_id": expected_id},
+                    )
                 try:
-                    url = await self._js_strict("window.location.href")
+                    live_url = await self._js_strict("window.location.href")
                 except CDPJSError:
+                    live_url = ""
+                if isinstance(live_url, str) and "/c/" in live_url:
+                    live_id = live_url.split("/c/")[1].split("/")[0].split("?")[0]
+                    if live_id != trusted_id:
+                        raise TurnReconciliationError(
+                            conversation_id=trusted_id,
+                            anchor_mode=turn_anchor.mode,
+                            last_status="conversation_id_mismatch",
+                            diagnostic={"captured_id": turn_anchor.captured_user_message_id,
+                                        "url_conversation_id": live_id},
+                        )
+                conv_id = trusted_id
+            else:
+                # Without backend proof, the only usable ID is the live
+                # conversation URL. No old/stale _current_conv_id fallback.
+                for _ in range(30):
+                    try:
+                        url = await self._js_strict("window.location.href")
+                    except CDPJSError:
+                        await asyncio.sleep(0.5)
+                        continue
+                    if isinstance(url, str) and "/c/" in url:
+                        conv_id = url.split("/c/")[1].split("/")[0].split("?")[0]
+                        if conv_id:
+                            break
                     await asyncio.sleep(0.5)
-                    continue
-                if "/c/" in url:
-                    conv_id = url.split("/c/")[1].split("/")[0].split("?")[0]
-                    break
-                await asyncio.sleep(0.5)
+
+            # The driver is now the SOLE text owner. Skipping reconciliation
+            # and emitting finish_reason=stop would create an HTTP 200 with
+            # empty/unverified text in both REST and SSE.
+            if not conv_id:
+                raise TurnReconciliationError(
+                    conversation_id="",
+                    anchor_mode=turn_anchor.mode,
+                    last_status="conversation_id_unavailable",
+                    diagnostic={"captured_id": turn_anchor.captured_user_message_id,
+                                "reason": "No trusted backend ID or conversation URL"},
+                )
 
             if conv_id:
                 logger.info("Conversation: %s", conv_id)
@@ -1852,9 +1902,63 @@ class CDPDriver:
                     last_status = result.status
                     last_diagnostic = result.diagnostic or {}
                     if result.status == "matched" and result.text:
-                        if len(result.text) > len(last_dom_text):
-                            yield StreamChunk(delta=result.text[len(last_dom_text):])
-                            last_dom_text = result.text
+                        # DOM deltas may contain stale UI chrome or shift
+                        # their prefix during hydration. A length-only suffix
+                        # silently truncates canonical text in either case.
+                        # Once a chunk was streamed it cannot be retracted:
+                        # fail closed instead of returning HTTP 200 with a
+                        # mixed/garbled answer. An empty DOM baseline safely
+                        # emits the entire anchored backend text.
+                        if not result.text.startswith(last_dom_text):
+                            # Log classification only, not raw assistant text:
+                            # private responses should not escape via WARN logs.
+                            # A whitespace-only difference is diagnostically
+                            # useful but is NOT an exact-match success.
+                            mismatch_at = next(
+                                (
+                                    i for i, (x, y) in enumerate(
+                                        zip(last_dom_text, result.text)
+                                    ) if x != y
+                                ),
+                                min(len(last_dom_text), len(result.text)),
+                            )
+                            dom_digest = hashlib.sha256(
+                                last_dom_text.encode("utf-8")
+                            ).hexdigest()[:12]
+                            backend_digest = hashlib.sha256(
+                                result.text.encode("utf-8")
+                            ).hexdigest()[:12]
+                            whitespace_only = (
+                                last_dom_text.strip() == result.text.strip()
+                            )
+                            logger.warning(
+                                "Anchored text prefix mismatch: conv_id=%s "
+                                "dom_len=%d backend_len=%d first_diff=%d "
+                                "whitespace_only=%s dom_sha256_12=%s "
+                                "backend_sha256_12=%s",
+                                conv_id, len(last_dom_text), len(result.text),
+                                mismatch_at, whitespace_only,
+                                dom_digest, backend_digest,
+                            )
+                            raise TurnReconciliationError(
+                                conversation_id=conv_id,
+                                anchor_mode=turn_anchor.mode,
+                                last_status="text_prefix_mismatch",
+                                diagnostic={
+                                    "captured_id": turn_anchor.captured_user_message_id,
+                                    "dom_text_length": len(last_dom_text),
+                                    "backend_text_length": len(result.text),
+                                    "first_mismatch_offset": mismatch_at,
+                                    "whitespace_only": whitespace_only,
+                                    "dom_sha256_12": dom_digest,
+                                    "backend_sha256_12": backend_digest,
+                                    "reason": "DOM delta is not a prefix of anchored text",
+                                },
+                            )
+                        suffix = result.text[len(last_dom_text):]
+                        if suffix:
+                            yield StreamChunk(delta=suffix)
+                        last_dom_text = result.text
                         break
                     if result.status == "non_text":
                         # P2.5 RCA fix: non_text is NOT terminal here. The backend
