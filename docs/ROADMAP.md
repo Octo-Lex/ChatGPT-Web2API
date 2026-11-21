@@ -502,3 +502,32 @@ This version removes the stale health work, avoids duplicate rate-limit work,
 drops the under-specified stdio-process warning, moves `ensure` earlier
 (`/health` is trustworthy), and pins the two Phase 3 ambiguities (degraded
 restart, SSE watchdog) before any `ensure` code is written.
+
+---
+
+## Proposed Phase 8 entry gate — capability preservation and guard proportionality (2026-11-21)
+
+**Proposal only:** pending maintainer adoption of [Engineering Charter](ENGINEERING_CHARTER.md) and [Capability Register](CAPABILITY_REGISTER.md). This section does not approve new implementation scope, alter earlier shipped milestones, or authorize merging any open PR. The earlier roadmap remains the sequencing authority until the proposal is adopted.
+
+### Baseline correction
+
+Master at 497527d includes A1/A2 (#38–39), B1 (#42, default-off MCP session-affine pool), and the #44 reliability session. These are existing capabilities, not work to restart. B1's structural canary is scoped; full account-burst qualification remains open. The README's pre-B1 warning remains valid for the unpooled path but no longer describes all available code. Record that documentation drift rather than assuming absence of B1. Master CI run 29195499536 had all six test jobs passing but lint failed and build was skipped. Do not label it all-green.
+
+### Proposed near-term sequence
+
+| Stage | Work and decision gate |
+|---|---|
+| 8.0a — Baseline and charter | Review the two governance documents against pinned master; confirm preserved capabilities, scope, constraints and evidence axes. Amend deliberately; no production code in this documentation PR. |
+| 8.0b — Guard proportionality | Audit current production and pending guard policies against G00–G10. Classify each as necessary invariant, recovery mechanism, auxiliary observation or unnecessary coupling. Record false-accept/false-reject scenarios; keep identity/ownership/no-blind-replay guarantees. |
+| 8.1 — Restore current chat path (#57, companion replacement for #55) | Review R1, R2, R3, text finality and all 22 failures at 6d1a651. Distinguish obsolete fixtures from valid behavioral contracts; handle mixed hydration (logical identity, not just counts), non-text versus UI chrome, and buffered REST/MCP versus emitted SSE. Preserve true incremental output, thinking budgets and qualified fallbacks. Keep scope narrow; split delivery-policy work only if necessary and explicitly agreed. |
+| 8.1 gate | Freeze first-pass review, independent review, exact-head CI/build, then targeted authorized live qualification of changed paths. The 54c4b09 short REST canary is not a certificate for 6d1a651 or SSE. Do not merge both #55 and its companion #57. |
+| 8.2 — Mutation outcome (#52 / #51) | Reconcile no-replay semantics on the accepted combined head; review unknown-outcome handling and client retries. Decide single_send default explicitly, after preserving safe retry functionality. Do not claim durable idempotency/exactly-once. |
+| 8.3 — Navigation and Send safety (#56) | Rebase with combined selector and no-replay changes; retain F2 finally rebinding requirement, fresh route/project validation and no Stop/foreign-tab mutation. Review displacement after navigation. |
+| 8.4 — Combined qualification | Verify route → send → acknowledgment → completion → delivery with exact-head CI, independent review and authorized scoped live evidence. Sequence of #57/#52/#56 above is proposed, not permission to deploy a known unsafe intermediate configuration. If a dependency or blocker requires a different order, amend this roadmap before proceeding. |
+| 8.5 — Further evolution, candidate only | Consider request-state/recovery coordination, delivery policy extraction, session-contract parity, observability and measured resource/latency improvements. Admit a separate work item only for a demonstrated gap with a forcing function. Preserve scope, no speculative rewrite. |
+
+### Acceptance and non-regression
+
+Use the capability IDs in the register for changed behavior; retain tests exercising established user-visible contracts. Evidence for actual upstream compatibility must be distinguished from exact-head CI and historical canaries. Prioritize a high valid-request success rate without wrong-turn, foreign-write, duplicate-effect or silent-corruption outcomes. Measure false rejection with evidence of a viable safe alternative. No new numerical SLO until baseline measurement.
+
+No broader feature expansion, alternate browser backend, APR pattern adoption, or public API retirement is approved by this proposal. Existing `ensure` semantics, owner/attacher architecture, risk-tier gates, B1 opt-in behavior, 16 MCP tools and normal REST/SSE contracts remain protected. See the charter for the change acceptance checklist.
