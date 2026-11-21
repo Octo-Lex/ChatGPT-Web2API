@@ -105,6 +105,8 @@ async def test_send_acknowledged_when_user_count_increases(monkeypatch):
 
     # After send: user count goes from 0 to 1 (message landed)
     async def fake_js_strict(expr, timeout=15):
+        if expr == "window.location.href":
+            return "https://chatgpt.com/c/ack-test-conversation"
         # Send acknowledgment check: user count + composer present + empty
         if "userCount" in expr and "composerEmpty" in expr:
             return json.dumps({"userCount": 1, "composerPresent": True, "composerEmpty": True})
@@ -130,12 +132,23 @@ async def test_send_acknowledged_when_user_count_increases(monkeypatch):
     driver._completion.stream_until_complete = fake_stream
     driver._completion.last_dom_text = "ok"
     driver._completion.had_non_text_content = False
+    # R1's strict tail now requires an actual conversation ID and an
+    # authoritative text result, even in an acknowledgment-only fixture.
+    # Supply a completed same-turn result; never bypass reconciliation.
+    from chatgpt_web2api.turn_anchor import TurnTextResult
+
+    driver._fetch_text_for_turn = AsyncMock(
+        return_value=TurnTextResult(status="matched", text="ok")
+    )
 
     # Should NOT raise — message was acknowledged
     chunks = []
     async for chunk in driver.send_and_stream("test message", timeout=10):
         chunks.append(chunk)
-    assert len(chunks) > 0
+    assert "".join(chunk.delta for chunk in chunks) == "ok"
+    assert chunks[-1].finish_reason == "stop"
+    driver.click_send.assert_awaited_once()
+    driver._fetch_text_for_turn.assert_awaited_once()
 
 
 # ── 2. Diagnostic preservation in TurnReconciliationError ────────────────
