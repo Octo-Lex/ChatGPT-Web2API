@@ -1512,11 +1512,15 @@ class CDPDriver:
         max_attempts = 3
         for attempt in range(1, max_attempts + 1):
             t0 = _time.monotonic()
+            last_error: Exception | None = None
             try:
                 raw = await self._js_strict(TURN_SIGNAL_COUNTS_JS)
                 signals = parse_turn_signal_counts(raw)
-            except (CDPJSError, ValueError, TypeError) as err:
-                pass
+            except (CDPJSError, ValueError, TypeError) as caught:
+                # Python clears an `except ... as caught` binding after its
+                # suite. Preserve it outside the handler for retry logging
+                # and the final typed fail-closed exception.
+                last_error = caught
             else:
                 count = max(signals["copy"], signals["legacy_assistant"])
                 user_count = max(signals["edit"], signals["legacy_user"])
@@ -1535,7 +1539,7 @@ class CDPDriver:
                 logger.warning(
                     "send_baseline_failed: attempt=%d error=%s "
                     "conv_id=%s — retrying",
-                    attempt, err, self._current_conv_id or "(none)",
+                    attempt, last_error, self._current_conv_id or "(none)",
                 )
                 await asyncio.sleep(0.3 * attempt)
             else:
@@ -1543,13 +1547,13 @@ class CDPDriver:
                     "send_baseline_unavailable: attempts=%d last_error=%s "
                     "conv_id=%s — refusing to send with untrusted baseline "
                     "(stale-return risk)",
-                    attempt, err, self._current_conv_id or "(none)",
+                    attempt, last_error, self._current_conv_id or "(none)",
                 )
                 raise SendReadinessError(
                     f"Cannot establish pre-send assistant-count baseline "
-                    f"after {max_attempts} attempts: {err}. Refusing to send "
+                    f"after {max_attempts} attempts: {last_error}. Refusing to send "
                     f"with an untrusted baseline (would risk stale-return)."
-                ) from err
+                ) from last_error
         # Unreachable (the loop either returns or raises).
         raise SendReadinessError("send_baseline: exhausted retries unexpectedly")
 
